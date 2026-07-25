@@ -26,6 +26,7 @@ This project is not affiliated with, endorsed by, or maintained by Factory.
 - Bounded request timeout and process concurrency
 - Client disconnect cancellation
 - Factory-native tool blocking
+- Versioned and externally validated OpenAPI 3.1 contract
 - Strict typing, locked dependencies, and 99% test coverage
 
 ## How it works
@@ -276,6 +277,71 @@ next serialized transcript.
 
 When bearer authentication is enabled, set the same token as `model.api_key`.
 
+## OpenClaw
+
+Configure OpenClaw's `openai-completions` adapter in
+`~/.openclaw/openclaw.json`, following the
+[custom provider model](https://docs.openclaw.ai/concepts/model-providers).
+Set a bridge token in the environment used by both processes:
+
+```bash
+export FACTORY_DROID_OPENAI_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+```
+
+Add this JSON5 configuration:
+
+```json5
+{
+  agents: {
+    defaults: {
+      model: { primary: "factory-droid/factory-droid" },
+      models: {
+        "factory-droid/factory-droid": { alias: "Factory Droid" },
+      },
+    },
+  },
+  models: {
+    mode: "merge",
+    providers: {
+      "factory-droid": {
+        baseUrl: "http://127.0.0.1:8787/v1",
+        apiKey: "${FACTORY_DROID_OPENAI_API_KEY}",
+        api: "openai-completions",
+        timeoutSeconds: 600,
+        models: [
+          {
+            id: "factory-droid",
+            name: "Factory Droid",
+            reasoning: true,
+            input: ["text"],
+            compat: {
+              supportsDeveloperRole: true,
+              supportsReasoningEffort: true,
+              supportsUsageInStreaming: true,
+              supportsTools: true,
+              supportsStrictMode: false,
+            },
+          },
+        ],
+      },
+    },
+  },
+}
+```
+
+Start the bridge from the working directory Droid should access, then restart
+the OpenClaw gateway. Verify the configuration with:
+
+```bash
+openclaw doctor
+openclaw models list
+```
+
+OpenClaw retains ownership of tool execution. Tool calling, tool-result
+continuation, streaming usage, developer messages, and reasoning effort are
+enabled explicitly. Strict tool schemas, temperature control, multimodal SDK
+attachments, and parallel tool calls remain unsupported by this bridge.
+
 ## API compatibility
 
 ### Endpoints
@@ -285,6 +351,59 @@ When bearer authentication is enabled, set the same token as `model.api_key`.
 | `GET` | `/health` | Process health check |
 | `GET` | `/v1/models` | Configured bridge model alias |
 | `POST` | `/v1/chat/completions` | Chat completions and streaming |
+| `GET` | `/openapi.json` | OpenAPI 3.1 contract |
+| `GET` | `/docs` | Interactive Swagger UI |
+| `GET` | `/redoc` | Interactive ReDoc reference |
+
+### Feature support matrix
+
+| OpenAI capability | Status | Bridge behavior |
+|---|---|---|
+| Text chat completions | Supported | Returns one assistant choice |
+| System and developer messages | Supported | Serialized with the complete transcript |
+| Non-streaming responses | Supported | OpenAI-compatible JSON completion |
+| Streaming responses | Supported | SSE chunks followed by `[DONE]` |
+| Function tool schemas | Supported | Serialized into the strict Droid prompt |
+| Tool choice | Supported | `auto`, `none`, `required`, or one named function |
+| Tool-result continuation | Supported | Client resends the complete transcript on the next request |
+| Parallel tool calls | Not supported | At most one external tool call per Droid turn |
+| Reasoning output | Supported | Emitted as `reasoning` and `reasoning_content` |
+| Token usage | Supported | Includes cache read and write token details |
+| Model selection | Supported | Alias uses the Droid default; other IDs are forwarded |
+| Multimodal content | Partial | Content structures are serialized as JSON, not SDK attachments |
+| Structured outputs | Not supported | `response_format` and JSON schema enforcement are ignored |
+| Sampling controls | Not supported | `temperature`, `top_p`, penalties, and `seed` are ignored |
+| Multiple choices | Not supported | `n` is ignored and one choice is returned |
+| Log probabilities | Not supported | `logprobs` and `top_logprobs` are ignored |
+
+### Unsupported API families
+
+| API family | Status |
+|---|---|
+| Responses API | Not implemented |
+| Embeddings | Not implemented |
+| Images | Not implemented |
+| Audio | Not implemented |
+| Files and batches | Not implemented |
+| Fine-tuning | Not implemented |
+| Moderations | Not implemented |
+
+### OpenAPI contract
+
+The versioned [OpenAPI 3.1 document](openapi.json) describes the supported
+HTTP contract. Regenerate and validate it after changing routes or models:
+
+```bash
+uv run python scripts/generate_openapi.py
+uv run openapi-spec-validator openapi.json
+```
+
+Tests compare the committed document with FastAPI's generated schema. CI also
+validates it independently with `openapi-spec-validator`, so malformed or
+stale API contracts fail automatically. The contract covers the implemented
+OpenAI-compatible subset, not the complete OpenAI platform. Separate contract
+tests exercise models, non-streaming chat, streaming chat, usage, and function
+tool calls through the official `openai` Python client.
 
 ### Request fields
 
@@ -295,10 +414,11 @@ When bearer authentication is enabled, set the same token as `model.api_key`.
 | `tools` | Yes | OpenAI function tools |
 | `tool_choice` | Yes | `auto`, `none`, `required`, or one named function |
 | `stream` | Yes | OpenAI-compatible SSE chunks |
-| `stream_options` | Accepted | Usage is included in the final stream chunk |
+| `stream_options` | Partial | Accepted; usage is always included in the final stream chunk |
 | `reasoning_effort` | Yes | Mapped to Droid reasoning effort |
 | `factory_droid_reasoning_effort` | Yes | Bridge-specific override |
 | `timeout` | Yes | Per-request value capped by server timeout |
+| Common sampling fields | Accepted | Ignored; see the feature matrix |
 | Unknown fields | Accepted | Ignored by the bridge |
 
 The bridge currently returns one choice with index `0`.
@@ -426,21 +546,18 @@ For every Droid session, the bridge:
 Set `FACTORY_DROID_OPENAI_WORKDIR` to the smallest directory required by your
 workflow.
 
-## Compatibility limits
+## Bridge architecture limits
 
 This is a compatibility bridge, not a native OpenAI inference implementation.
 
-- Factory's SDK does not accept arbitrary native chat history.
-- Factory's SDK does not accept external OpenAI tool schemas.
-- Factory's SDK does not provide external tool-result continuation.
-- Every completion creates a new Droid session.
-- History and tools are serialized into one prompt.
-- One external tool call is supported per Droid turn.
-- Prompt caching is not equivalent to a native inference endpoint.
-- Multimodal message structures are serialized as JSON, not SDK attachments.
-- Sampling fields such as `temperature`, `top_p`, and `seed` are not enforced.
-- `n`, log probabilities, audio, and native structured outputs are unsupported.
-- Droid output must follow the strict tool marker protocol for tool calling.
+| Limitation | Effect |
+|---|---|
+| No native SDK chat-history input | History is serialized into one prompt |
+| No native SDK external-tool schemas | Tool definitions are serialized into the prompt |
+| No native SDK tool-result continuation | Each request creates a new Droid session |
+| Session-per-request execution | Prompt caching differs from a native inference endpoint |
+| Strict tool marker protocol | Invalid generated tool payloads fail closed |
+| One external call per Droid turn | Parallel tool calls are rejected |
 
 ## Troubleshooting
 
@@ -495,12 +612,27 @@ Run required validation:
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy
+uv run python scripts/generate_openapi.py
+uv run openapi-spec-validator openapi.json
 uv run pytest --cov=factory_droid_openai --cov-report=term-missing
 uv build
 ```
 
-Tests use fake Droid SDK clients and FastAPI's in-process ASGI transport. They
-do not access Factory services or require credentials.
+### Automated test layers
+
+| Layer | CI status | Coverage |
+|---|---|---|
+| Unit tests | Automated | Configuration, protocol parsing, runner lifecycle, CLI, and response mapping |
+| HTTP integration | Automated | Authentication, JSON, SSE, errors, timeouts, and disconnect cleanup through ASGI |
+| OpenAI client contract | Automated | Official `openai` client models, chat, streaming, usage, and function tools |
+| OpenAPI contract | Automated | Generated-schema drift plus independent OpenAPI 3.1 validation |
+| Package smoke test | Automated | Build, isolated wheel install, CLI, live process health, models, schema, and validation error |
+| Live Factory inference | Manual | Requires an authenticated local Droid CLI and can consume account quota |
+
+The automated suite does not access Factory services or require credentials.
+Public CI intentionally excludes live inference because it requires a Factory
+account. The local curl and client examples above provide the credentialed
+end-to-end smoke path before deployment.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution requirements and
 [SECURITY.md](SECURITY.md) for private vulnerability reporting. Release history

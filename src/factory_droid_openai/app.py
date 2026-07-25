@@ -7,14 +7,22 @@ import secrets
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Request, Security
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from factory_droid_openai.config import Settings
-from factory_droid_openai.models import ChatCompletionRequest  # noqa: TC001
+from factory_droid_openai.models import (
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    ErrorResponse,
+    HealthResponse,
+    ModelInfo,
+    ModelListResponse,
+)
 from factory_droid_openai.protocol import (
     ProtocolEmission,
     ProtocolError,
@@ -35,6 +43,39 @@ from factory_droid_openai.runner import (
 )
 
 RunnerFactory = Callable[[], DroidRunner]
+BearerCredentials = Annotated[
+    HTTPAuthorizationCredentials | None,
+    Security(HTTPBearer(auto_error=False)),
+]
+
+CHAT_COMPLETION_RESPONSES: dict[int | str, dict[str, Any]] = {
+    200: {
+        "model": ChatCompletionResponse,
+        "description": "A JSON completion or an SSE completion stream.",
+        "content": {
+            "text/event-stream": {
+                "schema": {"type": "string"},
+                "example": 'data: {"object":"chat.completion.chunk",...}\n\ndata: [DONE]\n\n',
+            }
+        },
+    },
+    "4XX": {
+        "model": ErrorResponse,
+        "description": "Invalid request or bearer authentication failure.",
+    },
+    502: {
+        "model": ErrorResponse,
+        "description": "Droid SDK, process, or bridge protocol failure.",
+    },
+    503: {
+        "model": ErrorResponse,
+        "description": "Droid executable unavailable.",
+    },
+    504: {
+        "model": ErrorResponse,
+        "description": "Droid request timeout.",
+    },
+}
 
 
 def create_app(
@@ -52,15 +93,36 @@ def create_app(
     concurrency = asyncio.Semaphore(resolved_settings.max_concurrency)
     application = FastAPI(
         title="Factory Droid OpenAI Bridge",
+        summary="OpenAI-compatible access to Factory Droid.",
+        description=(
+            "An unofficial compatibility bridge for OpenAI Chat Completions clients. "
+            "The bridge runs one isolated Factory Droid session per request."
+        ),
         version="0.1.0",
+        license_info={
+            "name": "Apache License 2.0",
+            "identifier": "Apache-2.0",
+        },
+        openapi_tags=[
+            {
+                "name": "Service",
+                "description": "Bridge health and service metadata.",
+            },
+            {
+                "name": "OpenAI compatibility",
+                "description": "OpenAI-compatible model and chat endpoints.",
+            },
+        ],
     )
 
-    async def require_auth(request: Request) -> None:
+    async def require_auth(credentials: BearerCredentials) -> None:
         expected = resolved_settings.api_key
         if expected is None:
             return
-        scheme, _, token = request.headers.get("authorization", "").partition(" ")
-        if scheme.lower() != "bearer" or not secrets.compare_digest(token, expected):
+        if credentials is None or not secrets.compare_digest(
+            credentials.credentials,
+            expected,
+        ):
             raise BridgeHTTPError(
                 "Invalid API key.",
                 status_code=401,
@@ -82,28 +144,46 @@ def create_app(
             "invalid_request_error",
         )
 
-    @application.get("/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok"}
+    @application.get(
+        "/health",
+        response_model=HealthResponse,
+        tags=["Service"],
+        summary="Check bridge health",
+    )
+    async def health() -> HealthResponse:
+        return HealthResponse(status="ok")
 
-    @application.get("/v1/models", dependencies=[Depends(require_auth)])
-    async def models() -> dict[str, Any]:
-        return {
-            "object": "list",
-            "data": [
-                {
-                    "id": resolved_settings.model_alias,
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": "factory",
-                }
-            ],
-        }
+    @application.get(
+        "/v1/models",
+        response_model=ModelListResponse,
+        dependencies=[Depends(require_auth)],
+        responses={
+            "4XX": {
+                "model": ErrorResponse,
+                "description": "Bearer authentication failure.",
+            }
+        },
+        tags=["OpenAI compatibility"],
+        summary="List the bridge model alias",
+    )
+    async def models() -> ModelListResponse:
+        return ModelListResponse(
+            data=[
+                ModelInfo(
+                    id=resolved_settings.model_alias,
+                    created=0,
+                    owned_by="factory",
+                )
+            ]
+        )
 
     @application.post(
         "/v1/chat/completions",
         dependencies=[Depends(require_auth)],
         response_model=None,
+        responses=CHAT_COMPLETION_RESPONSES,
+        tags=["OpenAI compatibility"],
+        summary="Create a chat completion",
     )
     async def chat_completions(
         payload: ChatCompletionRequest,

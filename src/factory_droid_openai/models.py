@@ -45,6 +45,63 @@ class StreamOptions(BaseModel):
     include_usage: bool = False
 
 
+class HealthResponse(BaseModel):
+    status: Literal["ok"]
+
+
+class ModelInfo(BaseModel):
+    id: str
+    object: Literal["model"] = "model"
+    created: int
+    owned_by: str
+
+
+class ModelListResponse(BaseModel):
+    object: Literal["list"] = "list"
+    data: list[ModelInfo]
+
+
+class UsageResponse(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    prompt_tokens_details: dict[str, int]
+
+
+class AssistantMessageResponse(BaseModel):
+    role: Literal["assistant"] = "assistant"
+    content: str | None
+    reasoning: str | None = None
+    reasoning_content: str | None = None
+    tool_calls: list[ToolCall] | None = None
+
+
+class ChatCompletionChoice(BaseModel):
+    index: int
+    message: AssistantMessageResponse
+    finish_reason: Literal["stop", "tool_calls"]
+
+
+class ChatCompletionResponse(BaseModel):
+    id: str
+    object: Literal["chat.completion"] = "chat.completion"
+    created: int
+    model: str
+    choices: list[ChatCompletionChoice]
+    usage: UsageResponse
+
+
+class ErrorDetail(BaseModel):
+    message: str
+    type: str
+    param: str | None = None
+    code: str | None = None
+
+
+class ErrorResponse(BaseModel):
+    error: ErrorDetail
+
+
 class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 

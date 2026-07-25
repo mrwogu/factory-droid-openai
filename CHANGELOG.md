@@ -7,6 +7,13 @@ and releases follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Versioned OpenAPI 3.1 contract with automated drift and validity checks
+- Documented support matrices for OpenAI capabilities and API families
+- OpenClaw custom-provider configuration
+- Official OpenAI client contract tests and installed-service smoke tests
+
 ## [0.1.0] - 2026-07-25
 
 ### Added
