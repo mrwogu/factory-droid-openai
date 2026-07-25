@@ -7,6 +7,7 @@ Describe the change and why it is needed.
 - [ ] `uv run ruff check .`
 - [ ] `uv run ruff format --check .`
 - [ ] `uv run mypy`
+- [ ] `uv run openapi-spec-validator openapi.json`
 - [ ] `uv run pytest --cov=factory_droid_openai --cov-report=term-missing`
 - [ ] `uv build`
 

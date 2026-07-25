@@ -50,6 +50,9 @@ jobs:
       - name: Test with coverage
         run: uv run pytest --cov=factory_droid_openai --cov-report=term-missing --cov-report=xml
 
+      - name: Validate OpenAPI contract
+        run: uv run openapi-spec-validator openapi.json
+
   tests:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
@@ -109,3 +112,53 @@ jobs:
           /tmp/factory-droid-openai-package/bin/python -m pip install dist/*.whl
           /tmp/factory-droid-openai-package/bin/python -c "import factory_droid_openai"
           /tmp/factory-droid-openai-package/bin/factory-droid-openai --help
+
+      - name: Smoke test installed HTTP service
+        run: |
+          set -euo pipefail
+          FACTORY_DROID_OPENAI_WORKDIR="$PWD" \
+            /tmp/factory-droid-openai-package/bin/factory-droid-openai \
+              --host 127.0.0.1 \
+              --port 8787 \
+              --log-level warning &
+          bridge_pid=$!
+          trap 'kill "$bridge_pid" 2>/dev/null || true' EXIT
+          /tmp/factory-droid-openai-package/bin/python - <<'PY'
+          import json
+          import time
+          import urllib.error
+          import urllib.request
+
+          base_url = "http://127.0.0.1:8787"
+          for _ in range(50):
+              try:
+                  with urllib.request.urlopen(f"{base_url}/health") as response:
+                      assert json.load(response) == {"status": "ok"}
+                  break
+              except urllib.error.URLError:
+                  time.sleep(0.1)
+          else:
+              raise RuntimeError("Bridge did not become healthy")
+
+          with urllib.request.urlopen(f"{base_url}/v1/models") as response:
+              models = json.load(response)
+          assert models["data"][0]["id"] == "factory-droid"
+
+          with urllib.request.urlopen(f"{base_url}/openapi.json") as response:
+              schema = json.load(response)
+          assert schema["openapi"] == "3.1.0"
+
+          request = urllib.request.Request(
+              f"{base_url}/v1/chat/completions",
+              data=b'{"model":"factory-droid","messages":[]}',
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          try:
+              urllib.request.urlopen(request)
+          except urllib.error.HTTPError as error:
+              assert error.code == 400
+              assert json.load(error)["error"]["type"] == "invalid_request_error"
+          else:
+              raise AssertionError("Invalid chat request unexpectedly succeeded")
+          PY
