@@ -220,6 +220,7 @@ def create_app(
                 runner=resolved_runner_factory(),
                 run_request=run_request,
                 concurrency=concurrency,
+                include_usage=bool(payload.stream_options and payload.stream_options.include_usage),
             )
             return StreamingResponse(
                 event_stream,
@@ -331,6 +332,7 @@ async def _stream_completion(
     runner: DroidRunner,
     run_request: RunRequest,
     concurrency: asyncio.Semaphore,
+    include_usage: bool = False,
 ) -> AsyncIterator[str]:
     yield _sse(
         _chunk(
@@ -338,6 +340,7 @@ async def _stream_completion(
             created,
             model,
             delta={"role": "assistant", "content": ""},
+            include_usage=include_usage,
         )
     )
     usage = Usage()
@@ -359,6 +362,7 @@ async def _stream_completion(
                                 created,
                                 model,
                                 emission,
+                                include_usage=include_usage,
                             )
                         )
                 elif isinstance(event, ReasoningDelta):
@@ -371,6 +375,7 @@ async def _stream_completion(
                                 "reasoning": event.text,
                                 "reasoning_content": event.text,
                             },
+                            include_usage=include_usage,
                         )
                     )
                 elif isinstance(event, UsageUpdate):
@@ -393,6 +398,7 @@ async def _stream_completion(
                     created,
                     model,
                     emission,
+                    include_usage=include_usage,
                 )
             )
         yield _sse(
@@ -402,9 +408,11 @@ async def _stream_completion(
                 model,
                 delta={},
                 finish_reason="tool_calls" if saw_tool_call else "stop",
-                usage=usage,
+                include_usage=include_usage,
             )
         )
+        if include_usage:
+            yield _sse(_usage_chunk(request_id, created, model, usage))
     except ProtocolError as exc:
         yield _sse(_error_body(str(exc), "factory_protocol_error"))
     except RunnerError as exc:
@@ -428,6 +436,8 @@ def _chunk_for_emission(
     created: int,
     model: str,
     emission: ProtocolEmission,
+    *,
+    include_usage: bool = False,
 ) -> dict[str, Any]:
     if isinstance(emission, TextEmission):
         return _chunk(
@@ -435,12 +445,14 @@ def _chunk_for_emission(
             created,
             model,
             delta={"content": emission.text},
+            include_usage=include_usage,
         )
     return _chunk(
         request_id,
         created,
         model,
         delta={"tool_calls": [{"index": 0, **_tool_call_dict(emission)}]},
+        include_usage=include_usage,
     )
 
 
@@ -462,7 +474,7 @@ def _chunk(
     *,
     delta: dict[str, Any],
     finish_reason: str | None = None,
-    usage: Usage | None = None,
+    include_usage: bool = False,
 ) -> dict[str, Any]:
     body: dict[str, Any] = {
         "id": request_id,
@@ -477,9 +489,25 @@ def _chunk(
             }
         ],
     }
-    if usage is not None:
-        body["usage"] = _usage_dict(usage)
+    if include_usage:
+        body["usage"] = None
     return body
+
+
+def _usage_chunk(
+    request_id: str,
+    created: int,
+    model: str,
+    usage: Usage,
+) -> dict[str, Any]:
+    return {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [],
+        "usage": _usage_dict(usage),
+    }
 
 
 def _usage_dict(usage: Usage) -> dict[str, Any]:
