@@ -18,7 +18,8 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> Settings:
-        workdir = Path(os.getenv("FACTORY_DROID_OPENAI_WORKDIR", os.getcwd())).expanduser()
+        configured_workdir = os.getenv("FACTORY_DROID_OPENAI_WORKDIR")
+        workdir = Path(configured_workdir).expanduser() if configured_workdir else Path.cwd()
         if not workdir.is_dir():
             raise ValueError(f"Factory Droid workdir does not exist: {workdir}")
         timeout_seconds = _positive_float(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -88,7 +88,7 @@ class DroidRunner:
         self._workdir = workdir
         self._client_factory = client_factory or _create_client
 
-    async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
+    async def run(self, request: RunRequest) -> AsyncGenerator[RunEvent, None]:
         client = self._client_factory(self._droid_path, self._workdir)
         initialized = False
         completed = False

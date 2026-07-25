@@ -1,0 +1,81 @@
+name: Bug report
+description: Report reproducible incorrect behavior.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include API keys, authentication tokens, or private prompt content.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the observed behavior and expected result.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide the smallest request, configuration, and steps that reproduce the issue.
+      placeholder: |
+        1. Start the bridge with ...
+        2. Send ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: input
+    id: bridge-version
+    attributes:
+      label: Bridge version
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: droid-version
+    attributes:
+      label: Droid CLI version
+      description: Output from `droid --version`.
+    validations:
+      required: true
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      description: Output from `python --version`.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: response-mode
+    attributes:
+      label: Response mode
+      options:
+        - Non-streaming
+        - Streaming
+        - Both
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Remove credentials, private paths, and sensitive prompt content.
+      render: text
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues for this problem.
+          required: true
+        - label: I removed credentials and sensitive data from this report.
+          required: true
