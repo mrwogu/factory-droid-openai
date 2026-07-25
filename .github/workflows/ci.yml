@@ -19,6 +19,9 @@ jobs:
     name: Quality
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -57,6 +60,15 @@ jobs:
 
       - name: Test with coverage
         run: uv run pytest --cov=factory_droid_openai --cov-report=term-missing --cov-report=xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          disable_search: true
+          fail_ci_if_error: true
+          files: ./coverage.xml
+          use_oidc: true
+          version: v11.3.1
 
       - name: Validate OpenAPI contract
         run: uv run openapi-spec-validator openapi.json

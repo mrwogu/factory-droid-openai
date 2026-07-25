@@ -1,0 +1,68 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+  ],
+  "enabledManagers": [
+    "pep621",
+  ],
+  "timezone": "UTC",
+  "schedule": [
+    "before 6am on monday",
+  ],
+  "minimumReleaseAge": "3 days",
+  "dependencyDashboard": true,
+  "dependencyDashboardAutoclose": true,
+  "labels": [
+    "dependencies",
+    "renovate",
+  ],
+  "semanticCommits": "enabled",
+  "semanticCommitType": "build",
+  "semanticCommitScope": "deps",
+  "rangeStrategy": "bump",
+  "prConcurrentLimit": 5,
+  "rebaseWhen": "behind-base-branch",
+  "vulnerabilityAlerts": {
+    "enabled": false,
+  },
+  "osvVulnerabilityAlerts": false,
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": [
+      "before 6am on the first day of the month",
+    ],
+  },
+  "packageRules": [
+    {
+      "description": "Group non-major runtime dependency updates",
+      "matchDepTypes": [
+        "project.dependencies",
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+      ],
+      "groupName": "runtime dependencies",
+    },
+    {
+      "description": "Group non-major development dependency updates",
+      "matchDepTypes": [
+        "project.optional-dependencies",
+        "build-system.requires",
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+      ],
+      "groupName": "development dependencies",
+    },
+    {
+      "description": "Require dashboard approval for major updates",
+      "matchUpdateTypes": [
+        "major",
+      ],
+      "dependencyDashboardApproval": true,
+    },
+  ],
+}

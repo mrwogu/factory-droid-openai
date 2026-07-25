@@ -1,20 +1,6 @@
 version: 2
 
 updates:
-  - package-ecosystem: pip
-    directory: /
-    schedule:
-      interval: weekly
-      day: monday
-      time: "06:00"
-      timezone: UTC
-    open-pull-requests-limit: 10
-    groups:
-      runtime-dependencies:
-        dependency-type: production
-      development-dependencies:
-        dependency-type: development
-
   - package-ecosystem: github-actions
     directory: /
     schedule:
@@ -23,7 +9,16 @@ updates:
       time: "06:00"
       timezone: UTC
     open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github_actions
+    commit-message:
+      prefix: build
+      include: scope
     groups:
-      github-actions:
+      github-actions-minor-and-patch:
         patterns:
           - "*"
+        update-types:
+          - minor
+          - patch
