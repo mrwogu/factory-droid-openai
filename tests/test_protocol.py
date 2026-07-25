@@ -287,10 +287,10 @@ def test_stream_parser_rejects_oversized_payload() -> None:
 def test_stream_parser_preserves_partial_marker_as_plain_text() -> None:
     parser = ToolCallStreamParser(frozenset())
 
-    emissions = parser.feed("literal <hermes_tool_")
+    emissions = parser.feed("literal <tool_")
     emissions.extend(parser.finish())
 
     assert (
         "".join(emission.text for emission in emissions if isinstance(emission, TextEmission))
-        == "literal <hermes_tool_"
+        == "literal <tool_"
     )
