@@ -1,0 +1,51 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "bootstrap-sha": "519fed04f852ade2d915c9e1b2d2f7825a4b7619",
+  "release-type": "python",
+  "packages": {
+    ".": {
+      "package-name": "factory-droid-openai",
+      "include-component-in-tag": false,
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "extra-files": [
+        "src/factory_droid_openai/app.py",
+        {
+          "type": "json",
+          "path": "openapi.json",
+          "jsonpath": "$.info.version"
+        },
+        {
+          "type": "yaml",
+          "path": ".github/ISSUE_TEMPLATE/bug_report.yml",
+          "jsonpath": "$.body[?(@.id=='bridge-version')].attributes.placeholder"
+        },
+        {
+          "type": "toml",
+          "path": "uv.lock",
+          "jsonpath": "$.package[?(@.name.value=='factory-droid-openai')].version"
+        }
+      ]
+    }
+  },
+  "changelog-sections": [
+    {
+      "type": "feat",
+      "section": "Features"
+    },
+    {
+      "type": "fix",
+      "section": "Bug Fixes"
+    },
+    {
+      "type": "perf",
+      "section": "Performance Improvements"
+    },
+    {
+      "type": "revert",
+      "section": "Reverts"
+    }
+  ],
+  "pull-request-title-pattern": "chore${scope}: release ${version}",
+  "include-v-in-tag": true
+}
