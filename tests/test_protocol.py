@@ -113,6 +113,41 @@ def test_tool_choice_none_removes_tools() -> None:
     assert '"tools":[]' in plan.prompt
 
 
+def test_tool_choice_required_keeps_all_tools() -> None:
+    plan = build_prompt(_request(tool_choice="required"))
+
+    assert plan.allowed_tool_names == frozenset({"weather"})
+    assert plan.require_tool_call is True
+
+
+@pytest.mark.parametrize(
+    ("chat_request", "message"),
+    [
+        (_request(tools=[], tool_choice="required"), "needs at least one tool"),
+        (
+            _request(tool_choice={"type": "function", "function": {}}),
+            "function name is missing",
+        ),
+        (
+            _request(
+                tool_choice={
+                    "type": "function",
+                    "function": {"name": "missing"},
+                }
+            ),
+            "unknown tool",
+        ),
+        (_request(tool_choice=42), "unsupported tool_choice"),
+    ],
+)
+def test_build_prompt_rejects_invalid_tool_choice(
+    chat_request: ChatCompletionRequest,
+    message: str,
+) -> None:
+    with pytest.raises(ProtocolError, match=message):
+        build_prompt(chat_request)
+
+
 def test_stream_parser_handles_every_marker_split() -> None:
     value = (
         "Before "
@@ -173,3 +208,89 @@ def test_required_tool_call_rejects_plain_text() -> None:
 
     with pytest.raises(ProtocolError, match="required tool call"):
         parser.finish()
+
+
+def test_stream_parser_accepts_whitespace_after_tool_call() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    assert parser.feed("") == []
+    emissions = parser.feed(
+        f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{}}}}{TOOL_CALL_CLOSE}\n'
+    )
+    emissions.extend(parser.feed(" \t"))
+    emissions.extend(parser.finish())
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert emissions[0].id.startswith("call_")
+
+    with pytest.raises(ProtocolError, match="unexpected text after tool call"):
+        parser.feed("trailing")
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        (f"{TOOL_CALL_OPEN}{{", "incomplete tool-call marker"),
+        (
+            f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{}}}}{TOOL_CALL_CLOSE}trailing',
+            "unexpected text after tool call",
+        ),
+        (
+            f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{}}}}{TOOL_CALL_CLOSE}',
+            "none are available",
+        ),
+    ],
+)
+def test_stream_parser_rejects_invalid_marker_sequences(
+    value: str,
+    message: str,
+) -> None:
+    parser = ToolCallStreamParser(
+        frozenset() if "none are available" in message else frozenset({"weather"})
+    )
+
+    if "incomplete" in message:
+        parser.feed(value)
+        with pytest.raises(ProtocolError, match=message):
+            parser.finish()
+    else:
+        with pytest.raises(ProtocolError, match=message):
+            parser.feed(value)
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ("not-json", "invalid tool-call JSON"),
+        ("[]", "must be a JSON object"),
+        ('{"name":"","arguments":{}}', "non-empty string"),
+    ],
+)
+def test_stream_parser_rejects_invalid_payloads(
+    payload: str,
+    message: str,
+) -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    with pytest.raises(ProtocolError, match=message):
+        parser.feed(f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE}")
+
+
+def test_stream_parser_rejects_oversized_payload() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    with pytest.raises(ProtocolError, match="too large"):
+        parser.feed(f"{TOOL_CALL_OPEN}{'x' * 1_000_001}")
+
+
+def test_stream_parser_preserves_partial_marker_as_plain_text() -> None:
+    parser = ToolCallStreamParser(frozenset())
+
+    emissions = parser.feed("literal <hermes_tool_")
+    emissions.extend(parser.finish())
+
+    assert (
+        "".join(emission.text for emission in emissions if isinstance(emission, TextEmission))
+        == "literal <hermes_tool_"
+    )

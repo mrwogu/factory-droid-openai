@@ -1,14 +1,24 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import TYPE_CHECKING, cast
 
 import httpx
 import pytest
+from fastapi.exceptions import RequestValidationError
 
-from factory_droid_openai.app import create_app
+from factory_droid_openai.app import (
+    _stream_completion,
+    _validation_message,
+    create_app,
+)
 from factory_droid_openai.config import Settings
-from factory_droid_openai.protocol import TOOL_CALL_CLOSE, TOOL_CALL_OPEN
+from factory_droid_openai.protocol import (
+    TOOL_CALL_CLOSE,
+    TOOL_CALL_OPEN,
+    ToolCallStreamParser,
+)
 from factory_droid_openai.runner import (
     ReasoningDelta,
     RunComplete,
@@ -25,6 +35,8 @@ if TYPE_CHECKING:
     from pathlib import Path
     from typing import Any
 
+    from fastapi import Request
+
     from factory_droid_openai.app import RunnerFactory
 
 
@@ -38,13 +50,17 @@ class FakeRunner:
         self.events = events
         self.error = error
         self.requests: list[RunRequest] = []
+        self.closed = False
 
     async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
         self.requests.append(request)
-        if self.error is not None:
-            raise self.error
-        for event in self.events:
-            yield event
+        try:
+            if self.error is not None:
+                raise self.error
+            for event in self.events:
+                yield event
+        finally:
+            self.closed = True
 
 
 def _settings(tmp_path: Path, *, api_key: str | None = None) -> Settings:
@@ -268,3 +284,242 @@ async def test_invalid_request_uses_openai_error_shape(tmp_path: Path) -> None:
 
     assert response.status_code == 400
     assert response.json()["error"]["type"] == "invalid_request_error"
+
+
+@pytest.mark.asyncio
+async def test_tool_choice_validation_uses_openai_error_shape(tmp_path: Path) -> None:
+    runner = FakeRunner([])
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(tools=[], tool_choice="required"),
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == {
+        "message": "tool_choice='required' needs at least one tool",
+        "type": "invalid_request_error",
+        "param": None,
+        "code": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_protocol_failure_returns_bad_gateway(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner(
+        [
+            TextDelta(f"{TOOL_CALL_OPEN}invalid{TOOL_CALL_CLOSE}"),
+            RunComplete(Usage()),
+        ]
+    )
+    payload = _payload(
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ]
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "factory_protocol_error"
+    assert runner.closed is True
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_incomplete_response_returns_bad_gateway(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner([TextDelta("partial")])
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=_payload())
+
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "factory_incomplete_response"
+    assert runner.closed is True
+
+
+@pytest.mark.asyncio
+async def test_request_options_map_to_runner_request(tmp_path: Path) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+    payload = _payload(
+        model="claude-sonnet-4",
+        timeout=120,
+        reasoning_effort="low",
+        factory_droid_reasoning_effort="high",
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert runner.requests[0].model == "claude-sonnet-4"
+    assert runner.requests[0].timeout_seconds == 30.0
+    assert runner.requests[0].reasoning_effort == "high"
+
+
+@pytest.mark.asyncio
+async def test_streaming_runner_error_uses_sse_error_shape(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [],
+        error=RunnerError(
+            "Droid failed",
+            error_type="factory_droid_sdk_error",
+        ),
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(stream=True),
+        )
+
+    events = [
+        line.removeprefix("data: ")
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    assert events[-1] == "[DONE]"
+    assert json.loads(events[-2])["error"]["type"] == "factory_droid_sdk_error"
+
+
+@pytest.mark.asyncio
+async def test_streaming_protocol_error_uses_sse_error_shape(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [
+            TextDelta(f"{TOOL_CALL_OPEN}invalid{TOOL_CALL_CLOSE}"),
+            RunComplete(Usage()),
+        ]
+    )
+    payload = _payload(
+        stream=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ],
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    error_event = next(
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith('data: {"error"')
+    )
+    assert error_event["error"]["type"] == "factory_protocol_error"
+
+
+@pytest.mark.asyncio
+async def test_chat_endpoint_requires_configured_bearer_token(tmp_path: Path) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+    app = _app(tmp_path, runner, api_key="secret")
+    async with _client(app) as client:
+        denied = await client.post("/v1/chat/completions", json=_payload())
+        allowed = await client.post(
+            "/v1/chat/completions",
+            json=_payload(),
+            headers={"Authorization": "Bearer secret"},
+        )
+
+    assert denied.status_code == 401
+    assert allowed.status_code == 200
+
+
+def test_validation_message_handles_empty_error_list() -> None:
+    assert _validation_message(RequestValidationError([])) == "Invalid request."
+
+
+class FakeRequest:
+    def __init__(self, *, disconnected: bool = False) -> None:
+        self.disconnected = disconnected
+
+    async def is_disconnected(self) -> bool:
+        return self.disconnected
+
+
+@pytest.mark.asyncio
+async def test_stream_generator_maps_every_event_type() -> None:
+    usage = Usage(6, 2, 1, 0)
+    runner = FakeRunner(
+        [
+            TextDelta("Hello"),
+            ReasoningDelta("Think"),
+            UsageUpdate(usage),
+            RunComplete(usage),
+        ]
+    )
+
+    events = await _collect_stream(runner)
+
+    assert any('"content":"Hello"' in event for event in events)
+    assert any('"reasoning":"Think"' in event for event in events)
+    assert any('"total_tokens":8' in event for event in events)
+    assert events[-1] == "data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
+async def test_stream_generator_emits_tool_call_from_finish_buffer() -> None:
+    runner = FakeRunner(
+        [
+            TextDelta(f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{}}}}{TOOL_CALL_CLOSE}'),
+            RunComplete(Usage()),
+        ]
+    )
+
+    events = await _collect_stream(
+        runner,
+        allowed_tool_names=frozenset({"weather"}),
+    )
+
+    assert any('"tool_calls"' in event for event in events)
+    assert any('"finish_reason":"tool_calls"' in event for event in events)
+
+
+@pytest.mark.asyncio
+async def test_stream_generator_maps_incomplete_response_to_sse_error() -> None:
+    events = await _collect_stream(FakeRunner([TextDelta("partial")]))
+
+    assert any('"type":"factory_incomplete_response"' in event for event in events)
+    assert events[-1] == "data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
+async def test_stream_generator_stops_after_client_disconnect() -> None:
+    runner = FakeRunner([TextDelta("ignored"), RunComplete(Usage())])
+
+    events = await _collect_stream(runner, disconnected=True)
+
+    assert len(events) == 1
+    assert '"role":"assistant"' in events[0]
+    assert runner.closed is True
+
+
+async def _collect_stream(
+    runner: FakeRunner,
+    *,
+    allowed_tool_names: frozenset[str] = frozenset(),
+    disconnected: bool = False,
+) -> list[str]:
+    return [
+        event
+        async for event in _stream_completion(
+            request=cast("Request", FakeRequest(disconnected=disconnected)),
+            request_id="chatcmpl-test",
+            created=1,
+            model="factory-droid",
+            parser=ToolCallStreamParser(allowed_tool_names),
+            runner=cast("Any", runner),
+            run_request=RunRequest(
+                prompt="prompt",
+                model="factory-droid",
+                model_alias="factory-droid",
+                reasoning_effort=None,
+                timeout_seconds=30,
+            ),
+            concurrency=asyncio.Semaphore(1),
+        )
+    ]

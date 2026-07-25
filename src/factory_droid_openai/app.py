@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import secrets
 import time
@@ -220,16 +221,17 @@ async def _collect_completion(
     parser: ToolCallStreamParser,
 ) -> CollectedCompletion:
     result = CollectedCompletion()
-    async for event in runner.run(run_request):
-        if isinstance(event, TextDelta):
-            _apply_emissions(result, parser.feed(event.text))
-        elif isinstance(event, ReasoningDelta):
-            result.reasoning += event.text
-        elif isinstance(event, UsageUpdate):
-            result.usage = event.usage
-        elif isinstance(event, RunComplete):
-            result.usage = event.usage
-            result.completed = True
+    async with contextlib.aclosing(runner.run(run_request)) as events:
+        async for event in events:
+            if isinstance(event, TextDelta):
+                _apply_emissions(result, parser.feed(event.text))
+            elif isinstance(event, ReasoningDelta):
+                result.reasoning += event.text
+            elif isinstance(event, UsageUpdate):
+                result.usage = event.usage
+            elif isinstance(event, RunComplete):
+                result.usage = event.usage
+                result.completed = True
     if not result.completed:
         raise RunnerError(
             "Factory Droid ended without a completion event.",
@@ -263,8 +265,8 @@ async def _stream_completion(
     saw_tool_call = False
 
     try:
-        async with concurrency:
-            async for event in runner.run(run_request):
+        async with concurrency, contextlib.aclosing(runner.run(run_request)) as events:
+            async for event in events:
                 if await request.is_disconnected():
                     return
                 if isinstance(event, TextDelta):
