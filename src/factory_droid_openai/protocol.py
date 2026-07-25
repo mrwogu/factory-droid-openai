@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from factory_droid_openai.models import ChatCompletionRequest, ToolDefinition
 
-TOOL_CALL_OPEN = "<hermes_tool_call>"
-TOOL_CALL_CLOSE = "</hermes_tool_call>"
+TOOL_CALL_OPEN = "<tool_call>"
+TOOL_CALL_CLOSE = "</tool_call>"
 _MAX_TOOL_PAYLOAD_BYTES = 1_000_000
 
 

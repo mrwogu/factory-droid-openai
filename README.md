@@ -45,6 +45,48 @@ The alias requests the Droid CLI's configured default instead of selecting a
 model explicitly. Examples below use explicit `gpt-5.4` and
 `gemini-3.1-pro-preview` model IDs.
 
+## API compatibility
+
+✅ Supported · ⚠️ Partial · ❌ Unsupported
+
+| OpenAI capability | Status | Bridge behavior |
+|---|---|---|
+| Text chat completions | ✅ | Returns one assistant choice |
+| System and developer messages | ✅ | Serialized with the complete transcript |
+| Non-streaming responses | ✅ | OpenAI-compatible JSON completion |
+| Streaming responses | ✅ | SSE chunks followed by `[DONE]` |
+| Function tool schemas | ✅ | Serialized into the strict Droid prompt |
+| Tool choice | ✅ | `auto`, `none`, `required`, or one named function |
+| Tool-result continuation | ✅ | Client resends the complete transcript on the next request |
+| Parallel tool calls | ❌ | At most one external tool call per Droid turn |
+| Reasoning output | ✅ | Emitted as `reasoning` and `reasoning_content` |
+| Token usage | ✅ | Includes cache read and write token details |
+| Model selection | ✅ | Alias uses the Droid default; other IDs are forwarded |
+| Multimodal content | ⚠️ | Content structures are serialized as JSON, not SDK attachments |
+| Structured outputs | ❌ | `response_format` and JSON schema enforcement are ignored |
+| Sampling controls | ❌ | `temperature`, `top_p`, penalties, and `seed` are ignored |
+| Multiple choices | ❌ | `n` is ignored and one choice is returned |
+| Log probabilities | ❌ | `logprobs` and `top_logprobs` are ignored |
+| Output token limits | ❌ | `max_tokens` and `max_completion_tokens` are ignored |
+| Stored completions | ❌ | `store`, `metadata`, listing, retrieval, and deletion are unavailable |
+| Prompt cache controls | ❌ | OpenAI cache keys and retention settings are ignored |
+| Built-in web search | ❌ | `web_search_options` is ignored |
+| Audio output | ❌ | Audio modalities and audio response fields are ignored |
+
+### Unsupported API families
+
+| API family | Status |
+|---|---|
+| Responses API | ❌ |
+| Embeddings | ❌ |
+| Images | ❌ |
+| Audio | ❌ |
+| Files and batches | ❌ |
+| Fine-tuning | ❌ |
+| Moderations | ❌ |
+| Realtime | ❌ |
+| Vector stores and uploads | ❌ |
+
 ## Features
 
 - OpenAI-compatible `POST /v1/chat/completions`
@@ -87,7 +129,7 @@ events back to OpenAI response objects.
 External tools use a strict text protocol. Droid emits:
 
 ```text
-<hermes_tool_call>{"name":"weather","arguments":{"city":"Gdansk"}}</hermes_tool_call>
+<tool_call>{"name":"weather","arguments":{"city":"Gdansk"}}</tool_call>
 ```
 
 The bridge validates the tool name and JSON arguments, then returns a standard
@@ -354,7 +396,7 @@ continuation, streaming usage, developer messages, and reasoning effort are
 enabled explicitly. Strict tool schemas, temperature control, multimodal SDK
 attachments, and parallel tool calls remain unsupported by this bridge.
 
-## API compatibility
+## API reference
 
 ### Endpoints
 
@@ -366,48 +408,6 @@ attachments, and parallel tool calls remain unsupported by this bridge.
 | `GET` | `/openapi.json` | OpenAPI 3.1 contract |
 | `GET` | `/docs` | Interactive Swagger UI |
 | `GET` | `/redoc` | Interactive ReDoc reference |
-
-### Feature support matrix
-
-✅ Supported · ⚠️ Partial · ❌ Unsupported
-
-| OpenAI capability | Status | Bridge behavior |
-|---|---|---|
-| Text chat completions | ✅ | Returns one assistant choice |
-| System and developer messages | ✅ | Serialized with the complete transcript |
-| Non-streaming responses | ✅ | OpenAI-compatible JSON completion |
-| Streaming responses | ✅ | SSE chunks followed by `[DONE]` |
-| Function tool schemas | ✅ | Serialized into the strict Droid prompt |
-| Tool choice | ✅ | `auto`, `none`, `required`, or one named function |
-| Tool-result continuation | ✅ | Client resends the complete transcript on the next request |
-| Parallel tool calls | ❌ | At most one external tool call per Droid turn |
-| Reasoning output | ✅ | Emitted as `reasoning` and `reasoning_content` |
-| Token usage | ✅ | Includes cache read and write token details |
-| Model selection | ✅ | Alias uses the Droid default; other IDs are forwarded |
-| Multimodal content | ⚠️ | Content structures are serialized as JSON, not SDK attachments |
-| Structured outputs | ❌ | `response_format` and JSON schema enforcement are ignored |
-| Sampling controls | ❌ | `temperature`, `top_p`, penalties, and `seed` are ignored |
-| Multiple choices | ❌ | `n` is ignored and one choice is returned |
-| Log probabilities | ❌ | `logprobs` and `top_logprobs` are ignored |
-| Output token limits | ❌ | `max_tokens` and `max_completion_tokens` are ignored |
-| Stored completions | ❌ | `store`, `metadata`, listing, retrieval, and deletion are unavailable |
-| Prompt cache controls | ❌ | OpenAI cache keys and retention settings are ignored |
-| Built-in web search | ❌ | `web_search_options` is ignored |
-| Audio output | ❌ | Audio modalities and audio response fields are ignored |
-
-### Unsupported API families
-
-| API family | Status |
-|---|---|
-| Responses API | ❌ |
-| Embeddings | ❌ |
-| Images | ❌ |
-| Audio | ❌ |
-| Files and batches | ❌ |
-| Fine-tuning | ❌ |
-| Moderations | ❌ |
-| Realtime | ❌ |
-| Vector stores and uploads | ❌ |
 
 ### OpenAPI contract
 

@@ -209,9 +209,9 @@ async def test_streaming_chat_completion_uses_openai_sse(tmp_path: Path) -> None
 async def test_streaming_tool_call_handles_split_markers(tmp_path: Path) -> None:
     runner = FakeRunner(
         [
-            TextDelta("<hermes_tool_"),
+            TextDelta("<tool_"),
             TextDelta('call>{"name":"weather","arguments":{'),
-            TextDelta('"city":"Gdansk"}}</hermes_tool_call>'),
+            TextDelta('"city":"Gdansk"}}</tool_call>'),
             RunComplete(Usage()),
         ]
     )
