@@ -182,7 +182,10 @@ async def test_streaming_chat_completion_uses_openai_sse(tmp_path: Path) -> None
     async with _client(_app(tmp_path, runner)) as client:
         response = await client.post(
             "/v1/chat/completions",
-            json=_payload(stream=True),
+            json=_payload(
+                stream=True,
+                stream_options={"include_usage": True},
+            ),
         )
 
     assert response.status_code == 200
@@ -196,7 +199,9 @@ async def test_streaming_chat_completion_uses_openai_sse(tmp_path: Path) -> None
     assert chunks[0]["choices"][0]["delta"]["role"] == "assistant"
     assert chunks[1]["choices"][0]["delta"]["reasoning"] == "think"
     assert chunks[2]["choices"][0]["delta"]["content"] == "Hi"
-    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+    assert chunks[-2]["choices"][0]["finish_reason"] == "stop"
+    assert all(chunk["usage"] is None for chunk in chunks[:-1])
+    assert chunks[-1]["choices"] == []
     assert chunks[-1]["usage"]["total_tokens"] == 11
 
 
@@ -234,6 +239,7 @@ async def test_streaming_tool_call_handles_split_markers(tmp_path: Path) -> None
     )
     assert tool_delta["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "weather"
     assert data[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    assert all("usage" not in chunk for chunk in data)
 
 
 @pytest.mark.asyncio
@@ -453,7 +459,7 @@ async def test_stream_generator_maps_every_event_type() -> None:
         ]
     )
 
-    events = await _collect_stream(runner)
+    events = await _collect_stream(runner, include_usage=True)
 
     assert any('"content":"Hello"' in event for event in events)
     assert any('"reasoning":"Think"' in event for event in events)
@@ -503,6 +509,7 @@ async def _collect_stream(
     *,
     allowed_tool_names: frozenset[str] = frozenset(),
     disconnected: bool = False,
+    include_usage: bool = False,
 ) -> list[str]:
     return [
         event
@@ -521,5 +528,6 @@ async def _collect_stream(
                 timeout_seconds=30,
             ),
             concurrency=asyncio.Semaphore(1),
+            include_usage=include_usage,
         )
     ]

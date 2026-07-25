@@ -116,9 +116,11 @@ async def test_official_openai_client_parses_stream(
         )
         chunks = [chunk async for chunk in stream]
 
-    content = "".join(chunk.choices[0].delta.content or "" for chunk in chunks)
+    content = "".join(chunk.choices[0].delta.content or "" for chunk in chunks if chunk.choices)
     assert content == "Hello stream"
-    assert chunks[-1].choices[0].finish_reason == "stop"
+    assert chunks[-2].choices[0].finish_reason == "stop"
+    assert all(chunk.usage is None for chunk in chunks[:-1])
+    assert chunks[-1].choices == []
     assert chunks[-1].usage is not None
     assert chunks[-1].usage.total_tokens == 6
 
