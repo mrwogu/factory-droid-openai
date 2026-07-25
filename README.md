@@ -375,6 +375,11 @@ attachments, and parallel tool calls remain unsupported by this bridge.
 | Sampling controls | Not supported | `temperature`, `top_p`, penalties, and `seed` are ignored |
 | Multiple choices | Not supported | `n` is ignored and one choice is returned |
 | Log probabilities | Not supported | `logprobs` and `top_logprobs` are ignored |
+| Output token limits | Not supported | `max_tokens` and `max_completion_tokens` are ignored |
+| Stored completions | Not supported | `store`, `metadata`, listing, retrieval, and deletion are unavailable |
+| Prompt cache controls | Not supported | OpenAI cache keys and retention settings are ignored |
+| Built-in web search | Not supported | `web_search_options` is ignored |
+| Audio output | Not supported | Audio modalities and audio response fields are ignored |
 
 ### Unsupported API families
 
@@ -387,6 +392,8 @@ attachments, and parallel tool calls remain unsupported by this bridge.
 | Files and batches | Not implemented |
 | Fine-tuning | Not implemented |
 | Moderations | Not implemented |
+| Realtime | Not implemented |
+| Vector stores and uploads | Not implemented |
 
 ### OpenAPI contract
 
@@ -414,11 +421,22 @@ tool calls through the official `openai` Python client.
 | `tools` | Yes | OpenAI function tools |
 | `tool_choice` | Yes | `auto`, `none`, `required`, or one named function |
 | `stream` | Yes | OpenAI-compatible SSE chunks |
-| `stream_options` | Partial | Accepted; usage is always included in the final stream chunk |
+| `stream_options.include_usage` | Yes | Emits null usage on normal chunks and one final usage-only chunk |
+| `stream_options.include_obfuscation` | No | Accepted but ignored |
 | `reasoning_effort` | Yes | Mapped to Droid reasoning effort |
 | `factory_droid_reasoning_effort` | Yes | Bridge-specific override |
 | `timeout` | Yes | Per-request value capped by server timeout |
-| Common sampling fields | Accepted | Ignored; see the feature matrix |
+| `temperature`, `top_p`, penalties, `seed` | No | Accepted but ignored |
+| `max_tokens`, `max_completion_tokens`, `stop` | No | Accepted but ignored |
+| `response_format` | No | Accepted but not enforced |
+| `parallel_tool_calls` | No | Accepted but ignored |
+| `functions`, `function_call` | No | Legacy function-calling fields are ignored |
+| `modalities`, `audio` | No | Accepted but ignored |
+| `logprobs`, `top_logprobs`, `logit_bias` | No | Accepted but ignored |
+| `store`, `metadata`, `user`, `safety_identifier` | No | Accepted but ignored |
+| `prompt_cache_key`, cache options and retention | No | Accepted but ignored |
+| `prediction`, `service_tier`, `verbosity` | No | Accepted but ignored |
+| `web_search_options` | No | Accepted but ignored |
 | Unknown fields | Accepted | Ignored by the bridge |
 
 The bridge currently returns one choice with index `0`.
@@ -597,6 +615,29 @@ factory_incomplete_response
 
 The Droid stream ended without a turn-complete event. Check Droid CLI health,
 request timeout, and bridge logs.
+
+## PromptScript
+
+Project AI instructions use [PromptScript](https://getpromptscript.dev/) as the
+source of truth. `promptscript.yaml` enables the `claude` and `factory`
+targets. Edit `.promptscript/project.prs`, not generated target files.
+
+| Target | Generated project instructions | Generated language skill |
+|---|---|---|
+| Claude Code | `CLAUDE.md` | `.claude/skills/promptscript/SKILL.md` |
+| Factory Droid | `AGENTS.md` | `.factory/skills/promptscript/SKILL.md` |
+
+Install and verify:
+
+```bash
+npm install --global "@promptscript/cli@1.14.2"
+prs validate
+prs compile --all
+prs diff --all --no-color
+prs check
+```
+
+CI validates PromptScript syntax and rejects generated target drift.
 
 ## Development
 

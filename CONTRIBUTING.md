@@ -34,6 +34,9 @@ uv run python scripts/generate_openapi.py
 uv run openapi-spec-validator openapi.json
 uv run pytest --cov=factory_droid_openai --cov-report=term-missing
 uv build
+prs validate
+prs diff --all --no-color
+prs check
 ```
 
 Apply formatting with:
