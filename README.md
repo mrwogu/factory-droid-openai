@@ -13,6 +13,38 @@ authenticated Factory Droid CLI through `/v1/chat/completions`.
 
 This project is not affiliated with, endorsed by, or maintained by Factory.
 
+## Quick start
+
+Requires Python 3.11+, an installed `droid` CLI, and an authenticated Factory
+session.
+
+```bash
+git clone https://github.com/mrwogu/factory-droid-openai.git
+cd factory-droid-openai
+uv sync
+FACTORY_DROID_OPENAI_WORKDIR="/path/to/your/project" \
+  uv run factory-droid-openai
+```
+
+From another terminal, send an explicit Droid model ID:
+
+```bash
+curl --fail http://127.0.0.1:8787/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "gpt-5.4",
+    "messages": [
+      {"role": "user", "content": "Reply with hello."}
+    ]
+  }'
+```
+
+Use an ID listed under `Available Models` by `droid exec --help`. The bridge
+forwards every model value except its `factory-droid` alias directly to Droid.
+The alias requests the Droid CLI's configured default instead of selecting a
+model explicitly. Examples below use explicit `gpt-5.4` and
+`gemini-3.1-pro-preview` model IDs.
+
 ## Features
 
 - OpenAI-compatible `POST /v1/chat/completions`
@@ -99,39 +131,11 @@ python3 -m venv .venv
 
 The default address is `http://127.0.0.1:8787`.
 
-## Quick start
-
-Start the bridge:
-
-```bash
-FACTORY_DROID_OPENAI_WORKDIR="$PWD" \
-  factory-droid-openai
-```
-
-Check health:
+Check health and inspect the configured alias:
 
 ```bash
 curl --fail http://127.0.0.1:8787/health
-```
-
-List models:
-
-```bash
 curl --fail http://127.0.0.1:8787/v1/models
-```
-
-Create a completion:
-
-```bash
-curl --fail http://127.0.0.1:8787/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "factory-droid",
-    "messages": [
-      {"role": "system", "content": "Answer concisely."},
-      {"role": "user", "content": "Reply with hello."}
-    ]
-  }'
 ```
 
 Stream a completion:
@@ -140,7 +144,7 @@ Stream a completion:
 curl --no-buffer --fail http://127.0.0.1:8787/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "factory-droid",
+    "model": "gemini-3.1-pro-preview",
     "stream": true,
     "messages": [
       {"role": "user", "content": "Count from one to three."}
@@ -167,7 +171,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="factory-droid",
+    model="gpt-5.4",
     messages=[
         {"role": "system", "content": "Answer concisely."},
         {"role": "user", "content": "Explain JSON-RPC in one sentence."},
@@ -188,7 +192,7 @@ client = OpenAI(
 )
 
 stream = client.chat.completions.create(
-    model="factory-droid",
+    model="gemini-3.1-pro-preview",
     messages=[{"role": "user", "content": "Count from one to three."}],
     stream=True,
 )
@@ -231,7 +235,7 @@ tools = [
 ]
 
 first = client.chat.completions.create(
-    model="factory-droid",
+    model="gpt-5.4",
     messages=messages,
     tools=tools,
 )
@@ -250,7 +254,7 @@ for tool_call in assistant.tool_calls or []:
     )
 
 final = client.chat.completions.create(
-    model="factory-droid",
+    model="gpt-5.4",
     messages=messages,
     tools=tools,
 )
@@ -265,11 +269,14 @@ Configure Hermes as a custom OpenAI-compatible provider in
 ```yaml
 model:
   provider: custom
-  default: factory-droid
+  default: gpt-5.4
   base_url: http://127.0.0.1:8787/v1
   api_key: none
   api_mode: chat_completions
 ```
+
+`model.default` is forwarded to Droid as an explicit model ID. Replace it with
+another ID from `droid exec --help` when needed.
 
 Hermes retains ownership of tool execution. The bridge converts Droid's strict
 tool protocol into OpenAI `tool_calls`, and Hermes returns tool results in the
@@ -294,9 +301,11 @@ Add this JSON5 configuration:
 {
   agents: {
     defaults: {
-      model: { primary: "factory-droid/factory-droid" },
+      model: { primary: "factory-droid/gpt-5.4" },
       models: {
-        "factory-droid/factory-droid": { alias: "Factory Droid" },
+        "factory-droid/gpt-5.4": {
+          alias: "GPT-5.4 via Factory Droid",
+        },
       },
     },
   },
@@ -310,8 +319,8 @@ Add this JSON5 configuration:
         timeoutSeconds: 600,
         models: [
           {
-            id: "factory-droid",
-            name: "Factory Droid",
+            id: "gpt-5.4",
+            name: "GPT-5.4 via Factory Droid",
             reasoning: true,
             input: ["text"],
             compat: {
@@ -328,6 +337,9 @@ Add this JSON5 configuration:
   },
 }
 ```
+
+Here, the first `factory-droid` segment names the OpenClaw provider. The
+`gpt-5.4` segment and model `id` are the explicit Droid model ID.
 
 Start the bridge from the working directory Droid should access, then restart
 the OpenClaw gateway. Verify the configuration with:
@@ -357,36 +369,45 @@ attachments, and parallel tool calls remain unsupported by this bridge.
 
 ### Feature support matrix
 
+✅ Supported · ⚠️ Partial · ❌ Unsupported
+
 | OpenAI capability | Status | Bridge behavior |
 |---|---|---|
-| Text chat completions | Supported | Returns one assistant choice |
-| System and developer messages | Supported | Serialized with the complete transcript |
-| Non-streaming responses | Supported | OpenAI-compatible JSON completion |
-| Streaming responses | Supported | SSE chunks followed by `[DONE]` |
-| Function tool schemas | Supported | Serialized into the strict Droid prompt |
-| Tool choice | Supported | `auto`, `none`, `required`, or one named function |
-| Tool-result continuation | Supported | Client resends the complete transcript on the next request |
-| Parallel tool calls | Not supported | At most one external tool call per Droid turn |
-| Reasoning output | Supported | Emitted as `reasoning` and `reasoning_content` |
-| Token usage | Supported | Includes cache read and write token details |
-| Model selection | Supported | Alias uses the Droid default; other IDs are forwarded |
-| Multimodal content | Partial | Content structures are serialized as JSON, not SDK attachments |
-| Structured outputs | Not supported | `response_format` and JSON schema enforcement are ignored |
-| Sampling controls | Not supported | `temperature`, `top_p`, penalties, and `seed` are ignored |
-| Multiple choices | Not supported | `n` is ignored and one choice is returned |
-| Log probabilities | Not supported | `logprobs` and `top_logprobs` are ignored |
+| Text chat completions | ✅ | Returns one assistant choice |
+| System and developer messages | ✅ | Serialized with the complete transcript |
+| Non-streaming responses | ✅ | OpenAI-compatible JSON completion |
+| Streaming responses | ✅ | SSE chunks followed by `[DONE]` |
+| Function tool schemas | ✅ | Serialized into the strict Droid prompt |
+| Tool choice | ✅ | `auto`, `none`, `required`, or one named function |
+| Tool-result continuation | ✅ | Client resends the complete transcript on the next request |
+| Parallel tool calls | ❌ | At most one external tool call per Droid turn |
+| Reasoning output | ✅ | Emitted as `reasoning` and `reasoning_content` |
+| Token usage | ✅ | Includes cache read and write token details |
+| Model selection | ✅ | Alias uses the Droid default; other IDs are forwarded |
+| Multimodal content | ⚠️ | Content structures are serialized as JSON, not SDK attachments |
+| Structured outputs | ❌ | `response_format` and JSON schema enforcement are ignored |
+| Sampling controls | ❌ | `temperature`, `top_p`, penalties, and `seed` are ignored |
+| Multiple choices | ❌ | `n` is ignored and one choice is returned |
+| Log probabilities | ❌ | `logprobs` and `top_logprobs` are ignored |
+| Output token limits | ❌ | `max_tokens` and `max_completion_tokens` are ignored |
+| Stored completions | ❌ | `store`, `metadata`, listing, retrieval, and deletion are unavailable |
+| Prompt cache controls | ❌ | OpenAI cache keys and retention settings are ignored |
+| Built-in web search | ❌ | `web_search_options` is ignored |
+| Audio output | ❌ | Audio modalities and audio response fields are ignored |
 
 ### Unsupported API families
 
 | API family | Status |
 |---|---|
-| Responses API | Not implemented |
-| Embeddings | Not implemented |
-| Images | Not implemented |
-| Audio | Not implemented |
-| Files and batches | Not implemented |
-| Fine-tuning | Not implemented |
-| Moderations | Not implemented |
+| Responses API | ❌ |
+| Embeddings | ❌ |
+| Images | ❌ |
+| Audio | ❌ |
+| Files and batches | ❌ |
+| Fine-tuning | ❌ |
+| Moderations | ❌ |
+| Realtime | ❌ |
+| Vector stores and uploads | ❌ |
 
 ### OpenAPI contract
 
@@ -414,11 +435,22 @@ tool calls through the official `openai` Python client.
 | `tools` | Yes | OpenAI function tools |
 | `tool_choice` | Yes | `auto`, `none`, `required`, or one named function |
 | `stream` | Yes | OpenAI-compatible SSE chunks |
-| `stream_options` | Partial | Accepted; usage is always included in the final stream chunk |
+| `stream_options.include_usage` | Yes | Emits null usage on normal chunks and one final usage-only chunk |
+| `stream_options.include_obfuscation` | No | Accepted but ignored |
 | `reasoning_effort` | Yes | Mapped to Droid reasoning effort |
 | `factory_droid_reasoning_effort` | Yes | Bridge-specific override |
 | `timeout` | Yes | Per-request value capped by server timeout |
-| Common sampling fields | Accepted | Ignored; see the feature matrix |
+| `temperature`, `top_p`, penalties, `seed` | No | Accepted but ignored |
+| `max_tokens`, `max_completion_tokens`, `stop` | No | Accepted but ignored |
+| `response_format` | No | Accepted but not enforced |
+| `parallel_tool_calls` | No | Accepted but ignored |
+| `functions`, `function_call` | No | Legacy function-calling fields are ignored |
+| `modalities`, `audio` | No | Accepted but ignored |
+| `logprobs`, `top_logprobs`, `logit_bias` | No | Accepted but ignored |
+| `store`, `metadata`, `user`, `safety_identifier` | No | Accepted but ignored |
+| `prompt_cache_key`, cache options and retention | No | Accepted but ignored |
+| `prediction`, `service_tier`, `verbosity` | No | Accepted but ignored |
+| `web_search_options` | No | Accepted but ignored |
 | Unknown fields | Accepted | Ignored by the bridge |
 
 The bridge currently returns one choice with index `0`.
@@ -433,13 +465,22 @@ initialization:
 
 ```json
 {
-  "model": "claude-sonnet-4",
+  "model": "gpt-5.4",
   "messages": [{"role": "user", "content": "Hello"}]
 }
 ```
 
-Model availability depends on the authenticated Factory account and Droid CLI
-configuration.
+For the official OpenAI client, the same explicit selection is:
+
+```python
+client.chat.completions.create(
+    model="gemini-3.1-pro-preview",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+```
+
+Run `droid exec --help` to list model IDs available in the installed Droid CLI.
+Availability also depends on the authenticated Factory account.
 
 ### Reasoning
 

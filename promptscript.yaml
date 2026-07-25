@@ -1,0 +1,11 @@
+id: factory-droid-openai
+syntax: 1.4.0
+targets:
+  - claude
+  - factory
+validation:
+  rules:
+    empty-block: warning
+formatting:
+  tabWidth: 2
+  proseWrap: preserve

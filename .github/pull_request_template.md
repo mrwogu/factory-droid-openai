@@ -10,10 +10,11 @@ Describe the change and why it is needed.
 - [ ] `uv run openapi-spec-validator openapi.json`
 - [ ] `uv run pytest --cov=factory_droid_openai --cov-report=term-missing`
 - [ ] `uv build`
+- [ ] `prs validate && prs diff --all --no-color && prs check`
 
 ## Security and compatibility
 
-- [ ] No credentials, private prompt data, or generated artifacts committed.
+- [ ] No credentials, private prompt data, or generated build artifacts committed.
 - [ ] OpenAI response shapes remain compatible in streaming and non-streaming modes.
 - [ ] Factory-native tools remain blocked.
 - [ ] Documentation and tests cover user-visible behavior changes.
