@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 import secrets
 import time
 import uuid
@@ -137,6 +138,15 @@ class SessionRegistry:
 
 
 class AdmissionLease:
+    """A held admission slot, releasable more than once.
+
+    Streaming releases the lease from two places: the generator's own
+    ``async with``, and the response finalizer. Only the finalizer runs when a
+    generator is closed before it ever starts, so both are needed; the
+    idempotency guard in ``release`` is what makes the overlap safe. Removing
+    either site leaks a slot.
+    """
+
     def __init__(self, admission: AdmissionController) -> None:
         self._admission = admission
         self._released = False
@@ -240,31 +250,55 @@ class _ClientDisconnectedError(Exception):
     pass
 
 
+_JSON_STRUCTURAL = re.compile(rb'["\\{}\[\]]')
+_JSON_QUOTE = ord('"')
+_JSON_BACKSLASH = ord("\\")
+_JSON_OPENERS = frozenset({ord("{"), ord("[")})
+_JSON_CLOSERS = frozenset({ord("}"), ord("]")})
+
+
 class _JsonDepthTracker:
+    """Bounds JSON nesting depth while the body is still being received.
+
+    Only quotes, escapes and brackets can change the state, so the search for
+    them runs in the regex engine rather than as one interpreter step per
+    byte. A large but flat body - a single multi-megabyte message string is
+    the common shape - costs a native scan instead of blocking the event loop
+    for tens of milliseconds.
+    """
+
     def __init__(self, max_depth: int) -> None:
         self._max_depth = max_depth
         self._depth = 0
         self._in_string = False
-        self._escaped = False
+        # Index of the byte neutralized by a backslash carried over from the
+        # previous chunk; -1 when no escape is pending.
+        self._escaped_index = -1
 
     def feed(self, data: bytes) -> None:
-        for value in data:
+        escaped_index = self._escaped_index
+        self._escaped_index = -1
+        for match in _JSON_STRUCTURAL.finditer(data):
+            index = match.start()
+            if index == escaped_index:
+                continue
+            value = data[index]
             if self._in_string:
-                if self._escaped:
-                    self._escaped = False
-                elif value == ord("\\"):
-                    self._escaped = True
-                elif value == ord('"'):
+                if value == _JSON_BACKSLASH:
+                    escaped_index = index + 1
+                elif value == _JSON_QUOTE:
                     self._in_string = False
                 continue
-            if value == ord('"'):
+            if value == _JSON_QUOTE:
                 self._in_string = True
-            elif value in (ord("{"), ord("[")):
+            elif value in _JSON_OPENERS:
                 self._depth += 1
                 if self._depth > self._max_depth:
                     raise _RequestPayloadLimitError("Request JSON exceeds configured depth limit.")
-            elif value in (ord("}"), ord("]")):
+            elif value in _JSON_CLOSERS:
                 self._depth = max(0, self._depth - 1)
+        if escaped_index == len(data):
+            self._escaped_index = 0
 
 
 class RequestSizeLimitMiddleware:

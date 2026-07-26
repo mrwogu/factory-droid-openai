@@ -662,3 +662,30 @@ def test_build_prompt_moves_images_out_of_the_transcript() -> None:
     assert "QUJD" not in plan.prompt
     assert "[attached image #1 (image/png)]" in plan.prompt
     assert plan.attachments.images[0].data == "QUJD"
+
+
+def test_streaming_parser_keeps_a_bounded_tail_for_large_payloads() -> None:
+    """Guards the invariant that keeps tool-call parsing linear.
+
+    The parser must only ever re-scan the incoming chunk plus a tail shorter
+    than the closing marker. Accumulating the payload and re-scanning it on
+    every feed is what made this O(n^2), and nothing else in the suite would
+    notice that coming back.
+    """
+    payload = json.dumps({"name": "lookup", "arguments": {"q": "x" * 200_000}})
+    stream = f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE}"
+    parser = ToolCallStreamParser(frozenset({"lookup"}))
+    limit = len(TOOL_CALL_CLOSE) - 1
+    widest_tail = 0
+
+    emissions: list[object] = []
+    for index in range(0, len(stream), 16):
+        emissions.extend(parser.feed(stream[index : index + 16]))
+        widest_tail = max(widest_tail, len(parser._close_tail))
+
+    assert widest_tail <= limit
+    emissions.extend(parser.finish())
+    assert len(emissions) == 1
+    call = emissions[0]
+    assert isinstance(call, ToolCallEmission)
+    assert json.loads(call.arguments)["q"] == "x" * 200_000
