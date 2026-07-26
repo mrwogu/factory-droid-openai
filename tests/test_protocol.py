@@ -6,6 +6,7 @@ import pytest
 
 from factory_droid_openai.models import ChatCompletionRequest
 from factory_droid_openai.protocol import (
+    _MAX_TOOL_PAYLOAD_BYTES,
     TOOL_CALL_CLOSE,
     TOOL_CALL_OPEN,
     ProtocolError,
@@ -148,6 +149,125 @@ def test_build_prompt_rejects_invalid_tool_choice(
         build_prompt(chat_request)
 
 
+def test_build_prompt_enforces_message_count_before_serializing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    messages = [{"role": "user", "content": f"message {index}"} for index in range(3)]
+
+    build_prompt(_request(messages=messages[:2]), max_messages=2)
+    request = _request(messages=messages)
+    message_type = type(request.messages[0])
+    monkeypatch.setattr(
+        message_type,
+        "model_dump",
+        lambda *_args, **_kwargs: pytest.fail("message serialized before count check"),
+    )
+
+    with pytest.raises(ProtocolError, match="maximum of 2 messages"):
+        build_prompt(request, max_messages=2)
+
+
+def test_build_prompt_enforces_tool_count_boundary() -> None:
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": f"tool_{index}", "parameters": {}},
+        }
+        for index in range(3)
+    ]
+
+    build_prompt(_request(tools=tools[:2]), max_tools=2)
+
+    with pytest.raises(ProtocolError, match="maximum of 2 tools"):
+        build_prompt(_request(tools=tools), max_tools=2)
+
+
+def test_build_prompt_enforces_utf8_tool_schema_byte_boundary() -> None:
+    request = _request(
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "description": "Zażółć",
+                    "parameters": {},
+                },
+            }
+        ]
+    )
+    assert request.tools is not None
+    serialized = json.dumps(
+        request.tools[0].model_dump(mode="json"),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    schema_bytes = len(serialized.encode("utf-8"))
+
+    build_prompt(request, max_tool_schema_bytes=schema_bytes)
+
+    with pytest.raises(ProtocolError, match=f"maximum of {schema_bytes - 1} bytes"):
+        build_prompt(request, max_tool_schema_bytes=schema_bytes - 1)
+
+
+def test_build_prompt_enforces_utf8_transcript_byte_boundary() -> None:
+    request = _request(
+        messages=[{"role": "user", "content": "Zażółć gęślą jaźń"}],
+        tools=[],
+    )
+    plan = build_prompt(request)
+    transcript = plan.prompt.split("OPENAI_TRANSCRIPT_JSON\n", 1)[1].split(
+        "\nEND_OPENAI_TRANSCRIPT_JSON",
+        1,
+    )[0]
+    transcript_bytes = len(transcript.encode("utf-8"))
+
+    build_prompt(request, max_transcript_bytes=transcript_bytes)
+
+    with pytest.raises(ProtocolError, match=f"maximum of {transcript_bytes - 1} bytes"):
+        build_prompt(request, max_transcript_bytes=transcript_bytes - 1)
+
+
+def test_build_prompt_enforces_tool_schema_depth_boundary() -> None:
+    max_depth = 6
+
+    def nested_parameters(wrappers: int) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for _ in range(wrappers):
+            value = {"nested": value}
+        return value
+
+    build_prompt(
+        _request(
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "parameters": nested_parameters(max_depth - 3),
+                    },
+                }
+            ]
+        ),
+        max_json_depth=max_depth,
+    )
+
+    with pytest.raises(ProtocolError, match="maximum JSON depth of 6"):
+        build_prompt(
+            _request(
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "weather",
+                            "parameters": nested_parameters(max_depth - 2),
+                        },
+                    }
+                ]
+            ),
+            max_json_depth=max_depth,
+        )
+
+
 def test_stream_parser_handles_every_marker_split() -> None:
     value = (
         "Before "
@@ -170,6 +290,46 @@ def test_stream_parser_handles_every_marker_split() -> None:
         assert len(tool_calls) == 1
         assert tool_calls[0].name == "weather"
         assert json.loads(tool_calls[0].arguments) == {"city": "Gdańsk"}
+
+
+@pytest.mark.parametrize("chunk_size", [1, 7])
+def test_stream_parser_handles_one_character_and_multibyte_chunks(
+    chunk_size: int,
+) -> None:
+    value = (
+        "Przed "
+        f"{TOOL_CALL_OPEN}"
+        '{"name":"weather","arguments":{"city":"Gdańsk"}}'
+        f"{TOOL_CALL_CLOSE}"
+    )
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    emissions: list[TextEmission | ToolCallEmission] = []
+
+    for index in range(0, len(value), chunk_size):
+        emissions.extend(parser.feed(value[index : index + chunk_size]))
+    emissions.extend(parser.finish())
+
+    assert (
+        "".join(emission.text for emission in emissions if isinstance(emission, TextEmission))
+        == "Przed "
+    )
+    tool_calls = [emission for emission in emissions if isinstance(emission, ToolCallEmission)]
+    assert len(tool_calls) == 1
+    assert json.loads(tool_calls[0].arguments) == {"city": "Gdańsk"}
+
+
+def test_stream_parser_handles_every_close_marker_split() -> None:
+    payload = '{"name":"weather","arguments":{"city":"Gdańsk"}}'
+
+    for split in range(1, len(TOOL_CALL_CLOSE)):
+        parser = ToolCallStreamParser(frozenset({"weather"}))
+        emissions = parser.feed(f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE[:split]}")
+        emissions.extend(parser.feed(TOOL_CALL_CLOSE[split:]))
+        emissions.extend(parser.finish())
+
+        assert len(emissions) == 1
+        assert isinstance(emissions[0], ToolCallEmission)
+        assert json.loads(emissions[0].arguments) == {"city": "Gdańsk"}
 
 
 def test_stream_parser_rejects_unknown_tool() -> None:
@@ -282,6 +442,48 @@ def test_stream_parser_rejects_oversized_payload() -> None:
 
     with pytest.raises(ProtocolError, match="too large"):
         parser.feed(f"{TOOL_CALL_OPEN}{'x' * 1_000_001}")
+
+
+def test_stream_parser_enforces_unicode_payload_byte_boundary() -> None:
+    prefix = '{"name":"weather","arguments":{"value":"'
+    suffix = '"}}'
+    fixed_bytes = len((prefix + suffix).encode("utf-8"))
+    filler = "é" + ("x" * (_MAX_TOOL_PAYLOAD_BYTES - fixed_bytes - 2))
+    payload = f"{prefix}{filler}{suffix}"
+    assert len(payload.encode("utf-8")) == _MAX_TOOL_PAYLOAD_BYTES
+
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    partial_close = TOOL_CALL_CLOSE[:-1]
+    assert parser.feed(f"{TOOL_CALL_OPEN}{payload}{partial_close}") == []
+    emissions = parser.feed(TOOL_CALL_CLOSE[-1:])
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == {"value": filler}
+
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    assert parser.feed(f"{TOOL_CALL_OPEN}{payload}") == []
+    with pytest.raises(ProtocolError, match="too large"):
+        parser.feed("x")
+
+
+def test_stream_parser_handles_large_chunked_payload() -> None:
+    value = "ż" * 100_000
+    payload = json.dumps(
+        {"name": "weather", "arguments": {"value": value}},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    stream = f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE}"
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    emissions: list[TextEmission | ToolCallEmission] = []
+
+    for index in range(0, len(stream), 31):
+        emissions.extend(parser.feed(stream[index : index + 31]))
+    emissions.extend(parser.finish())
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == {"value": value}
 
 
 def test_stream_parser_preserves_partial_marker_as_plain_text() -> None:

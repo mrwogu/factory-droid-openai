@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, cast
 
 import httpx
 import pytest
-from openai import AsyncOpenAI
+from openai import APIStatusError, AsyncOpenAI
 
 from factory_droid_openai.app import create_app
 from factory_droid_openai.config import Settings
@@ -37,12 +38,27 @@ class ScriptedRunner:
             yield event
 
 
+class BlockingRunner(ScriptedRunner):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
+        self.requests.append(request)
+        self.started.set()
+        await self.release.wait()
+        yield RunComplete(Usage())
+
+
 def _sdk_client(
     tmp_path: Path,
     runner: ScriptedRunner,
+    *,
+    settings: Settings | None = None,
 ) -> tuple[AsyncOpenAI, httpx.AsyncClient]:
     app = create_app(
-        Settings(api_key="sdk-token", workdir=tmp_path),
+        settings or Settings(api_key="sdk-token", workdir=tmp_path),
         runner_factory=cast("RunnerFactory", lambda: runner),
     )
     http_client = httpx.AsyncClient(
@@ -53,6 +69,7 @@ def _sdk_client(
         base_url="http://bridge/v1",
         api_key="sdk-token",
         http_client=http_client,
+        max_retries=0,
     )
     return client, http_client
 
@@ -161,3 +178,71 @@ async def test_official_openai_client_parses_function_tool_call(
     assert tool_call.type == "function"
     assert tool_call.function.name == "get_weather"
     assert tool_call.function.arguments == '{"city":"Gdansk"}'
+
+
+@pytest.mark.asyncio
+async def test_official_openai_client_parses_payload_limit_error(
+    tmp_path: Path,
+) -> None:
+    runner = ScriptedRunner([])
+    client, http_client = _sdk_client(
+        tmp_path,
+        runner,
+        settings=Settings(
+            api_key="sdk-token",
+            workdir=tmp_path,
+            max_request_bytes=100,
+        ),
+    )
+    async with http_client:
+        with pytest.raises(APIStatusError) as error:
+            await client.chat.completions.create(
+                model="factory-droid",
+                messages=[{"role": "user", "content": "x" * 200}],
+            )
+
+    assert error.value.status_code == 413
+    assert isinstance(error.value.body, dict)
+    assert error.value.body["type"] == "invalid_request_error"
+
+
+@pytest.mark.asyncio
+async def test_official_openai_client_parses_queue_overload_and_retry_after(
+    tmp_path: Path,
+) -> None:
+    runner = BlockingRunner()
+    client, http_client = _sdk_client(
+        tmp_path,
+        runner,
+        settings=Settings(
+            api_key="sdk-token",
+            workdir=tmp_path,
+            max_concurrency=1,
+            max_queue_size=0,
+            retry_after_seconds=3,
+        ),
+    )
+    async with http_client:
+        active = asyncio.create_task(
+            http_client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer sdk-token"},
+                json={
+                    "model": "factory-droid",
+                    "messages": [{"role": "user", "content": "first"}],
+                },
+            )
+        )
+        await runner.started.wait()
+        with pytest.raises(APIStatusError) as error:
+            await client.chat.completions.create(
+                model="factory-droid",
+                messages=[{"role": "user", "content": "second"}],
+            )
+        runner.release.set()
+        assert (await active).status_code == 200
+
+    assert error.value.status_code == 429
+    assert error.value.response.headers["retry-after"] == "3"
+    assert isinstance(error.value.body, dict)
+    assert error.value.body["type"] == "rate_limit_error"

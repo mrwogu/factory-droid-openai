@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import signal
+import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from droid_sdk import (
     AssistantTextDelta,
     DroidClient,
     DroidClientError,
     ErrorEvent,
+    ProcessTransport,
     ThinkingTextDelta,
     TokenUsageUpdate,
     ToolProgress,
@@ -42,6 +46,7 @@ class RunRequest:
     model_alias: str
     reasoning_effort: str | None
     timeout_seconds: float
+    deadline: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +81,64 @@ RunEvent = TextDelta | ReasoningDelta | UsageUpdate | RunComplete
 ClientFactory = Callable[[str, Path], DroidClient]
 
 
+class RunnerMetrics(Protocol):
+    def observe_droid_startup(self, seconds: float) -> None: ...
+
+    def increment_forced_kills(self) -> None: ...
+
+
+class _ManagedProcessTransport(ProcessTransport):
+    def __init__(
+        self,
+        *,
+        exec_path: str,
+        cwd: str,
+        grace_period: float,
+    ) -> None:
+        super().__init__(
+            exec_path=exec_path,
+            cwd=cwd,
+            grace_period=grace_period,
+        )
+        self._owned_process: asyncio.subprocess.Process | None = None
+        self._forced_kill = False
+        self._grace_period_seconds = grace_period
+
+    async def connect(self) -> None:
+        await super().connect()
+        self._owned_process = self._process
+
+    async def close(self) -> None:
+        process = self._owned_process
+        was_running = process is not None and process.returncode is None
+        started = asyncio.get_running_loop().time()
+        await super().close()
+        elapsed = asyncio.get_running_loop().time() - started
+        if was_running and process is not None and process.returncode is not None:
+            sigkill = getattr(signal, "SIGKILL", None)
+            self._forced_kill = (
+                sigkill is not None and process.returncode == -sigkill
+            ) or elapsed >= self._grace_period_seconds
+
+    async def force_kill_and_reap(self, timeout: float) -> bool:
+        process = self._owned_process
+        if process is None or process.returncode is not None or timeout <= 0:
+            return False
+        with contextlib.suppress(ProcessLookupError, OSError):
+            process.kill()
+        await asyncio.wait_for(process.wait(), timeout=timeout)
+        self._forced_kill = True
+        return True
+
+    def is_reaped(self) -> bool:
+        return self._owned_process is None or self._owned_process.returncode is not None
+
+    def consumed_forced_kill(self) -> bool:
+        forced = self._forced_kill
+        self._forced_kill = False
+        return forced
+
+
 class DroidRunner:
     def __init__(
         self,
@@ -83,13 +146,25 @@ class DroidRunner:
         droid_path: str,
         workdir: Path,
         client_factory: ClientFactory | None = None,
+        process_grace_seconds: float = 1.0,
+        cleanup_timeout_seconds: float = 4.0,
+        metrics: RunnerMetrics | None = None,
     ) -> None:
         self._droid_path = droid_path
         self._workdir = workdir
-        self._client_factory = client_factory or _create_client
+        self._client_factory = client_factory
+        self._process_grace_seconds = process_grace_seconds
+        self._cleanup_timeout_seconds = cleanup_timeout_seconds
+        self._metrics = metrics
 
     async def run(self, request: RunRequest) -> AsyncGenerator[RunEvent, None]:
-        client = self._client_factory(self._droid_path, self._workdir)
+        reasoning_effort = _resolve_reasoning_effort(request.reasoning_effort)
+        loop = asyncio.get_running_loop()
+        deadline = request.deadline or loop.time() + request.timeout_seconds
+        if deadline <= loop.time():
+            raise _timeout_error(request)
+
+        client, transport = self._new_client()
         initialized = False
         completed = False
         usage = Usage()
@@ -99,13 +174,18 @@ class DroidRunner:
         )
 
         try:
-            async with asyncio.timeout(request.timeout_seconds):
-                await client.connect()
+            async with asyncio.timeout_at(deadline):
+                startup_started = time.perf_counter()
+                try:
+                    await client.connect()
+                finally:
+                    if self._metrics is not None:
+                        self._metrics.observe_droid_startup(time.perf_counter() - startup_started)
                 await client.initialize_session(
                     machine_id="factory-droid-openai",
                     cwd=str(self._workdir),
                     model_id=_resolve_model_id(request.model, request.model_alias),
-                    reasoning_effort=_resolve_reasoning_effort(request.reasoning_effort),
+                    reasoning_effort=reasoning_effort,
                     autonomy_level=AutonomyLevel.Off,
                     skip_permissions_unsafe=False,
                     enabled_tool_ids=[],
@@ -138,11 +218,7 @@ class DroidRunner:
                             error_type=event.error_type or "factory_droid_error",
                         )
         except (TimeoutError, DroidTimeoutError) as exc:
-            raise RunnerError(
-                f"Factory Droid timed out after {request.timeout_seconds:.1f} seconds.",
-                status_code=504,
-                error_type="factory_droid_timeout",
-            ) from exc
+            raise _timeout_error(request) from exc
         except FileNotFoundError as exc:
             raise RunnerError(
                 f"Factory Droid executable was not found: {self._droid_path}",
@@ -155,13 +231,78 @@ class DroidRunner:
                 error_type="factory_droid_sdk_error",
             ) from exc
         finally:
-            if initialized and not completed:
-                await _best_effort(client.interrupt_session)
-            await _best_effort(client.close)
+            cleanup_task = asyncio.create_task(
+                self._cleanup(
+                    client,
+                    transport,
+                    interrupt=initialized and not completed,
+                )
+            )
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                await cleanup_task
+                raise
+
+    def _new_client(self) -> tuple[DroidClient, _ManagedProcessTransport | None]:
+        if self._client_factory is not None:
+            return self._client_factory(self._droid_path, self._workdir), None
+        transport = _ManagedProcessTransport(
+            exec_path=self._droid_path,
+            cwd=str(self._workdir),
+            grace_period=self._process_grace_seconds,
+        )
+        return DroidClient(transport=transport), transport
+
+    async def _cleanup(
+        self,
+        client: DroidClient,
+        transport: _ManagedProcessTransport | None,
+        *,
+        interrupt: bool,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        cleanup_deadline = loop.time() + self._cleanup_timeout_seconds
+        force_reap_budget = min(1.0, self._cleanup_timeout_seconds / 3)
+
+        if interrupt:
+            interrupt_deadline = min(
+                cleanup_deadline - force_reap_budget,
+                loop.time() + min(0.5, self._cleanup_timeout_seconds / 4),
+            )
+            await _run_until(client.interrupt_session, interrupt_deadline)
+
+        close_deadline = cleanup_deadline - force_reap_budget
+        closed = await _run_until(client.close, close_deadline)
+        if transport is None:
+            return
+
+        forced = False
+        if not closed or not transport.is_reaped():
+            remaining = cleanup_deadline - loop.time()
+            if remaining > 0:
+                with contextlib.suppress(
+                    TimeoutError,
+                    ProcessLookupError,
+                    OSError,
+                ):
+                    forced = await transport.force_kill_and_reap(remaining)
+        if (forced or transport.consumed_forced_kill()) and self._metrics is not None:
+            self._metrics.increment_forced_kills()
 
 
-def _create_client(droid_path: str, workdir: Path) -> DroidClient:
-    return DroidClient(exec_path=droid_path, cwd=str(workdir))
+def _create_client(
+    droid_path: str,
+    workdir: Path,
+    *,
+    grace_period: float = 1.0,
+) -> DroidClient:
+    transport = ProcessTransport(
+        exec_path=droid_path,
+        cwd=str(workdir),
+        grace_period=grace_period,
+    )
+    return DroidClient(transport=transport)
 
 
 def _resolve_model_id(model: str, model_alias: str) -> str | None:
@@ -183,6 +324,11 @@ def _resolve_reasoning_effort(value: str | None) -> ReasoningEffort | None:
         ) from exc
 
 
+def normalize_reasoning_effort(value: str | None) -> str | None:
+    resolved = _resolve_reasoning_effort(value)
+    return resolved.value if resolved is not None else None
+
+
 def _map_usage(event: TokenUsageUpdate) -> Usage:
     return Usage(
         input_tokens=max(0, event.input_tokens),
@@ -192,6 +338,34 @@ def _map_usage(event: TokenUsageUpdate) -> Usage:
     )
 
 
-async def _best_effort(operation: Callable[[], Awaitable[object]]) -> None:
+async def _run_until(
+    operation: Callable[[], Awaitable[object]],
+    deadline: float,
+) -> bool:
+    remaining = deadline - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        return False
+    task: asyncio.Future[object] = asyncio.ensure_future(operation())
+    done, _ = await asyncio.wait({task}, timeout=remaining)
+    if not done:
+        task.cancel()
+        task.add_done_callback(_consume_future_result)
+        return False
+    try:
+        await task
+    except (Exception, asyncio.CancelledError):
+        return False
+    return True
+
+
+def _consume_future_result(future: asyncio.Future[object]) -> None:
     with contextlib.suppress(Exception, asyncio.CancelledError):
-        await asyncio.wait_for(operation(), timeout=2.0)
+        future.result()
+
+
+def _timeout_error(request: RunRequest) -> RunnerError:
+    return RunnerError(
+        f"Factory Droid timed out after {request.timeout_seconds:.1f} seconds.",
+        status_code=504,
+        error_type="factory_droid_timeout",
+    )

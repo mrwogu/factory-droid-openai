@@ -29,7 +29,16 @@ def test_openapi_contract_documents_compatibility_surface(tmp_path: Path) -> Non
 
     chat = paths["/v1/chat/completions"]["post"]
     assert chat["security"] == [{"HTTPBearer": []}]
-    assert set(chat["responses"]) == {"200", "4XX", "502", "503", "504"}
+    assert set(chat["responses"]) == {
+        "200",
+        "4XX",
+        "413",
+        "429",
+        "502",
+        "503",
+        "504",
+    }
+    assert "Retry-After" in chat["responses"]["429"]["headers"]
     assert set(chat["responses"]["200"]["content"]) == {
         "application/json",
         "text/event-stream",

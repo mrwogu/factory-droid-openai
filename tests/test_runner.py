@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
+import textwrap
+import time
 from typing import TYPE_CHECKING, cast
 
 import pytest
@@ -17,6 +21,7 @@ from droid_sdk import (
 from droid_sdk import TimeoutError as DroidTimeoutError
 from droid_sdk.schemas.enums import AutonomyLevel, ReasoningEffort
 
+from factory_droid_openai.metrics import BridgeMetrics
 from factory_droid_openai.runner import (
     DroidRunner,
     ReasoningDelta,
@@ -312,7 +317,113 @@ async def test_runner_rejects_invalid_reasoning_effort(tmp_path: Path) -> None:
 
     assert error.value.status_code == 400
     assert error.value.error_type == "invalid_request_error"
-    assert client.closed is True
+    assert client.connected is False
+    assert client.closed is False
+
+
+@pytest.mark.asyncio
+async def test_runner_rejects_expired_deadline_before_client_factory(
+    tmp_path: Path,
+) -> None:
+    factory_calls = 0
+
+    def factory(_path: str, _workdir: Path) -> FakeClient:
+        nonlocal factory_calls
+        factory_calls += 1
+        return FakeClient([])
+
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", factory),
+    )
+
+    with pytest.raises(RunnerError, match="timed out") as error:
+        await _collect(
+            runner,
+            _request(deadline=asyncio.get_running_loop().time() - 1),
+        )
+
+    assert error.value.status_code == 504
+    assert factory_calls == 0
+
+
+class HangingCleanupClient(BlockingClient):
+    async def interrupt_session(self) -> None:
+        await asyncio.Event().wait()
+
+    async def close(self) -> None:
+        await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+async def test_runner_cleanup_uses_one_bounded_deadline(tmp_path: Path) -> None:
+    client = HangingCleanupClient()
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+        cleanup_timeout_seconds=0.12,
+    )
+    task = asyncio.create_task(_collect(runner, _request(timeout_seconds=10)))
+    await client.started.wait()
+    started = time.perf_counter()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert time.perf_counter() - started < 0.5
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal behavior")
+@pytest.mark.asyncio
+async def test_runner_kills_and_reaps_process_ignoring_sigterm(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "fake-droid"
+    pid_file = tmp_path / "child.pid"
+    executable.write_text(
+        textwrap.dedent(
+            f"""\
+            #!{sys.executable}
+            import os
+            import signal
+            import time
+            from pathlib import Path
+
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            Path({str(pid_file)!r}).write_text(str(os.getpid()), encoding="utf-8")
+            while True:
+                time.sleep(1)
+            """
+        ),
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+    metrics = BridgeMetrics()
+    runner = DroidRunner(
+        droid_path=str(executable),
+        workdir=tmp_path,
+        process_grace_seconds=0.05,
+        cleanup_timeout_seconds=0.5,
+        metrics=metrics,
+    )
+
+    task = asyncio.create_task(_collect(runner, _request(timeout_seconds=10)))
+    for _ in range(100):
+        if pid_file.exists():
+            break
+        await asyncio.sleep(0.01)
+    assert pid_file.exists()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    pid = int(pid_file.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+    assert "factory_droid_openai_forced_kills_total 1" in metrics.render()
 
 
 @pytest.mark.asyncio
