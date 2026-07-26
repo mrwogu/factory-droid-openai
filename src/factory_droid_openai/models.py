@@ -89,6 +89,7 @@ class ChatCompletionResponse(BaseModel):
     model: str
     choices: list[ChatCompletionChoice]
     usage: UsageResponse
+    factory_droid_session_id: str | None = None
 
 
 class ErrorDetail(BaseModel):
@@ -114,9 +115,21 @@ class ChatCompletionRequest(BaseModel):
     reasoning_effort: str | None = None
     factory_droid_reasoning_effort: str | None = None
     timeout: float | None = Field(default=None, gt=0)
+    n: int = Field(default=1, ge=1)
+    stop: str | list[str] | None = None
+    parallel_tool_calls: bool = True
+    factory_droid_session_id: str | None = None
+    factory_droid_status: bool = False
 
     @model_validator(mode="after")
     def validate_messages(self) -> ChatCompletionRequest:
         if not self.messages:
             raise ValueError("messages must contain at least one message")
         return self
+
+    @property
+    def stop_sequences(self) -> tuple[str, ...]:
+        if self.stop is None:
+            return ()
+        values = [self.stop] if isinstance(self.stop, str) else self.stop
+        return tuple(value for value in values if value)

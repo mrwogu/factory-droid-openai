@@ -32,6 +32,7 @@ def test_openapi_contract_documents_compatibility_surface(tmp_path: Path) -> Non
     assert set(chat["responses"]) == {
         "200",
         "4XX",
+        "404",
         "413",
         "429",
         "502",

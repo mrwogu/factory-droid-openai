@@ -14,6 +14,7 @@ from factory_droid_openai.app import (
     AdmissionLease,
     FinalizingStreamingResponse,
     RequestSizeLimitMiddleware,
+    SessionRegistry,
     _collect_completion_or_disconnect,
     _finalize_stream,
     _stream_completion,
@@ -33,6 +34,8 @@ from factory_droid_openai.runner import (
     RunEvent,
     RunnerError,
     RunRequest,
+    SessionStarted,
+    StatusUpdate,
     TextDelta,
     Usage,
     UsageUpdate,
@@ -993,3 +996,377 @@ async def _wait_for_metric(app: Any, expected: str) -> None:
             return
         await asyncio.sleep(0)
     pytest.fail(f"metric did not reach expected value: {expected}")
+
+
+def _feature_app(
+    tmp_path: Path,
+    runner: FakeRunner,
+    **settings_overrides: object,
+) -> Any:
+    return create_app(
+        Settings(workdir=tmp_path, **cast("Any", settings_overrides)),
+        runner_factory=cast("RunnerFactory", lambda: runner),
+    )
+
+
+@pytest.mark.asyncio
+async def test_stop_sequence_truncates_non_streaming_content(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [
+            TextDelta("keep this "),
+            TextDelta("HALT drop this"),
+            RunComplete(Usage()),
+        ]
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(stop="HALT"),
+        )
+
+    body = response.json()
+    assert body["choices"][0]["message"]["content"] == "keep this "
+    assert body["choices"][0]["finish_reason"] == "stop"
+
+
+@pytest.mark.asyncio
+async def test_stop_sequence_split_across_deltas_is_still_detected(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner(
+        [
+            TextDelta("alpha HA"),
+            TextDelta("LT omega"),
+            RunComplete(Usage()),
+        ]
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(stop=["HALT"]),
+        )
+
+    assert response.json()["choices"][0]["message"]["content"] == "alpha "
+
+
+@pytest.mark.asyncio
+async def test_stop_sequence_truncates_streaming_content(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [
+            TextDelta("visible "),
+            TextDelta("HALT hidden"),
+            RunComplete(Usage()),
+        ]
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(stream=True, stop="HALT"),
+        )
+
+    assert "visible " in response.text
+    assert "hidden" not in response.text
+    assert '"finish_reason":"stop"' in response.text
+
+
+@pytest.mark.asyncio
+async def test_multiple_choices_run_sequentially_and_sum_usage(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner([TextDelta("answer"), RunComplete(Usage(3, 2, 1, 0))])
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=_payload(n=3))
+
+    body = response.json()
+    assert [choice["index"] for choice in body["choices"]] == [0, 1, 2]
+    assert all(choice["message"]["content"] == "answer" for choice in body["choices"])
+    assert body["usage"]["prompt_tokens"] == 9
+    assert body["usage"]["completion_tokens"] == 6
+    assert len(runner.requests) == 3
+
+
+@pytest.mark.asyncio
+async def test_choice_count_above_the_configured_cap_is_rejected(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+    async with _client(_feature_app(tmp_path, runner, max_choices=2)) as client:
+        response = await client.post("/v1/chat/completions", json=_payload(n=3))
+
+    assert response.status_code == 400
+    assert "at most 2" in response.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_multiple_choices_are_rejected_for_streaming(tmp_path: Path) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(n=2, stream=True),
+        )
+
+    assert response.status_code == 400
+    assert "stream=true" in response.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_too_many_stop_sequences_are_rejected(tmp_path: Path) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+    async with _client(_feature_app(tmp_path, runner, max_stop_sequences=1)) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(stop=["a", "b"]),
+        )
+
+    assert response.status_code == 400
+    assert "at most 1 sequences" in response.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_session_continuation_is_rejected_when_disabled(tmp_path: Path) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(factory_droid_session_id="session-1"),
+        )
+
+    assert response.status_code == 400
+    assert "disabled" in response.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_session_is_rejected_even_when_continuity_is_enabled(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+    app = _feature_app(tmp_path, runner, session_continuity=True)
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(factory_droid_session_id="not-ours"),
+        )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["type"] == "session_not_found"
+
+
+@pytest.mark.asyncio
+async def test_session_id_round_trips_and_drives_a_continuation(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner(
+        [
+            SessionStarted("session-77"),
+            TextDelta("first reply"),
+            RunComplete(Usage()),
+        ]
+    )
+    app = _feature_app(tmp_path, runner, session_continuity=True)
+    async with _client(app) as client:
+        first = await client.post("/v1/chat/completions", json=_payload())
+        second = await client.post(
+            "/v1/chat/completions",
+            json=_payload(
+                factory_droid_session_id="session-77",
+                messages=[
+                    {"role": "user", "content": "first question"},
+                    {"role": "assistant", "content": "first reply"},
+                    {"role": "user", "content": "second question"},
+                ],
+            ),
+        )
+
+    assert first.json()["factory_droid_session_id"] == "session-77"
+    assert first.headers["x-factory-droid-session-id"] == "session-77"
+    assert second.status_code == 200
+    assert runner.requests[1].session_id == "session-77"
+    assert "second question" in runner.requests[1].prompt
+    assert "first question" not in runner.requests[1].prompt
+
+
+@pytest.mark.asyncio
+async def test_multiple_choices_cannot_continue_a_session(tmp_path: Path) -> None:
+    runner = FakeRunner([SessionStarted("session-9"), RunComplete(Usage())])
+    app = _feature_app(tmp_path, runner, session_continuity=True)
+    async with _client(app) as client:
+        await client.post("/v1/chat/completions", json=_payload())
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(n=2, factory_droid_session_id="session-9"),
+        )
+
+    assert response.status_code == 400
+    assert "cannot continue" in response.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_session_id_is_hidden_when_continuity_is_disabled(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner([SessionStarted("session-3"), RunComplete(Usage())])
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=_payload())
+
+    assert "factory_droid_session_id" not in response.json()
+    assert "x-factory-droid-session-id" not in response.headers
+
+
+@pytest.mark.asyncio
+async def test_status_events_are_opt_in_for_streaming(tmp_path: Path) -> None:
+    events: list[RunEvent] = [
+        StatusUpdate("executing_tool"),
+        TextDelta("done"),
+        RunComplete(Usage()),
+    ]
+    async with _client(_app(tmp_path, FakeRunner(list(events)))) as client:
+        without = await client.post(
+            "/v1/chat/completions",
+            json=_payload(stream=True),
+        )
+    async with _client(_app(tmp_path, FakeRunner(list(events)))) as client:
+        with_status = await client.post(
+            "/v1/chat/completions",
+            json=_payload(stream=True, factory_droid_status=True),
+        )
+
+    assert "factory_droid_status" not in without.text
+    assert '"factory_droid_status":"executing_tool"' in with_status.text
+
+
+@pytest.mark.asyncio
+async def test_streaming_session_id_is_announced_when_continuity_is_enabled(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner([SessionStarted("session-5"), RunComplete(Usage())])
+    app = _feature_app(tmp_path, runner, session_continuity=True)
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(stream=True),
+        )
+
+    assert '"factory_droid_session_id":"session-5"' in response.text
+
+
+@pytest.mark.asyncio
+async def test_streaming_emits_indexed_parallel_tool_calls(tmp_path: Path) -> None:
+    first = f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"A"}}}}{TOOL_CALL_CLOSE}'
+    second = f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"B"}}}}{TOOL_CALL_CLOSE}'
+    runner = FakeRunner([TextDelta(first + second), RunComplete(Usage())])
+    payload = _payload(
+        stream=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {"type": "object"}},
+            }
+        ],
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert '"index":0' in response.text
+    assert '"index":1' in response.text
+    assert '"finish_reason":"tool_calls"' in response.text
+
+
+@pytest.mark.asyncio
+async def test_parallel_tool_calls_false_keeps_the_single_call_contract(
+    tmp_path: Path,
+) -> None:
+    first = f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"A"}}}}{TOOL_CALL_CLOSE}'
+    second = f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"B"}}}}{TOOL_CALL_CLOSE}'
+    runner = FakeRunner([TextDelta(first + second), RunComplete(Usage())])
+    payload = _payload(
+        parallel_tool_calls=False,
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {"type": "object"}},
+            }
+        ],
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "factory_protocol_error"
+
+
+@pytest.mark.asyncio
+async def test_image_attachments_reach_the_runner_and_leave_the_prompt(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner([TextDelta("described"), RunComplete(Usage())])
+    payload = _payload(
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,QUJD"},
+                    },
+                ],
+            }
+        ]
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert runner.requests[0].images == (
+        {"type": "base64", "mediaType": "image/png", "data": "QUJD"},
+    )
+    assert "QUJD" not in runner.requests[0].prompt
+
+
+@pytest.mark.asyncio
+async def test_rejected_attachment_returns_a_client_error(tmp_path: Path) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+    payload = _payload(
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.com/cat.png"},
+                    }
+                ],
+            }
+        ]
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 400
+    assert "remote image URLs" in response.json()["error"]["message"]
+
+
+def test_session_registry_evicts_the_oldest_entries() -> None:
+    registry = SessionRegistry(2)
+
+    registry.remember("a")
+    registry.remember("b")
+    assert registry.knows("a") is True
+
+    registry.remember("c")
+
+    assert registry.knows("b") is False
+    assert registry.knows("a") is True
+    assert registry.knows("c") is True
+
+
+def test_session_registry_ignores_duplicate_entries() -> None:
+    registry = SessionRegistry(2)
+
+    registry.remember("a")
+    registry.remember("a")
+    registry.remember("b")
+
+    assert registry.knows("a") is True
+    assert registry.knows("b") is True
