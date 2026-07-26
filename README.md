@@ -59,14 +59,15 @@ model explicitly. Examples below use explicit `gpt-5.4` and
 | Function tool schemas | ✅ | Serialized into the strict Droid prompt |
 | Tool choice | ✅ | `auto`, `none`, `required`, or one named function |
 | Tool-result continuation | ✅ | Client resends the complete transcript on the next request |
-| Parallel tool calls | ❌ | At most one external tool call per Droid turn |
+| Parallel tool calls | ✅ | Several sequential tool calls per turn, bounded by a configured cap |
+| Stop sequences | ✅ | `stop` truncates the reply and interrupts the Droid turn |
 | Reasoning output | ✅ | Emitted as `reasoning` and `reasoning_content` |
 | Token usage | ✅ | Includes cache read and write token details |
 | Model selection | ✅ | Alias uses the Droid default; other IDs are forwarded |
-| Multimodal content | ⚠️ | Content structures are serialized as JSON, not SDK attachments |
+| Multimodal content | ⚠️ | Inline image and file data URIs use SDK attachments; remote URLs are rejected |
 | Structured outputs | ❌ | `response_format` and JSON schema enforcement are ignored |
 | Sampling controls | ❌ | `temperature`, `top_p`, penalties, and `seed` are ignored |
-| Multiple choices | ❌ | `n` is ignored and one choice is returned |
+| Multiple choices | ✅ | `n` runs that many Droid turns sequentially and returns `n` choices |
 | Log probabilities | ❌ | `logprobs` and `top_logprobs` are ignored |
 | Output token limits | ❌ | `max_tokens` and `max_completion_tokens` are ignored |
 | Stored completions | ❌ | `store`, `metadata`, listing, retrieval, and deletion are unavailable |
@@ -98,11 +99,15 @@ model explicitly. Examples below use explicit `gpt-5.4` and
 - Function tool schemas and validated tool-call responses
 - Reasoning delta and token usage mapping
 - Optional constant-time bearer authentication
-- Bounded request timeout and process concurrency
+- Bounded request timeout, payload size, and process concurrency
+- Queue-based admission control and Prometheus-style metrics
+- Inline image and document attachments over the native SDK channel
+- Stop sequences, `n` choices, and multiple tool calls per turn
+- Optional Droid session continuity across requests
 - Client disconnect cancellation
 - Factory-native tool blocking
 - Versioned and externally validated OpenAPI 3.1 contract
-- Strict typing, locked dependencies, and 99% test coverage
+- Strict typing, locked dependencies, and 97% test coverage
 
 ## How it works
 
@@ -406,6 +411,7 @@ attachments, and parallel tool calls remain unsupported by this bridge.
 | `GET` | `/health` | Process health check |
 | `GET` | `/v1/models` | Configured bridge model alias |
 | `POST` | `/v1/chat/completions` | Chat completions and streaming |
+| `GET` | `/metrics` | Prometheus-style bridge metrics |
 | `GET` | `/openapi.json` | OpenAPI 3.1 contract |
 | `GET` | `/docs` | Interactive Swagger UI |
 | `GET` | `/redoc` | Interactive ReDoc reference |
@@ -438,13 +444,17 @@ tool calls through the official `openai` Python client.
 | `stream` | Yes | OpenAI-compatible SSE chunks |
 | `stream_options.include_usage` | Yes | Emits null usage on normal chunks and one final usage-only chunk |
 | `stream_options.include_obfuscation` | No | Accepted but ignored |
+| `n` | Yes | Runs `n` Droid turns sequentially, capped by the server |
+| `stop` | Yes | String or list; truncates output and interrupts the turn |
+| `parallel_tool_calls` | Yes | `true` allows several tool calls per turn, `false` allows one |
+| `factory_droid_session_id` | Yes | Bridge-specific session continuation, disabled by default |
+| `factory_droid_status` | Yes | Bridge-specific Droid working-state SSE events |
 | `reasoning_effort` | Yes | Mapped to Droid reasoning effort |
 | `factory_droid_reasoning_effort` | Yes | Bridge-specific override |
 | `timeout` | Yes | Per-request value capped by server timeout |
 | `temperature`, `top_p`, penalties, `seed` | No | Accepted but ignored |
-| `max_tokens`, `max_completion_tokens`, `stop` | No | Accepted but ignored |
+| `max_tokens`, `max_completion_tokens` | No | Accepted but ignored |
 | `response_format` | No | Accepted but not enforced |
-| `parallel_tool_calls` | No | Accepted but ignored |
 | `functions`, `function_call` | No | Legacy function-calling fields are ignored |
 | `modalities`, `audio` | No | Accepted but ignored |
 | `logprobs`, `top_logprobs`, `logit_bias` | No | Accepted but ignored |
@@ -500,6 +510,77 @@ Supported values follow `droid-sdk-python`:
 Reasoning text appears as both `reasoning` and `reasoning_content` for broad
 client compatibility.
 
+### Multimodal attachments
+
+Image and file content parts are delivered over the Droid SDK's native
+attachment channel instead of being inlined into the prompt text. The
+transcript keeps a short placeholder in their place, so positional context
+survives without sending the payload twice.
+
+```python
+client.chat.completions.create(
+    model="gpt-5.4",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is in this screenshot?"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,<base64>"},
+                },
+            ],
+        }
+    ],
+)
+```
+
+Supported inline media types are `image/jpeg`, `image/png`, `image/gif`,
+`image/webp`, `application/pdf`, and `text/plain`. Remote `http(s)` URLs and
+`file_id` references are rejected with HTTP `400`: the bridge never fetches
+remote content on a client's behalf. Model support for images and PDFs still
+depends on the selected Droid model.
+
+### Session continuity
+
+By default every request creates a new Droid session and serializes the whole
+transcript. Setting `FACTORY_DROID_OPENAI_SESSION_CONTINUITY=true` lets a
+client continue an existing session instead, so only the new turn is sent:
+
+```python
+first = client.chat.completions.create(model="gpt-5.4", messages=messages)
+session_id = first.model_extra["factory_droid_session_id"]
+
+second = client.chat.completions.create(
+    model="gpt-5.4",
+    messages=[*messages, assistant_reply, next_question],
+    extra_body={"factory_droid_session_id": session_id},
+)
+```
+
+The session ID is also returned in the `x-factory-droid-session-id` response
+header, and announced in the first streaming chunk.
+
+Only sessions this bridge process created can be continued. Session IDs
+stored by the local Droid CLI - including your own interactive sessions - are
+rejected with HTTP `404`, so a client cannot read back conversations it does
+not own. Restarting the bridge clears the set of continuable sessions.
+
+### Droid status events
+
+`factory_droid_status: true` adds Droid working-state transitions to a
+streaming response as an extra `factory_droid_status` key inside the chunk
+delta:
+
+```json
+{"choices":[{"index":0,"delta":{"factory_droid_status":"executing_tool"}}]}
+```
+
+States follow the SDK: `idle`, `streaming_assistant_message`,
+`waiting_for_tool_confirmation`, `executing_tool`, and
+`compacting_conversation`. The field is absent unless explicitly requested, so
+strict OpenAI clients are unaffected.
+
 ### Errors
 
 Non-streaming failures use the OpenAI error object:
@@ -519,6 +600,9 @@ Non-streaming failures use the OpenAI error object:
 |---:|---|
 | `400` | Invalid request or unsupported option |
 | `401` | Missing or invalid bearer token |
+| `404` | Unknown Factory Droid session |
+| `413` | Request body or serialized transcript over the configured limit |
+| `429` | Droid request queue full, with a `Retry-After` header |
 | `502` | Droid SDK, process, or bridge protocol failure |
 | `503` | Droid executable unavailable |
 | `504` | Request timeout |
@@ -536,18 +620,79 @@ followed by `[DONE]`.
 | `FACTORY_DROID_PATH` | `droid` | Droid executable path |
 | `FACTORY_DROID_OPENAI_WORKDIR` | current directory | Droid working directory |
 | `FACTORY_DROID_OPENAI_TIMEOUT_SECONDS` | `600` | Maximum request duration |
+| `FACTORY_DROID_OPENAI_BODY_TIMEOUT_SECONDS` | `30` | Maximum time to receive a request body |
 | `FACTORY_DROID_OPENAI_MAX_CONCURRENCY` | `1` | Concurrent Droid subprocesses |
+| `FACTORY_DROID_OPENAI_MAX_QUEUE_SIZE` | `8` | Requests waiting for a Droid slot |
+| `FACTORY_DROID_OPENAI_RETRY_AFTER_SECONDS` | `1` | `Retry-After` value sent with `429` |
+| `FACTORY_DROID_OPENAI_MAX_REQUEST_BYTES` | `4194304` | Request body size limit |
+| `FACTORY_DROID_OPENAI_MAX_MESSAGES` | `512` | Messages accepted per request |
+| `FACTORY_DROID_OPENAI_MAX_TOOLS` | `128` | Tool schemas accepted per request |
+| `FACTORY_DROID_OPENAI_MAX_TRANSCRIPT_BYTES` | `4194304` | Serialized transcript size limit |
+| `FACTORY_DROID_OPENAI_MAX_TOOL_SCHEMA_BYTES` | `1048576` | Serialized tool schema size limit |
+| `FACTORY_DROID_OPENAI_MAX_JSON_DEPTH` | `32` | Request JSON nesting limit |
+| `FACTORY_DROID_OPENAI_PROCESS_GRACE_SECONDS` | `1` | Wait before killing a Droid process |
+| `FACTORY_DROID_OPENAI_CLEANUP_TIMEOUT_SECONDS` | `4` | Total budget for session cleanup |
+| `FACTORY_DROID_OPENAI_UVICORN_LIMIT_CONCURRENCY` | `64` | Uvicorn connection limit |
+| `FACTORY_DROID_OPENAI_UVICORN_BACKLOG` | `128` | Uvicorn listen backlog |
+| `FACTORY_DROID_OPENAI_MAX_TOOL_CALLS` | `8` | Tool calls accepted per Droid turn |
+| `FACTORY_DROID_OPENAI_MAX_ATTACHMENTS` | `16` | Inline attachments per request |
+| `FACTORY_DROID_OPENAI_MAX_ATTACHMENT_BYTES` | `8388608` | Total encoded attachment bytes |
+| `FACTORY_DROID_OPENAI_MAX_CHOICES` | `4` | Upper bound for `n` |
+| `FACTORY_DROID_OPENAI_MAX_STOP_SEQUENCES` | `4` | Upper bound for `stop` entries |
+| `FACTORY_DROID_OPENAI_SESSION_CONTINUITY` | `false` | Allow continuing bridge-created sessions |
+| `FACTORY_DROID_OPENAI_MAX_TRACKED_SESSIONS` | `256` | Continuable sessions kept in memory |
+| `FACTORY_DROID_OPENAI_WORKTREE` | unset | Run Droid in a git worktree |
+| `FACTORY_DROID_OPENAI_APPEND_SYSTEM_PROMPT_FILE` | unset | File appended to the Droid system prompt |
 | `FACTORY_DROID_OPENAI_MODEL_ALIAS` | `factory-droid` | Alias using Droid default model |
 
 Command-line options:
 
 ```text
 usage: factory-droid-openai [-h] [--host HOST] [--port PORT]
+                            [--limit-concurrency LIMIT_CONCURRENCY]
+                            [--backlog BACKLOG]
                             [--log-level {critical,error,warning,info,debug,trace}]
 ```
 
-Environment variables define defaults. `--host`, `--port`, and `--log-level`
-override server options.
+Environment variables define defaults. The command-line options override the
+matching server settings.
+
+## Limits and metrics
+
+Every request passes two gates before a Droid process is involved.
+
+Size limits are enforced while the body is still arriving, so an oversized
+payload is rejected with `413` instead of being buffered in full. Body bytes,
+message count, tool count, serialized transcript size, tool schema size, and
+JSON nesting depth each have their own bound.
+
+Admission control then bounds how many requests reach Droid. Requests beyond
+`FACTORY_DROID_OPENAI_MAX_CONCURRENCY` wait in a queue of at most
+`FACTORY_DROID_OPENAI_MAX_QUEUE_SIZE`; once that is full the bridge answers
+`429` with a `Retry-After` header rather than queueing without limit.
+
+`GET /metrics` renders Prometheus-style text. It is excluded from the OpenAPI
+contract because it is an operational endpoint, not part of the OpenAI API
+surface.
+
+| Metric | Meaning |
+|---|---|
+| `factory_droid_openai_requests_total` | Requests by outcome |
+| `factory_droid_openai_request_duration_seconds` | Request duration sum and count |
+| `factory_droid_openai_queue_wait_seconds` | Time spent waiting for admission |
+| `factory_droid_openai_droid_startup_seconds` | Droid session startup time |
+| `factory_droid_openai_ttft_seconds` | Time to first token |
+| `factory_droid_openai_active_sessions` | Droid sessions running now |
+| `factory_droid_openai_queued_requests` | Requests waiting for admission |
+| `factory_droid_openai_overload_rejections_total` | Requests rejected with `429` |
+| `factory_droid_openai_payload_rejections_total` | Requests rejected with `413` |
+| `factory_droid_openai_forced_kills_total` | Droid processes that needed a kill |
+
+`forced_kills_total` counts any process that did not exit within its grace
+period, so treat it as an upper bound on genuinely stuck processes.
+
+Serve `/metrics` on a loopback interface or behind your own access control;
+it carries no prompt content, but it does expose traffic shape.
 
 ## Authentication
 
@@ -584,6 +729,10 @@ For every Droid session, the bridge:
 5. Rejects any Factory-native tool event.
 6. Validates generated tool names against the request schema.
 7. Requires tool arguments to be a JSON object with unique keys.
+8. Caps the number of tool calls accepted in one turn.
+9. Rejects any non-whitespace output between or after tool calls.
+10. Refuses to fetch remote attachment URLs.
+11. Only continues Droid sessions this bridge process created.
 
 Set `FACTORY_DROID_OPENAI_WORKDIR` to the smallest directory required by your
 workflow.
@@ -594,12 +743,12 @@ This is a compatibility bridge, not a native OpenAI inference implementation.
 
 | Limitation | Effect |
 |---|---|
-| No native SDK chat-history input | History is serialized into one prompt |
+| No native SDK chat-history input | History is serialized into one prompt unless session continuity is enabled |
 | No native SDK external-tool schemas | Tool definitions are serialized into the prompt |
 | No native SDK tool-result continuation | Each request creates a new Droid session |
 | Session-per-request execution | Prompt caching differs from a native inference endpoint |
 | Strict tool marker protocol | Invalid generated tool payloads fail closed |
-| One external call per Droid turn | Parallel tool calls are rejected |
+| Sequential tool calls only | Calls arrive one after another, never concurrently |
 
 ## Troubleshooting
 
