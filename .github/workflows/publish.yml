@@ -1,0 +1,53 @@
+name: Publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pypi:
+    name: PyPI
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/p/factory-droid-openai
+    permissions:
+      # Trusted Publishing mints a short-lived OIDC token per run, so no
+      # long-lived PyPI credential is stored in the repository.
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.21"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Build distributions
+        run: uv build
+
+      # The built filename carries the version, so a tag that disagrees with
+      # pyproject.toml fails here instead of publishing the wrong artifact.
+      - name: Verify the build matches the release tag
+        if: github.event_name == 'release'
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          test -f "dist/factory_droid_openai-${version}-py3-none-any.whl"
+          test -f "dist/factory_droid_openai-${version}.tar.gz"
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
