@@ -158,23 +158,38 @@ Run Droid normally once if authentication or first-time setup is required.
 
 ## Installation
 
+Released versions are published to
+[PyPI](https://pypi.org/project/factory-droid-openai/).
+
 ### uv
+
+```bash
+uv tool install factory-droid-openai
+factory-droid-openai
+```
+
+### pipx
+
+```bash
+pipx install factory-droid-openai
+factory-droid-openai
+```
+
+### pip
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install factory-droid-openai
+.venv/bin/factory-droid-openai
+```
+
+### From source
 
 ```bash
 git clone https://github.com/mrwogu/factory-droid-openai.git
 cd factory-droid-openai
 uv sync
 uv run factory-droid-openai
-```
-
-### pip
-
-```bash
-git clone https://github.com/mrwogu/factory-droid-openai.git
-cd factory-droid-openai
-python3 -m venv .venv
-.venv/bin/python -m pip install .
-.venv/bin/factory-droid-openai
 ```
 
 The default address is `http://127.0.0.1:8787`.
