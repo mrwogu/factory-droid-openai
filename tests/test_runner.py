@@ -41,6 +41,7 @@ from factory_droid_openai.runner import (
     UsageUpdate,
     _build_exec_args,
     _create_client,
+    _run_until,
 )
 
 if TYPE_CHECKING:
@@ -402,11 +403,7 @@ async def test_runner_cleanup_uses_one_bounded_deadline(tmp_path: Path) -> None:
     assert time.perf_counter() - started < 0.5
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal behavior")
-@pytest.mark.asyncio
-async def test_runner_kills_and_reaps_process_ignoring_sigterm(
-    tmp_path: Path,
-) -> None:
+def _sigterm_ignoring_droid(tmp_path: Path) -> Path:
     executable = tmp_path / "fake-droid"
     pid_file = tmp_path / "child.pid"
     executable.write_text(
@@ -427,6 +424,16 @@ async def test_runner_kills_and_reaps_process_ignoring_sigterm(
         encoding="utf-8",
     )
     executable.chmod(0o700)
+    return executable
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal behavior")
+@pytest.mark.asyncio
+async def test_runner_kills_and_reaps_process_ignoring_sigterm(
+    tmp_path: Path,
+) -> None:
+    executable = _sigterm_ignoring_droid(tmp_path)
+    pid_file = tmp_path / "child.pid"
     metrics = BridgeMetrics()
     runner = DroidRunner(
         droid_path=str(executable),
@@ -621,3 +628,107 @@ def test_exec_args_append_cli_only_flags_to_the_jsonrpc_defaults(tmp_path: Path)
         "--append-system-prompt-file",
         str(prompt_file),
     ]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal behavior")
+@pytest.mark.asyncio
+async def test_cleanup_force_reaps_when_client_close_never_returns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fallback that exists for a hung close() must actually reap.
+
+    The SDK's own close escalates to SIGKILL by itself, so a plain
+    SIGTERM-ignoring process never reaches this path. Hanging close() is the
+    only way to reach the fallback - and it also exercises the abandoned-task
+    handoff, where the cancelled close and force_kill_and_reap act on the same
+    process.
+    """
+    executable = _sigterm_ignoring_droid(tmp_path)
+    pid_file = tmp_path / "child.pid"
+
+    async def never_returns(_self: DroidClient) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(DroidClient, "close", never_returns)
+    metrics = BridgeMetrics()
+    runner = DroidRunner(
+        droid_path=str(executable),
+        workdir=tmp_path,
+        process_grace_seconds=0.05,
+        cleanup_timeout_seconds=0.5,
+        metrics=metrics,
+    )
+
+    task = asyncio.create_task(_collect(runner, _request(timeout_seconds=10)))
+    for _ in range(100):
+        if pid_file.exists():
+            break
+        await asyncio.sleep(0.01)
+    assert pid_file.exists()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    pid = int(pid_file.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+    assert "factory_droid_openai_forced_kills_total 1" in metrics.render()
+
+
+@pytest.mark.asyncio
+async def test_run_until_reports_failure_for_expired_and_raising_operations() -> None:
+    loop = asyncio.get_running_loop()
+
+    async def unreached() -> None:  # pragma: no cover - must never be awaited
+        raise AssertionError("operation ran despite an expired deadline")
+
+    async def boom() -> None:
+        raise RuntimeError("close failed")
+
+    assert await _run_until(unreached, loop.time() - 1) is False
+    assert await _run_until(boom, loop.time() + 5) is False
+
+
+@pytest.mark.asyncio
+async def test_cleanup_completes_when_the_caller_is_cancelled_again(
+    tmp_path: Path,
+) -> None:
+    """A second cancellation must not abandon an in-flight cleanup.
+
+    The first cancel unwinds run() into its finally block; the second lands
+    while the shielded cleanup is still running, which is the disconnect
+    shape where a client goes away mid-request.
+    """
+    closing = asyncio.Event()
+    release = asyncio.Event()
+
+    class SlowClosingClient(FakeClient):
+        async def receive_response(self) -> AsyncIterator[object]:
+            await asyncio.Event().wait()
+            if False:
+                yield None
+
+        async def close(self) -> None:
+            closing.set()
+            await release.wait()
+            self.closed = True
+
+    client = SlowClosingClient([])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=lambda *_: cast("DroidClient", client),
+        cleanup_timeout_seconds=5.0,
+    )
+
+    task = asyncio.create_task(_collect(runner, _request(timeout_seconds=10)))
+    await asyncio.sleep(0)
+    task.cancel()
+    await closing.wait()
+    task.cancel()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert client.closed is True

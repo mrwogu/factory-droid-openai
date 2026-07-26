@@ -144,6 +144,10 @@ class _ManagedProcessTransport(ProcessTransport):
         elapsed = asyncio.get_running_loop().time() - started
         if was_running and process is not None and process.returncode is not None:
             sigkill = getattr(signal, "SIGKILL", None)
+            # The elapsed-time arm reports a forced kill the SDK performed
+            # internally, where the exit status is no longer visible here. A
+            # process that happens to exit on its own right at the grace
+            # boundary is counted too, so treat the metric as an upper bound.
             self._forced_kill = (
                 sigkill is not None and process.returncode == -sigkill
             ) or elapsed >= self._grace_period_seconds
@@ -194,7 +198,11 @@ class DroidRunner:
     async def run(self, request: RunRequest) -> AsyncGenerator[RunEvent, None]:
         reasoning_effort = _resolve_reasoning_effort(request.reasoning_effort)
         loop = asyncio.get_running_loop()
-        deadline = request.deadline or loop.time() + request.timeout_seconds
+        deadline = (
+            request.deadline
+            if request.deadline is not None
+            else loop.time() + request.timeout_seconds
+        )
         if deadline <= loop.time():
             raise _timeout_error(request)
 
@@ -421,6 +429,13 @@ async def _run_until(
     task: asyncio.Future[object] = asyncio.ensure_future(operation())
     done, _ = await asyncio.wait({task}, timeout=remaining)
     if not done:
+        # Deliberately fire-and-forget: the caller's remaining budget is spent
+        # on force_kill_and_reap instead of waiting for a close() that already
+        # blew its deadline to unwind. Both paths then act on the same process,
+        # which is safe because force_kill_and_reap suppresses
+        # ProcessLookupError/OSError and Process.wait() tolerates several
+        # waiters. Awaiting the cancellation here would reintroduce the hang
+        # this timeout exists to break.
         task.cancel()
         task.add_done_callback(_consume_future_result)
         return False

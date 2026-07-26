@@ -16,7 +16,9 @@ from factory_droid_openai.app import (
     RequestSizeLimitMiddleware,
     SessionRegistry,
     _collect_completion_or_disconnect,
+    _content_length,
     _finalize_stream,
+    _JsonDepthTracker,
     _stream_completion,
     _validation_message,
     create_app,
@@ -1370,3 +1372,34 @@ def test_session_registry_ignores_duplicate_entries() -> None:
 
     assert registry.knows("a") is True
     assert registry.knows("b") is True
+
+
+@pytest.mark.parametrize("value", [b"not-a-number", b"-1"])
+def test_content_length_ignores_unusable_headers(value: bytes) -> None:
+    assert _content_length({"headers": [(b"content-length", value)]}) is None
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 7, 4096])
+def test_json_depth_tracker_survives_escapes_split_across_chunks(chunk_size: int) -> None:
+    """Brackets inside strings must stay invisible however the body is chunked.
+
+    A backslash landing on a chunk boundary is the case that decides whether
+    the next byte is escaped, so the tracker has to carry that state over.
+    """
+    # The braces sit inside a string, so depth never rises above the outer
+    # object; the escaped quote must not be read as closing that string.
+    body = rb'{"a":"\"{{{{{{{{{{{{{{{{{{{{{{{{","b":"c\\","d":[1]}'
+    tracker = _JsonDepthTracker(3)
+
+    for index in range(0, len(body), chunk_size):
+        tracker.feed(body[index : index + chunk_size])
+
+    assert json.loads(body) == {"a": '"{{{{{{{{{{{{{{{{{{{{{{{{', "b": "c\\", "d": [1]}
+
+
+def test_json_depth_tracker_rejects_nesting_over_the_limit() -> None:
+    tracker = _JsonDepthTracker(3)
+    tracker.feed(b"[[[")
+
+    with pytest.raises(Exception, match="depth limit"):
+        tracker.feed(b"[")
