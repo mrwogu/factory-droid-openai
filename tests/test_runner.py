@@ -17,9 +17,15 @@ from droid_sdk import (
     TokenUsageUpdate,
     ToolUse,
     TurnComplete,
+    WorkingStateChanged,
 )
 from droid_sdk import TimeoutError as DroidTimeoutError
-from droid_sdk.schemas.enums import AutonomyLevel, ReasoningEffort
+from droid_sdk.errors import SessionNotFoundError
+from droid_sdk.schemas.enums import (
+    AutonomyLevel,
+    DroidWorkingState,
+    ReasoningEffort,
+)
 
 from factory_droid_openai.metrics import BridgeMetrics
 from factory_droid_openai.runner import (
@@ -28,9 +34,12 @@ from factory_droid_openai.runner import (
     RunComplete,
     RunnerError,
     RunRequest,
+    SessionStarted,
+    StatusUpdate,
     TextDelta,
     Usage,
     UsageUpdate,
+    _build_exec_args,
     _create_client,
 )
 
@@ -41,12 +50,16 @@ if TYPE_CHECKING:
 
 
 class FakeClient:
-    def __init__(self, events: list[object]) -> None:
+    def __init__(self, events: list[object], *, session_id: str | None = "session-1") -> None:
         self.events = events
         self.connected = False
         self.closed = False
         self.interrupted = False
         self.prompt = ""
+        self.session_id = session_id
+        self.loaded_session_id: str | None = None
+        self.images: Any = None
+        self.files: Any = None
         self.init_kwargs: dict[str, Any] = {}
         self.permission_handler: Any = None
         self.ask_user_handler: Any = None
@@ -63,8 +76,20 @@ class FakeClient:
     async def initialize_session(self, **kwargs: Any) -> None:
         self.init_kwargs = kwargs
 
-    async def add_user_message(self, *, text: str) -> None:
+    async def load_session(self, *, session_id: str) -> None:
+        self.loaded_session_id = session_id
+        self.session_id = session_id
+
+    async def add_user_message(
+        self,
+        *,
+        text: str,
+        images: Any = None,
+        files: Any = None,
+    ) -> None:
         self.prompt = text
+        self.images = images
+        self.files = files
 
     async def receive_response(self) -> AsyncIterator[object]:
         for event in self.events:
@@ -114,13 +139,14 @@ async def test_runner_maps_sdk_stream_and_usage(tmp_path: Path) -> None:
     events = [event async for event in runner.run(_request())]
 
     assert events == [
+        SessionStarted("session-1"),
         ReasoningDelta("think"),
         TextDelta("hello"),
         UsageUpdate(usage=Usage(12, 5, 3, 2)),
         RunComplete(usage=Usage(12, 5, 3, 2)),
     ]
-    assert isinstance(events[2], UsageUpdate)
-    assert events[2].usage.cache_read_tokens == 3
+    assert isinstance(events[3], UsageUpdate)
+    assert events[3].usage.cache_read_tokens == 3
     assert client.init_kwargs["model_id"] is None
     assert client.init_kwargs["reasoning_effort"] is ReasoningEffort.High
     assert client.init_kwargs["autonomy_level"] is AutonomyLevel.Off
@@ -455,3 +481,143 @@ def test_default_client_factory_configures_droid_process(tmp_path: Path) -> None
 
 async def _collect(runner: DroidRunner, request: RunRequest) -> list[object]:
     return [event async for event in runner.run(request)]
+
+
+@pytest.mark.asyncio
+async def test_runner_loads_existing_session_instead_of_initializing(
+    tmp_path: Path,
+) -> None:
+    usage = TokenUsageUpdate(
+        input_tokens=1,
+        output_tokens=1,
+        cache_read_tokens=0,
+        cache_write_tokens=0,
+    )
+    client = FakeClient([TurnComplete(usage)])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    events = await _collect(runner, _request(session_id="session-42"))
+
+    assert client.loaded_session_id == "session-42"
+    assert client.init_kwargs == {}
+    assert events[0] == SessionStarted("session-42")
+
+
+@pytest.mark.asyncio
+async def test_runner_reports_unknown_session_as_not_found(tmp_path: Path) -> None:
+    class MissingSessionClient(FakeClient):
+        async def load_session(self, *, session_id: str) -> None:
+            raise SessionNotFoundError(session_id)
+
+    client = MissingSessionClient([])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    with pytest.raises(RunnerError) as error:
+        await _collect(runner, _request(session_id="ghost"))
+
+    assert error.value.status_code == 404
+    assert error.value.error_type == "session_not_found"
+
+
+@pytest.mark.asyncio
+async def test_runner_forwards_attachments_to_the_sdk(tmp_path: Path) -> None:
+    usage = TokenUsageUpdate(
+        input_tokens=1,
+        output_tokens=1,
+        cache_read_tokens=0,
+        cache_write_tokens=0,
+    )
+    client = FakeClient([TurnComplete(usage)])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+    image = {"type": "base64", "mediaType": "image/png", "data": "QUJD"}
+    document = {"type": "text", "mediaType": "text/plain", "data": "hi"}
+
+    await _collect(runner, _request(images=(image,), documents=(document,)))
+
+    assert client.images == [image]
+    assert client.files == [document]
+
+
+@pytest.mark.asyncio
+async def test_runner_omits_empty_attachment_lists(tmp_path: Path) -> None:
+    usage = TokenUsageUpdate(
+        input_tokens=1,
+        output_tokens=1,
+        cache_read_tokens=0,
+        cache_write_tokens=0,
+    )
+    client = FakeClient([TurnComplete(usage)])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    await _collect(runner, _request())
+
+    assert client.images is None
+    assert client.files is None
+
+
+@pytest.mark.asyncio
+async def test_runner_maps_working_state_changes_to_status_events(
+    tmp_path: Path,
+) -> None:
+    usage = TokenUsageUpdate(
+        input_tokens=1,
+        output_tokens=1,
+        cache_read_tokens=0,
+        cache_write_tokens=0,
+    )
+    client = FakeClient(
+        [
+            WorkingStateChanged(state=DroidWorkingState.ExecutingTool),
+            TurnComplete(usage),
+        ]
+    )
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    events = await _collect(runner, _request())
+
+    assert StatusUpdate("executing_tool") in events
+
+
+def test_exec_args_stay_default_without_cli_only_options() -> None:
+    assert _build_exec_args(worktree=None, append_system_prompt_file=None) is None
+
+
+def test_exec_args_append_cli_only_flags_to_the_jsonrpc_defaults(tmp_path: Path) -> None:
+    prompt_file = tmp_path / "system.md"
+
+    args = _build_exec_args(worktree="wt", append_system_prompt_file=prompt_file)
+
+    assert args is not None
+    assert args[:5] == [
+        "exec",
+        "--input-format",
+        "stream-jsonrpc",
+        "--output-format",
+        "stream-jsonrpc",
+    ]
+    assert args[5:] == [
+        "--worktree",
+        "wt",
+        "--append-system-prompt-file",
+        str(prompt_file),
+    ]

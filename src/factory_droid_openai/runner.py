@@ -7,7 +7,7 @@ import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from droid_sdk import (
     AssistantTextDelta,
@@ -15,15 +15,28 @@ from droid_sdk import (
     DroidClientError,
     ErrorEvent,
     ProcessTransport,
+    SessionNotFoundError,
     ThinkingTextDelta,
     TokenUsageUpdate,
     ToolProgress,
     ToolResult,
     ToolUse,
     TurnComplete,
+    WorkingStateChanged,
 )
 from droid_sdk import TimeoutError as DroidTimeoutError
 from droid_sdk.schemas.enums import AutonomyLevel, ReasoningEffort
+
+# droid exec flags the SDK's ProcessTransport always passes. Overriding
+# exec_args replaces this list wholesale, so extra flags must be appended
+# to a copy of it rather than passed on their own.
+_BASE_EXEC_ARGS = (
+    "exec",
+    "--input-format",
+    "stream-jsonrpc",
+    "--output-format",
+    "stream-jsonrpc",
+)
 
 
 class RunnerError(RuntimeError):
@@ -47,6 +60,9 @@ class RunRequest:
     reasoning_effort: str | None
     timeout_seconds: float
     deadline: float | None = None
+    images: tuple[dict[str, Any], ...] = ()
+    documents: tuple[dict[str, Any], ...] = ()
+    session_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,7 +93,17 @@ class RunComplete:
     usage: Usage
 
 
-RunEvent = TextDelta | ReasoningDelta | UsageUpdate | RunComplete
+@dataclass(frozen=True, slots=True)
+class SessionStarted:
+    session_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class StatusUpdate:
+    state: str
+
+
+RunEvent = TextDelta | ReasoningDelta | UsageUpdate | RunComplete | SessionStarted | StatusUpdate
 ClientFactory = Callable[[str, Path], DroidClient]
 
 
@@ -94,11 +120,13 @@ class _ManagedProcessTransport(ProcessTransport):
         exec_path: str,
         cwd: str,
         grace_period: float,
+        exec_args: list[str] | None = None,
     ) -> None:
         super().__init__(
             exec_path=exec_path,
             cwd=cwd,
             grace_period=grace_period,
+            exec_args=exec_args,
         )
         self._owned_process: asyncio.subprocess.Process | None = None
         self._forced_kill = False
@@ -149,6 +177,8 @@ class DroidRunner:
         process_grace_seconds: float = 1.0,
         cleanup_timeout_seconds: float = 4.0,
         metrics: RunnerMetrics | None = None,
+        worktree: str | None = None,
+        append_system_prompt_file: Path | None = None,
     ) -> None:
         self._droid_path = droid_path
         self._workdir = workdir
@@ -156,6 +186,10 @@ class DroidRunner:
         self._process_grace_seconds = process_grace_seconds
         self._cleanup_timeout_seconds = cleanup_timeout_seconds
         self._metrics = metrics
+        self._exec_args = _build_exec_args(
+            worktree=worktree,
+            append_system_prompt_file=append_system_prompt_file,
+        )
 
     async def run(self, request: RunRequest) -> AsyncGenerator[RunEvent, None]:
         reasoning_effort = _resolve_reasoning_effort(request.reasoning_effort)
@@ -181,23 +215,36 @@ class DroidRunner:
                 finally:
                     if self._metrics is not None:
                         self._metrics.observe_droid_startup(time.perf_counter() - startup_started)
-                await client.initialize_session(
-                    machine_id="factory-droid-openai",
-                    cwd=str(self._workdir),
-                    model_id=_resolve_model_id(request.model, request.model_alias),
-                    reasoning_effort=reasoning_effort,
-                    autonomy_level=AutonomyLevel.Off,
-                    skip_permissions_unsafe=False,
-                    enabled_tool_ids=[],
-                )
+                if request.session_id is not None:
+                    # Continuation: reuse the stored Droid session so only the
+                    # new turn is sent instead of the whole transcript.
+                    await client.load_session(session_id=request.session_id)
+                else:
+                    await client.initialize_session(
+                        machine_id="factory-droid-openai",
+                        cwd=str(self._workdir),
+                        model_id=_resolve_model_id(request.model, request.model_alias),
+                        reasoning_effort=reasoning_effort,
+                        autonomy_level=AutonomyLevel.Off,
+                        skip_permissions_unsafe=False,
+                        enabled_tool_ids=[],
+                    )
                 initialized = True
-                await client.add_user_message(text=request.prompt)
+                if client.session_id is not None:
+                    yield SessionStarted(client.session_id)
+                await client.add_user_message(
+                    text=request.prompt,
+                    images=list(request.images) or None,
+                    files=list(request.documents) or None,
+                )
 
                 async for event in client.receive_response():
                     if isinstance(event, AssistantTextDelta):
                         yield TextDelta(event.text)
                     elif isinstance(event, ThinkingTextDelta):
                         yield ReasoningDelta(event.text)
+                    elif isinstance(event, WorkingStateChanged):
+                        yield StatusUpdate(_state_value(event.state))
                     elif isinstance(event, TokenUsageUpdate):
                         usage = _map_usage(event)
                         yield UsageUpdate(usage)
@@ -225,6 +272,12 @@ class DroidRunner:
                 status_code=503,
                 error_type="factory_droid_unavailable",
             ) from exc
+        except SessionNotFoundError as exc:
+            raise RunnerError(
+                f"Factory Droid session '{request.session_id}' was not found.",
+                status_code=404,
+                error_type="session_not_found",
+            ) from exc
         except DroidClientError as exc:
             raise RunnerError(
                 f"Factory Droid SDK failed: {exc}",
@@ -251,6 +304,7 @@ class DroidRunner:
             exec_path=self._droid_path,
             cwd=str(self._workdir),
             grace_period=self._process_grace_seconds,
+            exec_args=self._exec_args,
         )
         return DroidClient(transport=transport), transport
 
@@ -305,6 +359,21 @@ def _create_client(
     return DroidClient(transport=transport)
 
 
+def _build_exec_args(
+    *,
+    worktree: str | None,
+    append_system_prompt_file: Path | None,
+) -> list[str] | None:
+    if worktree is None and append_system_prompt_file is None:
+        return None
+    args = list(_BASE_EXEC_ARGS)
+    if worktree is not None:
+        args.extend(["--worktree", worktree])
+    if append_system_prompt_file is not None:
+        args.extend(["--append-system-prompt-file", str(append_system_prompt_file)])
+    return args
+
+
 def _resolve_model_id(model: str, model_alias: str) -> str | None:
     return None if model == model_alias else model
 
@@ -327,6 +396,10 @@ def _resolve_reasoning_effort(value: str | None) -> ReasoningEffort | None:
 def normalize_reasoning_effort(value: str | None) -> str | None:
     resolved = _resolve_reasoning_effort(value)
     return resolved.value if resolved is not None else None
+
+
+def _state_value(state: object) -> str:
+    return str(getattr(state, "value", state))
 
 
 def _map_usage(event: TokenUsageUpdate) -> Usage:

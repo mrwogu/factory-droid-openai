@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+
+from factory_droid_openai.attachments import AttachmentSet, extract_attachments
+from factory_droid_openai.errors import ProtocolError, RequestTooLargeError
 
 if TYPE_CHECKING:
     from factory_droid_openai.models import ChatCompletionRequest, ToolDefinition
@@ -12,13 +15,20 @@ TOOL_CALL_OPEN = "<tool_call>"
 TOOL_CALL_CLOSE = "</tool_call>"
 _MAX_TOOL_PAYLOAD_BYTES = 1_000_000
 
-
-class ProtocolError(ValueError):
-    pass
-
-
-class RequestTooLargeError(ProtocolError):
-    pass
+__all__ = [
+    "TOOL_CALL_CLOSE",
+    "TOOL_CALL_OPEN",
+    "AttachmentSet",
+    "PromptPlan",
+    "ProtocolEmission",
+    "ProtocolError",
+    "RequestTooLargeError",
+    "StopSequenceBuffer",
+    "TextEmission",
+    "ToolCallEmission",
+    "ToolCallStreamParser",
+    "build_prompt",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +36,7 @@ class PromptPlan:
     prompt: str
     allowed_tool_names: frozenset[str]
     require_tool_call: bool
+    attachments: AttachmentSet = field(default_factory=AttachmentSet)
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +62,9 @@ def build_prompt(
     max_transcript_bytes: int = 4_194_304,
     max_tool_schema_bytes: int = 1_048_576,
     max_json_depth: int = 32,
+    max_tool_calls: int = 1,
+    max_attachments: int = 16,
+    max_attachment_bytes: int = 8_388_608,
 ) -> PromptPlan:
     if len(request.messages) > max_messages:
         raise RequestTooLargeError(f"request exceeds maximum of {max_messages} messages")
@@ -77,8 +91,17 @@ def build_prompt(
 
     serialized_messages: list[str] = []
     message_bytes = 0
+    attachments = AttachmentSet()
     for message in request.messages:
         payload = message.model_dump(mode="json", exclude_none=True)
+        # Binary parts leave the transcript here and travel over the SDK's
+        # native attachment channel instead of being inlined as base64 text.
+        payload = extract_attachments(
+            payload,
+            attachments,
+            max_attachments=max_attachments,
+            max_attachment_bytes=max_attachment_bytes,
+        )
         if _json_depth_exceeds(payload, max_json_depth):
             raise RequestTooLargeError(f"message exceeds maximum JSON depth of {max_json_depth}")
         serialized, serialized_bytes = _serialize_json(payload)
@@ -107,12 +130,24 @@ def build_prompt(
     tool_names = frozenset(tool.function.name for tool in selected_tools)
 
     if tool_names:
+        if max_tool_calls > 1:
+            count_rule = (
+                f"If tools are needed, output up to {max_tool_calls} tool requests "
+                "back to back, each using "
+            )
+            trailing_rule = (
+                "Separate consecutive tool requests with nothing but whitespace. "
+                "Do not add any other text after the first closing marker."
+            )
+        else:
+            count_rule = "If a tool is needed, output exactly one tool request using "
+            trailing_rule = "Do not add text after the closing marker."
         tool_rule = (
-            "If a tool is needed, output exactly one tool request using "
+            f"{count_rule}"
             f"{TOOL_CALL_OPEN}"
             '{"name":"allowed_tool_name","arguments":{"key":"value"}}'
             f"{TOOL_CALL_CLOSE}. "
-            "Do not call Droid-native tools. Do not add text after the closing marker."
+            f"Do not call Droid-native tools. {trailing_rule}"
         )
         if require_tool_call:
             tool_rule += " A tool call is required for this response."
@@ -134,6 +169,7 @@ def build_prompt(
         prompt=prompt,
         allowed_tool_names=tool_names,
         require_tool_call=require_tool_call,
+        attachments=attachments,
     )
 
 
@@ -167,9 +203,11 @@ class ToolCallStreamParser:
         allowed_tool_names: frozenset[str],
         *,
         require_tool_call: bool = False,
+        max_tool_calls: int = 1,
     ) -> None:
         self._allowed_tool_names = allowed_tool_names
         self._require_tool_call = require_tool_call
+        self._max_tool_calls = max(1, max_tool_calls)
         self._text_tail = ""
         self._payload_chunks: list[str] = []
         self._payload_bytes = 0
@@ -177,6 +215,7 @@ class ToolCallStreamParser:
         self._capturing = False
         self._done = False
         self._saw_tool_call = False
+        self._tool_call_count = 0
 
     def feed(self, chunk: str) -> list[ProtocolEmission]:
         if not chunk:
@@ -194,7 +233,13 @@ class ToolCallStreamParser:
             raise ProtocolError("incomplete tool-call marker")
         emissions: list[ProtocolEmission] = []
         if self._text_tail:
-            emissions.append(TextEmission(self._text_tail))
+            # After a tool call only whitespace may separate further calls; any
+            # residual non-whitespace is trailing output and must fail closed.
+            if self._saw_tool_call:
+                if self._text_tail.strip():
+                    raise ProtocolError("unexpected text after tool call")
+            else:
+                emissions.append(TextEmission(self._text_tail))
             self._text_tail = ""
         if self._require_tool_call and not self._saw_tool_call:
             raise ProtocolError("the model did not produce the required tool call")
@@ -208,7 +253,7 @@ class ToolCallStreamParser:
             emissions: list[ProtocolEmission] = []
             prefix = value[:marker_index]
             if prefix:
-                emissions.append(TextEmission(prefix))
+                emissions.extend(self._emit_text_before_marker(prefix))
             self._capturing = True
             emissions.extend(
                 self._consume_tool_payload(value[marker_index + len(TOOL_CALL_OPEN) :])
@@ -222,7 +267,14 @@ class ToolCallStreamParser:
             return []
         text = value[:emit_length]
         self._text_tail = value[emit_length:]
-        return [TextEmission(text)]
+        return self._emit_text_before_marker(text)
+
+    def _emit_text_before_marker(self, text: str) -> list[ProtocolEmission]:
+        if not self._saw_tool_call:
+            return [TextEmission(text)]
+        if text.strip():
+            raise ProtocolError("unexpected text after tool call")
+        return []
 
     def _consume_tool_payload(self, chunk: str) -> list[ProtocolEmission]:
         value = self._close_tail + chunk
@@ -243,16 +295,26 @@ class ToolCallStreamParser:
             payload_bytes = tail_bytes + len(chunk_payload.encode("utf-8"))
         self._append_payload(payload, payload_bytes)
         trailing = value[close_index + len(TOOL_CALL_CLOSE) :]
-        if trailing.strip():
-            raise ProtocolError("unexpected text after tool call")
         complete_payload = "".join(self._payload_chunks)
         emission = self._parse_tool_payload(complete_payload)
         self._payload_chunks.clear()
+        # The size limit is per payload, so the bounded call count is what caps
+        # the total bytes a single turn can buffer.
+        self._payload_bytes = 0
         self._close_tail = ""
         self._capturing = False
-        self._done = True
         self._saw_tool_call = True
-        return [emission]
+        self._tool_call_count += 1
+
+        emissions: list[ProtocolEmission] = [emission]
+        if self._tool_call_count >= self._max_tool_calls:
+            self._done = True
+            if trailing.strip():
+                raise ProtocolError("unexpected text after tool call")
+            return emissions
+        if trailing:
+            emissions.extend(self._consume_text(trailing))
+        return emissions
 
     def _append_payload(self, value: str, value_bytes: int | None = None) -> None:
         if not value:
@@ -288,6 +350,56 @@ class ToolCallStreamParser:
             name=name,
             arguments=json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
         )
+
+
+class StopSequenceBuffer:
+    """Truncates assistant text at the first configured stop sequence.
+
+    Droid has no native stop-sequence support, so the bridge enforces it on
+    the emitted text. Text that could still turn into a stop sequence is held
+    back until the next chunk resolves it.
+    """
+
+    def __init__(self, stop_sequences: tuple[str, ...]) -> None:
+        self._stop_sequences = tuple(sequence for sequence in stop_sequences if sequence)
+        self._held = ""
+        self._triggered = False
+
+    @property
+    def triggered(self) -> bool:
+        return self._triggered
+
+    def feed(self, text: str) -> str:
+        if self._triggered:
+            return ""
+        if not self._stop_sequences:
+            return text
+        value = self._held + text
+        self._held = ""
+
+        earliest = -1
+        for sequence in self._stop_sequences:
+            index = value.find(sequence)
+            if index >= 0 and (earliest < 0 or index < earliest):
+                earliest = index
+        if earliest >= 0:
+            self._triggered = True
+            return value[:earliest]
+
+        held = max(
+            _partial_marker_suffix_length(value, sequence) for sequence in self._stop_sequences
+        )
+        if held:
+            self._held = value[-held:]
+            return value[:-held]
+        return value
+
+    def flush(self) -> str:
+        if self._triggered:
+            return ""
+        held = self._held
+        self._held = ""
+        return held
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
