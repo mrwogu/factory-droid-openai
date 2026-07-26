@@ -1,13 +1,14 @@
 name: Bug report
 description: Report reproducible incorrect behavior.
-title: "bug: "
-labels: ["bug"]
+title: 'bug: '
+labels:
+  - bug
 body:
   - type: markdown
     attributes:
-      value: |
-        Do not include API keys, authentication tokens, or private prompt content.
-
+      value: >
+        Do not include API keys, authentication tokens, or private prompt
+        content.
   - type: textarea
     id: summary
     attributes:
@@ -15,27 +16,26 @@ body:
       description: Describe the observed behavior and expected result.
     validations:
       required: true
-
   - type: textarea
     id: reproduction
     attributes:
       label: Reproduction
-      description: Provide the smallest request, configuration, and steps that reproduce the issue.
+      description: >-
+        Provide the smallest request, configuration, and steps that reproduce
+        the issue.
       placeholder: |
         1. Start the bridge with ...
         2. Send ...
         3. Observe ...
     validations:
       required: true
-
   - type: input
     id: bridge-version
     attributes:
       label: Bridge version
-      placeholder: "1.0.0"
+      placeholder: 1.0.0
     validations:
       required: true
-
   - type: input
     id: droid-version
     attributes:
@@ -43,7 +43,6 @@ body:
       description: Output from `droid --version`.
     validations:
       required: true
-
   - type: input
     id: python-version
     attributes:
@@ -51,7 +50,6 @@ body:
       description: Output from `python --version`.
     validations:
       required: true
-
   - type: dropdown
     id: response-mode
     attributes:
@@ -62,14 +60,12 @@ body:
         - Both
     validations:
       required: true
-
   - type: textarea
     id: logs
     attributes:
       label: Sanitized logs
       description: Remove credentials, private paths, and sensitive prompt content.
       render: text
-
   - type: checkboxes
     id: checks
     attributes:
