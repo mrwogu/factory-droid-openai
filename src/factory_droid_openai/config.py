@@ -28,6 +28,15 @@ class Settings:
     cleanup_timeout_seconds: float = 4.0
     server_limit_concurrency: int = 64
     server_backlog: int = 128
+    max_tool_calls: int = 8
+    max_attachments: int = 16
+    max_attachment_bytes: int = 8_388_608
+    max_choices: int = 4
+    max_stop_sequences: int = 4
+    session_continuity: bool = False
+    max_tracked_sessions: int = 256
+    worktree: str | None = None
+    append_system_prompt_file: Path | None = None
     model_alias: str = "factory-droid"
 
     @classmethod
@@ -103,6 +112,38 @@ class Settings:
             "FACTORY_DROID_OPENAI_UVICORN_BACKLOG",
             default=128,
         )
+        max_tool_calls = _positive_int(
+            "FACTORY_DROID_OPENAI_MAX_TOOL_CALLS",
+            default=8,
+        )
+        max_attachments = _non_negative_int(
+            "FACTORY_DROID_OPENAI_MAX_ATTACHMENTS",
+            default=16,
+        )
+        max_attachment_bytes = _positive_int(
+            "FACTORY_DROID_OPENAI_MAX_ATTACHMENT_BYTES",
+            default=8_388_608,
+        )
+        max_choices = _positive_int(
+            "FACTORY_DROID_OPENAI_MAX_CHOICES",
+            default=4,
+        )
+        max_stop_sequences = _non_negative_int(
+            "FACTORY_DROID_OPENAI_MAX_STOP_SEQUENCES",
+            default=4,
+        )
+        session_continuity = _boolean(
+            "FACTORY_DROID_OPENAI_SESSION_CONTINUITY",
+            default=False,
+        )
+        max_tracked_sessions = _positive_int(
+            "FACTORY_DROID_OPENAI_MAX_TRACKED_SESSIONS",
+            default=256,
+        )
+        worktree = os.getenv("FACTORY_DROID_OPENAI_WORKTREE") or None
+        append_system_prompt_file = _optional_file(
+            "FACTORY_DROID_OPENAI_APPEND_SYSTEM_PROMPT_FILE",
+        )
         port = _positive_int("FACTORY_DROID_OPENAI_PORT", default=8787)
         if port > 65535:
             raise ValueError("FACTORY_DROID_OPENAI_PORT must be at most 65535")
@@ -127,6 +168,15 @@ class Settings:
             cleanup_timeout_seconds=cleanup_timeout_seconds,
             server_limit_concurrency=server_limit_concurrency,
             server_backlog=server_backlog,
+            max_tool_calls=max_tool_calls,
+            max_attachments=max_attachments,
+            max_attachment_bytes=max_attachment_bytes,
+            max_choices=max_choices,
+            max_stop_sequences=max_stop_sequences,
+            session_continuity=session_continuity,
+            max_tracked_sessions=max_tracked_sessions,
+            worktree=worktree,
+            append_system_prompt_file=append_system_prompt_file,
             model_alias=os.getenv("FACTORY_DROID_OPENAI_MODEL_ALIAS", "factory-droid"),
         )
 
@@ -151,6 +201,28 @@ def _positive_int(name: str, *, default: int) -> int:
     if value <= 0:
         raise ValueError(f"{name} must be greater than zero")
     return value
+
+
+def _boolean(name: str, *, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean value")
+
+
+def _optional_file(name: str) -> Path | None:
+    raw = os.getenv(name)
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    if not path.is_file():
+        raise ValueError(f"{name} does not point at a readable file: {path}")
+    return path.resolve()
 
 
 def _non_negative_int(name: str, *, default: int) -> int:

@@ -10,6 +10,7 @@ from factory_droid_openai.protocol import (
     TOOL_CALL_CLOSE,
     TOOL_CALL_OPEN,
     ProtocolError,
+    StopSequenceBuffer,
     TextEmission,
     ToolCallEmission,
     ToolCallStreamParser,
@@ -496,3 +497,168 @@ def test_stream_parser_preserves_partial_marker_as_plain_text() -> None:
         "".join(emission.text for emission in emissions if isinstance(emission, TextEmission))
         == "literal <tool_"
     )
+
+
+def _tool_call(name: str, arguments: str) -> str:
+    return f'{TOOL_CALL_OPEN}{{"name":"{name}","arguments":{arguments}}}{TOOL_CALL_CLOSE}'
+
+
+def test_parser_accepts_several_tool_calls_when_allowed() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}), max_tool_calls=3)
+
+    emissions = parser.feed(
+        _tool_call("weather", '{"city":"Gdansk"}')
+        + "\n  "
+        + _tool_call("weather", '{"city":"Sopot"}')
+    )
+    emissions.extend(parser.finish())
+
+    calls = [item for item in emissions if isinstance(item, ToolCallEmission)]
+    assert [json.loads(call.arguments)["city"] for call in calls] == ["Gdansk", "Sopot"]
+    assert all(isinstance(item, ToolCallEmission) for item in emissions)
+
+
+def test_parser_stops_accepting_calls_past_the_configured_cap() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}), max_tool_calls=1)
+
+    with pytest.raises(ProtocolError, match="unexpected text after tool call"):
+        parser.feed(
+            _tool_call("weather", '{"city":"Gdansk"}') + _tool_call("weather", '{"city":"Sopot"}')
+        )
+
+
+def test_parser_rejects_prose_between_tool_calls() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}), max_tool_calls=3)
+    parser.feed(_tool_call("weather", '{"city":"Gdansk"}'))
+
+    with pytest.raises(ProtocolError, match="unexpected text after tool call"):
+        parser.feed("and now some prose")
+
+
+def test_parser_rejects_trailing_prose_at_finish_after_tool_call() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}), max_tool_calls=3)
+    parser.feed(_tool_call("weather", '{"city":"Gdansk"}'))
+    # Held back as a possible opening marker, so it only fails at finish().
+    parser.feed("  <tool")
+
+    with pytest.raises(ProtocolError, match="unexpected text after tool call"):
+        parser.finish()
+
+
+def test_parser_drops_whitespace_after_final_tool_call() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}), max_tool_calls=3)
+    parser.feed(_tool_call("weather", '{"city":"Gdansk"}'))
+    parser.feed("   ")
+
+    assert parser.finish() == []
+
+
+def test_stop_buffer_truncates_at_first_sequence() -> None:
+    buffer = StopSequenceBuffer(("STOP",))
+
+    assert buffer.feed("hello ") == "hello "
+    assert buffer.feed("world STOP tail") == "world "
+    assert buffer.triggered is True
+    assert buffer.feed("more") == ""
+    assert buffer.flush() == ""
+
+
+def test_stop_buffer_holds_back_partial_sequences() -> None:
+    buffer = StopSequenceBuffer(("STOP",))
+
+    assert buffer.feed("hello ST") == "hello "
+    assert buffer.feed("OP after") == ""
+    assert buffer.triggered is True
+
+
+def test_stop_buffer_releases_held_text_that_is_not_a_stop() -> None:
+    buffer = StopSequenceBuffer(("STOP",))
+
+    assert buffer.feed("done ST") == "done "
+    assert buffer.flush() == "ST"
+    assert buffer.triggered is False
+
+
+def test_stop_buffer_picks_the_earliest_of_several_sequences() -> None:
+    buffer = StopSequenceBuffer(("END", "STOP"))
+
+    assert buffer.feed("a STOP b END") == "a "
+
+
+def test_stop_buffer_without_sequences_passes_text_through() -> None:
+    buffer = StopSequenceBuffer(())
+
+    assert buffer.feed("anything") == "anything"
+    assert buffer.flush() == ""
+
+
+def test_multi_tool_prompt_mentions_the_cap() -> None:
+    plan = build_prompt(_request(), max_tool_calls=4)
+
+    assert "up to 4 tool requests" in plan.prompt
+
+
+def test_continuation_prompt_sends_only_messages_after_last_assistant() -> None:
+    request = _request(
+        messages=[
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "reply"},
+            {"role": "user", "content": "second"},
+        ]
+    )
+
+    plan = build_prompt(request, continuation=True)
+
+    assert "second" in plan.prompt
+    assert "first" not in plan.prompt
+    assert "session already holds the earlier turns" in plan.prompt
+
+
+def test_continuation_falls_back_to_full_transcript_without_assistant_turn() -> None:
+    request = _request(
+        messages=[
+            {"role": "user", "content": "first"},
+            {"role": "user", "content": "second"},
+        ]
+    )
+
+    plan = build_prompt(request, continuation=True)
+
+    assert "first" in plan.prompt
+    assert "second" in plan.prompt
+
+
+def test_continuation_falls_back_when_assistant_message_is_last() -> None:
+    request = _request(
+        messages=[
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "reply"},
+        ]
+    )
+
+    plan = build_prompt(request, continuation=True)
+
+    assert "first" in plan.prompt
+
+
+def test_build_prompt_moves_images_out_of_the_transcript() -> None:
+    request = _request(
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,QUJD"},
+                    },
+                ],
+            }
+        ]
+    )
+
+    plan = build_prompt(request)
+
+    assert "QUJD" not in plan.prompt
+    assert "[attached image #1 (image/png)]" in plan.prompt
+    assert plan.attachments.images[0].data == "QUJD"

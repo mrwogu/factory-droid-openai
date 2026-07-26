@@ -103,6 +103,22 @@
             ],
             "title": "Factory Droid Reasoning Effort"
           },
+          "factory_droid_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Factory Droid Session Id"
+          },
+          "factory_droid_status": {
+            "default": false,
+            "title": "Factory Droid Status",
+            "type": "boolean"
+          },
           "messages": {
             "items": {
               "$ref": "#/components/schemas/ChatMessage"
@@ -114,6 +130,17 @@
             "title": "Model",
             "type": "string"
           },
+          "n": {
+            "default": 1,
+            "minimum": 1.0,
+            "title": "N",
+            "type": "integer"
+          },
+          "parallel_tool_calls": {
+            "default": true,
+            "title": "Parallel Tool Calls",
+            "type": "boolean"
+          },
           "reasoning_effort": {
             "anyOf": [
               {
@@ -124,6 +151,23 @@
               }
             ],
             "title": "Reasoning Effort"
+          },
+          "stop": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stop"
           },
           "stream": {
             "default": false,
@@ -189,6 +233,17 @@
           "created": {
             "title": "Created",
             "type": "integer"
+          },
+          "factory_droid_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Factory Droid Session Id"
           },
           "id": {
             "title": "Id",
@@ -627,6 +682,16 @@
               }
             },
             "description": "A JSON completion or an SSE completion stream."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The requested Factory Droid session is unknown to this bridge."
           },
           "413": {
             "content": {

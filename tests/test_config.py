@@ -28,6 +28,15 @@ _ENVIRONMENT_KEYS = (
     "FACTORY_DROID_OPENAI_RETRY_AFTER_SECONDS",
     "FACTORY_DROID_OPENAI_PROCESS_GRACE_SECONDS",
     "FACTORY_DROID_OPENAI_CLEANUP_TIMEOUT_SECONDS",
+    "FACTORY_DROID_OPENAI_MAX_TOOL_CALLS",
+    "FACTORY_DROID_OPENAI_MAX_ATTACHMENTS",
+    "FACTORY_DROID_OPENAI_MAX_ATTACHMENT_BYTES",
+    "FACTORY_DROID_OPENAI_MAX_CHOICES",
+    "FACTORY_DROID_OPENAI_MAX_STOP_SEQUENCES",
+    "FACTORY_DROID_OPENAI_SESSION_CONTINUITY",
+    "FACTORY_DROID_OPENAI_MAX_TRACKED_SESSIONS",
+    "FACTORY_DROID_OPENAI_WORKTREE",
+    "FACTORY_DROID_OPENAI_APPEND_SYSTEM_PROMPT_FILE",
     "FACTORY_DROID_OPENAI_UVICORN_LIMIT_CONCURRENCY",
     "FACTORY_DROID_OPENAI_UVICORN_BACKLOG",
     "FACTORY_DROID_OPENAI_MODEL_ALIAS",
@@ -232,3 +241,91 @@ def test_settings_from_env_rejects_missing_workdir(
 
     with pytest.raises(ValueError, match="workdir does not exist"):
         Settings.from_env()
+
+
+def test_settings_read_feature_limits_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    prompt_file = tmp_path / "system.md"
+    prompt_file.write_text("extra instructions", encoding="utf-8")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_TOOL_CALLS", "3")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_ATTACHMENTS", "0")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_ATTACHMENT_BYTES", "1024")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_CHOICES", "2")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_STOP_SEQUENCES", "0")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_SESSION_CONTINUITY", "yes")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_TRACKED_SESSIONS", "5")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKTREE", "feature-branch")
+    monkeypatch.setenv(
+        "FACTORY_DROID_OPENAI_APPEND_SYSTEM_PROMPT_FILE",
+        str(prompt_file),
+    )
+
+    settings = Settings.from_env()
+
+    assert settings.max_tool_calls == 3
+    assert settings.max_attachments == 0
+    assert settings.max_attachment_bytes == 1024
+    assert settings.max_choices == 2
+    assert settings.max_stop_sequences == 0
+    assert settings.session_continuity is True
+    assert settings.max_tracked_sessions == 5
+    assert settings.worktree == "feature-branch"
+    assert settings.append_system_prompt_file == prompt_file.resolve()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("1", True), ("true", True), ("on", True), ("0", False), ("off", False)],
+)
+def test_settings_parse_boolean_flags(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    raw: str,
+    expected: bool,
+) -> None:
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_SESSION_CONTINUITY", raw)
+
+    assert Settings.from_env().session_continuity is expected
+
+
+def test_settings_reject_non_boolean_continuity_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_SESSION_CONTINUITY", "maybe")
+
+    with pytest.raises(ValueError, match="must be a boolean value"):
+        Settings.from_env()
+
+
+def test_settings_reject_missing_system_prompt_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
+    monkeypatch.setenv(
+        "FACTORY_DROID_OPENAI_APPEND_SYSTEM_PROMPT_FILE",
+        str(tmp_path / "missing.md"),
+    )
+
+    with pytest.raises(ValueError, match="does not point at a readable file"):
+        Settings.from_env()
+
+
+def test_settings_ignore_blank_optional_values(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKTREE", "")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_APPEND_SYSTEM_PROMPT_FILE", "")
+
+    settings = Settings.from_env()
+
+    assert settings.worktree is None
+    assert settings.append_system_prompt_file is None

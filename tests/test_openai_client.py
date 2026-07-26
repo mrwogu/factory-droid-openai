@@ -246,3 +246,103 @@ async def test_official_openai_client_parses_queue_overload_and_retry_after(
     assert error.value.response.headers["retry-after"] == "3"
     assert isinstance(error.value.body, dict)
     assert error.value.body["type"] == "rate_limit_error"
+
+
+@pytest.mark.asyncio
+async def test_official_openai_client_applies_stop_sequences(tmp_path: Path) -> None:
+    runner = ScriptedRunner(
+        [
+            TextDelta("kept "),
+            TextDelta("HALT dropped"),
+            RunComplete(Usage()),
+        ]
+    )
+    client, http_client = _sdk_client(tmp_path, runner)
+    async with http_client:
+        completion = await client.chat.completions.create(
+            model="factory-droid",
+            messages=[{"role": "user", "content": "Hello"}],
+            stop="HALT",
+        )
+
+    assert completion.choices[0].message.content == "kept "
+    assert completion.choices[0].finish_reason == "stop"
+
+
+@pytest.mark.asyncio
+async def test_official_openai_client_receives_multiple_choices(tmp_path: Path) -> None:
+    runner = ScriptedRunner([TextDelta("answer"), RunComplete(Usage(2, 1, 0, 0))])
+    client, http_client = _sdk_client(tmp_path, runner)
+    async with http_client:
+        completion = await client.chat.completions.create(
+            model="factory-droid",
+            messages=[{"role": "user", "content": "Hello"}],
+            n=2,
+        )
+
+    assert [choice.index for choice in completion.choices] == [0, 1]
+    assert completion.usage is not None
+    assert completion.usage.prompt_tokens == 4
+
+
+@pytest.mark.asyncio
+async def test_official_openai_client_parses_parallel_tool_calls(tmp_path: Path) -> None:
+    body = '{{"name":"get_weather","arguments":{{"city":"{city}"}}}}'
+    first = f"{TOOL_CALL_OPEN}{body.format(city='Gdansk')}{TOOL_CALL_CLOSE}"
+    second = f"{TOOL_CALL_OPEN}{body.format(city='Sopot')}{TOOL_CALL_CLOSE}"
+    runner = ScriptedRunner([TextDelta(first + second), RunComplete(Usage())])
+    client, http_client = _sdk_client(tmp_path, runner)
+    async with http_client:
+        completion = await client.chat.completions.create(
+            model="factory-droid",
+            messages=[{"role": "user", "content": "Weather?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+        )
+
+    tool_calls = completion.choices[0].message.tool_calls
+    assert tool_calls is not None
+    assert len(tool_calls) == 2
+    arguments = []
+    for call in tool_calls:
+        assert call.type == "function"
+        arguments.append(call.function.arguments)
+    assert arguments == ['{"city":"Gdansk"}', '{"city":"Sopot"}']
+    assert completion.choices[0].finish_reason == "tool_calls"
+
+
+@pytest.mark.asyncio
+async def test_official_openai_client_sends_image_parts(tmp_path: Path) -> None:
+    runner = ScriptedRunner([TextDelta("a cat"), RunComplete(Usage())])
+    client, http_client = _sdk_client(tmp_path, runner)
+    async with http_client:
+        completion = await client.chat.completions.create(
+            model="factory-droid",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What is this?"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,QUJD"},
+                        },
+                    ],
+                }
+            ],
+        )
+
+    assert completion.choices[0].message.content == "a cat"
+    assert runner.requests[0].images == (
+        {"type": "base64", "mediaType": "image/png", "data": "QUJD"},
+    )

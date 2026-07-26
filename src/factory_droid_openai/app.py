@@ -6,7 +6,7 @@ import json
 import secrets
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import TYPE_CHECKING, Annotated, Any
 
@@ -29,6 +29,7 @@ from factory_droid_openai.protocol import (
     ProtocolEmission,
     ProtocolError,
     RequestTooLargeError,
+    StopSequenceBuffer,
     TextEmission,
     ToolCallEmission,
     ToolCallStreamParser,
@@ -40,6 +41,8 @@ from factory_droid_openai.runner import (
     RunComplete,
     RunnerError,
     RunRequest,
+    SessionStarted,
+    StatusUpdate,
     TextDelta,
     Usage,
     UsageUpdate,
@@ -84,6 +87,10 @@ CHAT_COMPLETION_RESPONSES: dict[int | str, dict[str, Any]] = {
             }
         },
     },
+    404: {
+        "model": ErrorResponse,
+        "description": "The requested Factory Droid session is unknown to this bridge.",
+    },
     502: {
         "model": ErrorResponse,
         "description": "Droid SDK, process, or bridge protocol failure.",
@@ -101,6 +108,32 @@ CHAT_COMPLETION_RESPONSES: dict[int | str, dict[str, Any]] = {
 
 class AdmissionRejectedError(RuntimeError):
     pass
+
+
+class SessionRegistry:
+    """Tracks the Droid sessions this bridge process created.
+
+    Continuation only ever resumes a session the bridge itself started.
+    Accepting arbitrary IDs would let a client load unrelated sessions the
+    local Droid CLI stored - including the operator's own interactive work -
+    and read their contents back out through the completion.
+    """
+
+    def __init__(self, max_entries: int) -> None:
+        self._max_entries = max_entries
+        self._sessions: OrderedDict[str, None] = OrderedDict()
+
+    def remember(self, session_id: str) -> None:
+        self._sessions.pop(session_id, None)
+        self._sessions[session_id] = None
+        while len(self._sessions) > self._max_entries:
+            self._sessions.popitem(last=False)
+
+    def knows(self, session_id: str) -> bool:
+        if session_id not in self._sessions:
+            return False
+        self._sessions.move_to_end(session_id)
+        return True
 
 
 class AdmissionLease:
@@ -369,8 +402,11 @@ def create_app(
             process_grace_seconds=resolved_settings.process_grace_seconds,
             cleanup_timeout_seconds=resolved_settings.cleanup_timeout_seconds,
             metrics=metrics,
+            worktree=resolved_settings.worktree,
+            append_system_prompt_file=resolved_settings.append_system_prompt_file,
         )
     )
+    sessions = SessionRegistry(resolved_settings.max_tracked_sessions)
     admission = AdmissionController(
         max_concurrency=resolved_settings.max_concurrency,
         max_queue_size=resolved_settings.max_queue_size,
@@ -408,6 +444,7 @@ def create_app(
     )
     application.state.admission = admission
     application.state.metrics = metrics
+    application.state.sessions = sessions
 
     async def require_auth(credentials: BearerCredentials) -> None:
         expected = resolved_settings.api_key
@@ -496,6 +533,28 @@ def create_app(
         )
         request_started_at = asyncio.get_running_loop().time()
         deadline = request_started_at + timeout_seconds
+
+        rejection = _validate_options(payload, resolved_settings)
+        if rejection is not None:
+            return rejection
+
+        session_id: str | None = None
+        if payload.factory_droid_session_id is not None:
+            if not resolved_settings.session_continuity:
+                return _error_response(
+                    "Session continuity is disabled on this bridge.",
+                    400,
+                    "invalid_request_error",
+                )
+            if not sessions.knows(payload.factory_droid_session_id):
+                return _error_response(
+                    "Unknown Factory Droid session. Only sessions created by this "
+                    "bridge process can be continued.",
+                    404,
+                    "session_not_found",
+                )
+            session_id = payload.factory_droid_session_id
+
         try:
             plan = build_prompt(
                 payload,
@@ -504,6 +563,12 @@ def create_app(
                 max_transcript_bytes=resolved_settings.max_transcript_bytes,
                 max_tool_schema_bytes=resolved_settings.max_tool_schema_bytes,
                 max_json_depth=resolved_settings.max_json_depth,
+                max_tool_calls=(
+                    resolved_settings.max_tool_calls if payload.parallel_tool_calls else 1
+                ),
+                max_attachments=resolved_settings.max_attachments,
+                max_attachment_bytes=resolved_settings.max_attachment_bytes,
+                continuation=session_id is not None,
             )
         except RequestTooLargeError as exc:
             metrics.increment_payload_rejections()
@@ -526,6 +591,9 @@ def create_app(
             reasoning_effort=reasoning_effort,
             timeout_seconds=timeout_seconds,
             deadline=deadline,
+            images=tuple(image.to_sdk() for image in plan.attachments.images),
+            documents=tuple(document.to_sdk() for document in plan.attachments.documents),
+            session_id=session_id,
         )
 
         try:
@@ -560,6 +628,9 @@ def create_app(
                 parser=ToolCallStreamParser(
                     plan.allowed_tool_names,
                     require_tool_call=plan.require_tool_call,
+                    max_tool_calls=(
+                        resolved_settings.max_tool_calls if payload.parallel_tool_calls else 1
+                    ),
                 ),
                 runner=runner,
                 run_request=run_request,
@@ -572,6 +643,10 @@ def create_app(
                     outcome,
                 ),
                 include_usage=bool(payload.stream_options and payload.stream_options.include_usage),
+                stop_sequences=payload.stop_sequences,
+                emit_status=payload.factory_droid_status,
+                session_callback=sessions.remember,
+                expose_session=resolved_settings.session_continuity,
             )
             return FinalizingStreamingResponse(
                 event_stream,
@@ -588,57 +663,62 @@ def create_app(
                 },
             )
 
+        choices: list[dict[str, Any]] = []
+        total_usage = Usage()
+        started_session: str | None = None
         try:
             async with lease:
-                result = await _collect_completion_or_disconnect(
-                    request=request,
-                    runner=runner,
-                    run_request=run_request,
-                    parser=ToolCallStreamParser(
-                        plan.allowed_tool_names,
-                        require_tool_call=plan.require_tool_call,
-                    ),
-                    metrics=metrics,
-                    request_started_at=request_started_at,
-                )
-                if result is None:
-                    return _error_response(
-                        "Client disconnected.",
-                        499,
-                        "client_disconnected",
+                # Choices run one after another so n completions never exceed the
+                # configured Droid process concurrency.
+                for index in range(payload.n):
+                    choice_runner = runner if index == 0 else resolved_runner_factory()
+                    result = await _collect_completion_or_disconnect(
+                        request=request,
+                        runner=choice_runner,
+                        run_request=run_request,
+                        parser=ToolCallStreamParser(
+                            plan.allowed_tool_names,
+                            require_tool_call=plan.require_tool_call,
+                            max_tool_calls=(
+                                resolved_settings.max_tool_calls
+                                if payload.parallel_tool_calls
+                                else 1
+                            ),
+                        ),
+                        metrics=metrics,
+                        request_started_at=request_started_at,
+                        stop_sequences=payload.stop_sequences,
                     )
+                    if result is None:
+                        return _error_response(
+                            "Client disconnected.",
+                            499,
+                            "client_disconnected",
+                        )
+                    if result.session_id is not None:
+                        sessions.remember(result.session_id)
+                        started_session = result.session_id
+                    total_usage = _add_usage(total_usage, result.usage)
+                    choices.append(_choice_dict(result, index))
         except ProtocolError as exc:
             return _error_response(str(exc), 502, "factory_protocol_error")
         except RunnerError as exc:
             return _error_response(str(exc), exc.status_code, exc.error_type)
 
-        message: dict[str, Any] = {
-            "role": "assistant",
-            "content": result.text or None,
+        body: dict[str, Any] = {
+            "id": request_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": payload.model,
+            "choices": choices,
+            "usage": _usage_dict(total_usage),
         }
-        if result.reasoning:
-            message["reasoning"] = result.reasoning
-            message["reasoning_content"] = result.reasoning
-        if result.tool_calls:
-            message["tool_calls"] = result.tool_calls
+        headers = {"x-request-id": request_id}
+        if resolved_settings.session_continuity and started_session is not None:
+            body["factory_droid_session_id"] = started_session
+            headers["x-factory-droid-session-id"] = started_session
 
-        return JSONResponse(
-            {
-                "id": request_id,
-                "object": "chat.completion",
-                "created": created,
-                "model": payload.model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": message,
-                        "finish_reason": ("tool_calls" if result.tool_calls else "stop"),
-                    }
-                ],
-                "usage": _usage_dict(result.usage),
-            },
-            headers={"x-request-id": request_id},
-        )
+        return JSONResponse(body, headers=headers)
 
     return application
 
@@ -658,6 +738,8 @@ class CollectedCompletion:
         self.tool_calls: list[dict[str, Any]] = []
         self.usage = Usage()
         self.completed = False
+        self.session_id: str | None = None
+        self.stopped = False
 
     @property
     def text(self) -> str:
@@ -675,8 +757,10 @@ async def _collect_completion(
     parser: ToolCallStreamParser,
     metrics: BridgeMetrics | None = None,
     request_started_at: float | None = None,
+    stop_sequences: tuple[str, ...] = (),
 ) -> CollectedCompletion:
     result = CollectedCompletion()
+    stop_buffer = StopSequenceBuffer(stop_sequences)
     observed_ttft = False
     async with contextlib.aclosing(runner.run(run_request)) as events:
         async for event in events:
@@ -686,7 +770,13 @@ async def _collect_completion(
                     metrics,
                     request_started_at,
                 )
-                _apply_emissions(result, parser.feed(event.text))
+                _apply_emissions(result, parser.feed(event.text), stop_buffer)
+                if stop_buffer.triggered:
+                    # Leaving the loop closes the runner generator, which
+                    # interrupts the Droid turn instead of draining it.
+                    result.stopped = True
+                    result.completed = True
+                    break
             elif isinstance(event, ReasoningDelta):
                 observed_ttft = _observe_ttft(
                     observed_ttft,
@@ -694,6 +784,8 @@ async def _collect_completion(
                     request_started_at,
                 )
                 result.reasoning_parts.append(event.text)
+            elif isinstance(event, SessionStarted):
+                result.session_id = event.session_id
             elif isinstance(event, UsageUpdate):
                 result.usage = event.usage
             elif isinstance(event, RunComplete):
@@ -704,7 +796,11 @@ async def _collect_completion(
             "Factory Droid ended without a completion event.",
             error_type="factory_incomplete_response",
         )
-    _apply_emissions(result, parser.finish())
+    if not result.stopped:
+        _apply_emissions(result, parser.finish(), stop_buffer)
+        held = stop_buffer.flush()
+        if held:
+            result.text_parts.append(held)
     return result
 
 
@@ -716,6 +812,7 @@ async def _collect_completion_or_disconnect(
     parser: ToolCallStreamParser,
     metrics: BridgeMetrics | None = None,
     request_started_at: float | None = None,
+    stop_sequences: tuple[str, ...] = (),
 ) -> CollectedCompletion | None:
     completion_task = asyncio.create_task(
         _collect_completion(
@@ -724,6 +821,7 @@ async def _collect_completion_or_disconnect(
             parser=parser,
             metrics=metrics,
             request_started_at=request_started_at,
+            stop_sequences=stop_sequences,
         )
     )
     disconnect_task = asyncio.create_task(_wait_for_disconnect(request))
@@ -763,12 +861,18 @@ async def _stream_completion(
     request_started_at: float | None = None,
     outcome_callback: Callable[[str], None] | None = None,
     include_usage: bool = False,
+    stop_sequences: tuple[str, ...] = (),
+    emit_status: bool = False,
+    session_callback: Callable[[str], None] | None = None,
+    expose_session: bool = False,
 ) -> AsyncIterator[str]:
     usage = Usage()
     completed = False
     saw_tool_call = False
     observed_ttft = False
     outcome = "success"
+    stop_buffer = StopSequenceBuffer(stop_sequences)
+    tool_call_index = 0
 
     async with lease:
         yield _sse(
@@ -792,12 +896,54 @@ async def _stream_completion(
                         for emission in parser.feed(event.text):
                             if isinstance(emission, ToolCallEmission):
                                 saw_tool_call = True
-                            yield _sse(
-                                _chunk_for_emission(
+                                chunk = _chunk_for_emission(
                                     request_id,
                                     created,
                                     model,
                                     emission,
+                                    include_usage=include_usage,
+                                    tool_call_index=tool_call_index,
+                                )
+                                tool_call_index += 1
+                                yield _sse(chunk)
+                                continue
+                            text = stop_buffer.feed(emission.text)
+                            if text:
+                                yield _sse(
+                                    _chunk_for_emission(
+                                        request_id,
+                                        created,
+                                        model,
+                                        TextEmission(text),
+                                        include_usage=include_usage,
+                                    )
+                                )
+                        if stop_buffer.triggered:
+                            # Closing the runner generator interrupts the Droid
+                            # turn instead of draining output nobody will read.
+                            completed = True
+                            break
+                    elif isinstance(event, SessionStarted):
+                        if session_callback is not None:
+                            session_callback(event.session_id)
+                        if expose_session:
+                            yield _sse(
+                                _chunk(
+                                    request_id,
+                                    created,
+                                    model,
+                                    delta={"factory_droid_session_id": event.session_id},
+                                    include_usage=include_usage,
+                                )
+                            )
+                    elif isinstance(event, StatusUpdate):
+                        if emit_status:
+                            yield _sse(
+                                _chunk(
+                                    request_id,
+                                    created,
+                                    model,
+                                    delta={"factory_droid_status": event.state},
                                     include_usage=include_usage,
                                 )
                             )
@@ -830,18 +976,43 @@ async def _stream_completion(
                     "Factory Droid ended without a completion event.",
                     error_type="factory_incomplete_response",
                 )
-            for emission in parser.finish():
-                if isinstance(emission, ToolCallEmission):
-                    saw_tool_call = True
-                yield _sse(
-                    _chunk_for_emission(
-                        request_id,
-                        created,
-                        model,
-                        emission,
-                        include_usage=include_usage,
+            if not stop_buffer.triggered:
+                for emission in parser.finish():
+                    if isinstance(emission, ToolCallEmission):
+                        saw_tool_call = True
+                        chunk = _chunk_for_emission(
+                            request_id,
+                            created,
+                            model,
+                            emission,
+                            include_usage=include_usage,
+                            tool_call_index=tool_call_index,
+                        )
+                        tool_call_index += 1
+                        yield _sse(chunk)
+                        continue
+                    text = stop_buffer.feed(emission.text)
+                    if text:
+                        yield _sse(
+                            _chunk_for_emission(
+                                request_id,
+                                created,
+                                model,
+                                TextEmission(text),
+                                include_usage=include_usage,
+                            )
+                        )
+                held = stop_buffer.flush()
+                if held:
+                    yield _sse(
+                        _chunk_for_emission(
+                            request_id,
+                            created,
+                            model,
+                            TextEmission(held),
+                            include_usage=include_usage,
+                        )
                     )
-                )
             yield _sse(
                 _chunk(
                     request_id,
@@ -887,10 +1058,13 @@ async def _finalize_stream(
 def _apply_emissions(
     result: CollectedCompletion,
     emissions: list[ProtocolEmission],
+    stop_buffer: StopSequenceBuffer | None = None,
 ) -> None:
     for emission in emissions:
         if isinstance(emission, TextEmission):
-            result.text_parts.append(emission.text)
+            text = emission.text if stop_buffer is None else stop_buffer.feed(emission.text)
+            if text:
+                result.text_parts.append(text)
         else:
             result.tool_calls.append(_tool_call_dict(emission))
 
@@ -902,6 +1076,7 @@ def _chunk_for_emission(
     emission: ProtocolEmission,
     *,
     include_usage: bool = False,
+    tool_call_index: int = 0,
 ) -> dict[str, Any]:
     if isinstance(emission, TextEmission):
         return _chunk(
@@ -915,7 +1090,7 @@ def _chunk_for_emission(
         request_id,
         created,
         model,
-        delta={"tool_calls": [{"index": 0, **_tool_call_dict(emission)}]},
+        delta={"tool_calls": [{"index": tool_call_index, **_tool_call_dict(emission)}]},
         include_usage=include_usage,
     )
 
@@ -972,6 +1147,63 @@ def _usage_chunk(
         "choices": [],
         "usage": _usage_dict(usage),
     }
+
+
+def _validate_options(
+    payload: ChatCompletionRequest,
+    settings: Settings,
+) -> JSONResponse | None:
+    if payload.n > settings.max_choices:
+        return _error_response(
+            f"n must be at most {settings.max_choices} on this bridge.",
+            400,
+            "invalid_request_error",
+        )
+    if payload.n > 1 and payload.stream:
+        return _error_response(
+            "n greater than 1 is not supported together with stream=true.",
+            400,
+            "invalid_request_error",
+        )
+    if payload.n > 1 and payload.factory_droid_session_id is not None:
+        return _error_response(
+            "n greater than 1 cannot continue an existing Factory Droid session.",
+            400,
+            "invalid_request_error",
+        )
+    if len(payload.stop_sequences) > settings.max_stop_sequences:
+        return _error_response(
+            f"stop accepts at most {settings.max_stop_sequences} sequences.",
+            400,
+            "invalid_request_error",
+        )
+    return None
+
+
+def _choice_dict(result: CollectedCompletion, index: int) -> dict[str, Any]:
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": result.text or None,
+    }
+    if result.reasoning:
+        message["reasoning"] = result.reasoning
+        message["reasoning_content"] = result.reasoning
+    if result.tool_calls:
+        message["tool_calls"] = result.tool_calls
+    return {
+        "index": index,
+        "message": message,
+        "finish_reason": "tool_calls" if result.tool_calls else "stop",
+    }
+
+
+def _add_usage(left: Usage, right: Usage) -> Usage:
+    return Usage(
+        input_tokens=left.input_tokens + right.input_tokens,
+        output_tokens=left.output_tokens + right.output_tokens,
+        cache_read_tokens=left.cache_read_tokens + right.cache_read_tokens,
+        cache_write_tokens=left.cache_write_tokens + right.cache_write_tokens,
+    )
 
 
 def _usage_dict(usage: Usage) -> dict[str, Any]:
