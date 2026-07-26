@@ -827,7 +827,9 @@ end-to-end smoke path before deployment.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution requirements and
 [SECURITY.md](SECURITY.md) for private vulnerability reporting. Release history
-is maintained in [CHANGELOG.md](CHANGELOG.md).
+is published on the
+[releases page](https://github.com/mrwogu/factory-droid-openai/releases) and
+generated from the commit history by Release Please.
 
 ## License
 
