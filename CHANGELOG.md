@@ -7,6 +7,30 @@ and releases follow [Semantic Versioning](https://semver.org/).
 
 ## Unreleased
 
+## 1.0.0 (2026-07-26)
+
+
+### chore
+
+* cut the first release as 1.0.0 ([0b71f3c](https://github.com/mrwogu/factory-droid-openai/commit/0b71f3c96dfcfb80d040f28cf481d0cc6bc9748d))
+
+
+### Features
+
+* add attachments, multi tool calls and session events ([945cb48](https://github.com/mrwogu/factory-droid-openai/commit/945cb485f20e140f810585de5c8da4e2f0f7fd74))
+* add OpenAI-compatible Factory Droid bridge ([5b657d5](https://github.com/mrwogu/factory-droid-openai/commit/5b657d50a655ff4363b409987ed699ca53e9e080))
+* add PromptScript targets and release 1.0.0 ([b9227bc](https://github.com/mrwogu/factory-droid-openai/commit/b9227bcdb4ca125f60920b5bd2c2093f55e36e93))
+* add request limits, admission control and metrics ([9b79773](https://github.com/mrwogu/factory-droid-openai/commit/9b79773d76f58ed2be1b2257778f1fa72fa89f50))
+* add security, CI, and package safeguards ([0bb592f](https://github.com/mrwogu/factory-droid-openai/commit/0bb592f7f68332c8a941f664859ee29f68cad341))
+* add verified OpenAI contract and OpenClaw guide ([32a6773](https://github.com/mrwogu/factory-droid-openai/commit/32a67731e30752ab26a83380fde2ac1083fd0e1b))
+* align streaming usage with OpenAI ([a0fa506](https://github.com/mrwogu/factory-droid-openai/commit/a0fa506b2b75a71e50765a8ae0201ca2fe7fc425))
+* wire stop, n, sessions and status into the API ([16208c6](https://github.com/mrwogu/factory-droid-openai/commit/16208c695ba963268f9e698b1d9389f4fda9c4a8))
+
+
+### Performance Improvements
+
+* scan only structural bytes for the JSON depth guard ([65ea02e](https://github.com/mrwogu/factory-droid-openai/commit/65ea02e090898a71e7ac254ddc5e5bc7f7e8f4c1))
+
 ## 1.0.0 - 2026-07-26
 
 ### Bridge
