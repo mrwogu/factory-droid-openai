@@ -17,6 +17,10 @@ class ProtocolError(ValueError):
     pass
 
 
+class RequestTooLargeError(ProtocolError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class PromptPlan:
     prompt: str
@@ -39,20 +43,66 @@ class ToolCallEmission:
 ProtocolEmission = TextEmission | ToolCallEmission
 
 
-def build_prompt(request: ChatCompletionRequest) -> PromptPlan:
+def build_prompt(
+    request: ChatCompletionRequest,
+    *,
+    max_messages: int = 512,
+    max_tools: int = 128,
+    max_transcript_bytes: int = 4_194_304,
+    max_tool_schema_bytes: int = 1_048_576,
+    max_json_depth: int = 32,
+) -> PromptPlan:
+    if len(request.messages) > max_messages:
+        raise RequestTooLargeError(f"request exceeds maximum of {max_messages} messages")
     tools = list(request.tools or [])
+    if len(tools) > max_tools:
+        raise RequestTooLargeError(f"request exceeds maximum of {max_tools} tools")
+
     selected_tools, require_tool_call = _resolve_tool_choice(tools, request.tool_choice)
-    tool_payload = [tool.model_dump(mode="json") for tool in selected_tools]
-    message_payload = [
-        message.model_dump(mode="json", exclude_none=True) for message in request.messages
-    ]
-    transcript = json.dumps(
-        {
-            "messages": message_payload,
-            "tools": tool_payload,
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
+    serialized_tools: list[str] = []
+    tool_schema_bytes = 0
+    for tool in selected_tools:
+        payload = tool.model_dump(mode="json")
+        if _json_depth_exceeds(payload, max_json_depth):
+            raise RequestTooLargeError(
+                f"tool schema exceeds maximum JSON depth of {max_json_depth}"
+            )
+        serialized, serialized_bytes = _serialize_json(payload)
+        tool_schema_bytes += serialized_bytes
+        if tool_schema_bytes > max_tool_schema_bytes:
+            raise RequestTooLargeError(
+                f"tool schemas exceed maximum of {max_tool_schema_bytes} bytes"
+            )
+        serialized_tools.append(serialized)
+
+    serialized_messages: list[str] = []
+    message_bytes = 0
+    for message in request.messages:
+        payload = message.model_dump(mode="json", exclude_none=True)
+        if _json_depth_exceeds(payload, max_json_depth):
+            raise RequestTooLargeError(f"message exceeds maximum JSON depth of {max_json_depth}")
+        serialized, serialized_bytes = _serialize_json(payload)
+        message_bytes += serialized_bytes
+        serialized_messages.append(serialized)
+
+    transcript_bytes = (
+        len(b'{"messages":[')
+        + message_bytes
+        + max(0, len(serialized_messages) - 1)
+        + len(b'],"tools":[')
+        + tool_schema_bytes
+        + max(0, len(serialized_tools) - 1)
+        + len(b"]}")
+    )
+    if transcript_bytes > max_transcript_bytes:
+        raise RequestTooLargeError(f"transcript exceeds maximum of {max_transcript_bytes} bytes")
+
+    transcript = (
+        '{"messages":['
+        + ",".join(serialized_messages)
+        + '],"tools":['
+        + ",".join(serialized_tools)
+        + "]}"
     )
     tool_names = frozenset(tool.function.name for tool in selected_tools)
 
@@ -120,7 +170,10 @@ class ToolCallStreamParser:
     ) -> None:
         self._allowed_tool_names = allowed_tool_names
         self._require_tool_call = require_tool_call
-        self._buffer = ""
+        self._text_tail = ""
+        self._payload_chunks: list[str] = []
+        self._payload_bytes = 0
+        self._close_tail = ""
         self._capturing = False
         self._done = False
         self._saw_tool_call = False
@@ -132,58 +185,84 @@ class ToolCallStreamParser:
             if chunk.strip():
                 raise ProtocolError("unexpected text after tool call")
             return []
-        self._buffer += chunk
         if self._capturing:
-            return self._consume_tool_payload()
-        return self._consume_text()
+            return self._consume_tool_payload(chunk)
+        return self._consume_text(chunk)
 
     def finish(self) -> list[ProtocolEmission]:
         if self._capturing:
             raise ProtocolError("incomplete tool-call marker")
         emissions: list[ProtocolEmission] = []
-        if self._buffer:
-            emissions.append(TextEmission(self._buffer))
-            self._buffer = ""
+        if self._text_tail:
+            emissions.append(TextEmission(self._text_tail))
+            self._text_tail = ""
         if self._require_tool_call and not self._saw_tool_call:
             raise ProtocolError("the model did not produce the required tool call")
         return emissions
 
-    def _consume_text(self) -> list[ProtocolEmission]:
-        marker_index = self._buffer.find(TOOL_CALL_OPEN)
+    def _consume_text(self, chunk: str) -> list[ProtocolEmission]:
+        value = self._text_tail + chunk
+        self._text_tail = ""
+        marker_index = value.find(TOOL_CALL_OPEN)
         if marker_index >= 0:
             emissions: list[ProtocolEmission] = []
-            prefix = self._buffer[:marker_index]
+            prefix = value[:marker_index]
             if prefix:
                 emissions.append(TextEmission(prefix))
-            self._buffer = self._buffer[marker_index + len(TOOL_CALL_OPEN) :]
             self._capturing = True
-            emissions.extend(self._consume_tool_payload())
+            emissions.extend(
+                self._consume_tool_payload(value[marker_index + len(TOOL_CALL_OPEN) :])
+            )
             return emissions
 
-        held = _partial_marker_suffix_length(self._buffer, TOOL_CALL_OPEN)
-        emit_length = len(self._buffer) - held
+        held = _partial_marker_suffix_length(value, TOOL_CALL_OPEN)
+        emit_length = len(value) - held
         if emit_length <= 0:
+            self._text_tail = value
             return []
-        text = self._buffer[:emit_length]
-        self._buffer = self._buffer[emit_length:]
+        text = value[:emit_length]
+        self._text_tail = value[emit_length:]
         return [TextEmission(text)]
 
-    def _consume_tool_payload(self) -> list[ProtocolEmission]:
-        close_index = self._buffer.find(TOOL_CALL_CLOSE)
+    def _consume_tool_payload(self, chunk: str) -> list[ProtocolEmission]:
+        value = self._close_tail + chunk
+        close_index = value.find(TOOL_CALL_CLOSE)
         if close_index < 0:
-            if len(self._buffer.encode("utf-8")) > _MAX_TOOL_PAYLOAD_BYTES:
-                raise ProtocolError("tool-call payload is too large")
+            held = _partial_marker_suffix_length(value, TOOL_CALL_CLOSE)
+            committed = value[:-held] if held else value
+            committed_bytes = len(self._close_tail) + len(chunk.encode("utf-8")) - held
+            self._append_payload(committed, committed_bytes)
+            self._close_tail = value[-held:] if held else ""
             return []
 
-        payload = self._buffer[:close_index]
-        trailing = self._buffer[close_index + len(TOOL_CALL_CLOSE) :]
+        payload = value[:close_index]
+        payload_bytes = 0
+        if payload:
+            tail_bytes = len(self._close_tail)
+            chunk_payload = chunk[: close_index - len(self._close_tail)]
+            payload_bytes = tail_bytes + len(chunk_payload.encode("utf-8"))
+        self._append_payload(payload, payload_bytes)
+        trailing = value[close_index + len(TOOL_CALL_CLOSE) :]
         if trailing.strip():
             raise ProtocolError("unexpected text after tool call")
-        self._buffer = ""
+        complete_payload = "".join(self._payload_chunks)
+        emission = self._parse_tool_payload(complete_payload)
+        self._payload_chunks.clear()
+        self._close_tail = ""
         self._capturing = False
         self._done = True
         self._saw_tool_call = True
-        return [self._parse_tool_payload(payload)]
+        return [emission]
+
+    def _append_payload(self, value: str, value_bytes: int | None = None) -> None:
+        if not value:
+            return
+        self._payload_bytes += (
+            value_bytes if value_bytes is not None else len(value.encode("utf-8"))
+        )
+        if self._payload_bytes > _MAX_TOOL_PAYLOAD_BYTES:
+            raise ProtocolError("tool-call payload is too large")
+        self._payload_chunks.append(value)
 
     def _parse_tool_payload(self, payload: str) -> ToolCallEmission:
         if not self._allowed_tool_names:
@@ -218,6 +297,24 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise ValueError(f"duplicate key '{key}'")
         result[key] = value
     return result
+
+
+def _serialize_json(value: Any) -> tuple[str, int]:
+    serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return serialized, len(serialized.encode("utf-8"))
+
+
+def _json_depth_exceeds(value: Any, max_depth: int) -> bool:
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        current, depth = stack.pop()
+        if not isinstance(current, (dict, list)):
+            continue
+        if depth > max_depth:
+            return True
+        children = current.values() if isinstance(current, dict) else current
+        stack.extend((child, depth + 1) for child in children)
+    return False
 
 
 def _partial_marker_suffix_length(value: str, marker: str) -> int:
