@@ -24,7 +24,8 @@
           "path": "uv.lock",
           "jsonpath": "$.package[?(@.name.value=='factory-droid-openai')].version"
         }
-      ]
+      ],
+      "release-as": "1.0.0"
     }
   },
   "changelog-sections": [
