@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import uvicorn
 
 from factory_droid_openai.config import Settings
+from factory_droid_openai.logs import LOG_FORMATS, LOG_LEVELS, configure_logging
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -40,10 +41,23 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--backlog", type=_positive_int, default=settings.server_backlog)
     parser.add_argument(
         "--log-level",
-        choices=("critical", "error", "warning", "info", "debug", "trace"),
-        default="info",
+        choices=LOG_LEVELS,
+        default=settings.log_level,
+    )
+    parser.add_argument(
+        "--log-format",
+        choices=LOG_FORMATS,
+        default=settings.log_format,
+    )
+    parser.add_argument(
+        "--access-log",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Uvicorn per-request access log lines.",
     )
     args = parser.parse_args(argv)
+
+    configure_logging(level=args.log_level, log_format=args.log_format)
 
     if not settings.api_key:
         import sys
@@ -62,6 +76,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         host=args.host,
         port=args.port,
         log_level=args.log_level,
+        access_log=args.access_log,
         limit_concurrency=args.limit_concurrency,
         backlog=args.backlog,
     )

@@ -37,6 +37,13 @@ from factory_droid_openai.droid_rpc import (
     ContextStats,
     DroidRpcExtension,
 )
+from factory_droid_openai.logs import TRACE as _TRACE_LEVEL
+from factory_droid_openai.logs import current_timeline
+from factory_droid_openai.logs import debug as log_debug
+from factory_droid_openai.logs import enabled as log_enabled
+from factory_droid_openai.logs import millis as _millis
+from factory_droid_openai.logs import trace as log_trace
+from factory_droid_openai.logs import warning as log_warning
 
 # droid exec flags the SDK's ProcessTransport always passes. Overriding
 # exec_args replaces this list wholesale, so extra flags must be appended
@@ -247,8 +254,20 @@ class DroidRunner:
                 try:
                     await client.connect()
                 finally:
+                    startup_seconds = time.perf_counter() - startup_started
                     if self._metrics is not None:
-                        self._metrics.observe_droid_startup(time.perf_counter() - startup_started)
+                        self._metrics.observe_droid_startup(startup_seconds)
+                    timeline = current_timeline()
+                    startup_ms = (
+                        timeline.observe("droid_startup_ms", startup_seconds)
+                        if timeline is not None
+                        else None
+                    )
+                    log_debug(
+                        "droid.connected",
+                        droid=self._droid_path,
+                        droid_startup_ms=startup_ms,
+                    )
                 if request.session_id is not None:
                     # Continuation: reuse the stored Droid session so only the
                     # new turn is sent instead of the whole transcript.
@@ -270,6 +289,19 @@ class DroidRunner:
                     )
                 initialized = True
                 await self._rpc.disable_native_tools(client)
+                session_timeline = current_timeline()
+                log_debug(
+                    "droid.session_ready",
+                    session_id=client.session_id,
+                    model=_resolve_model_id(request.model, request.model_alias),
+                    reasoning_effort=_state_value(reasoning_effort) if reasoning_effort else None,
+                    continuation=request.session_id is not None,
+                    session_ready_ms=(
+                        session_timeline.since_start("session_ready_ms")
+                        if session_timeline is not None
+                        else None
+                    ),
+                )
                 if client.session_id is not None:
                     yield SessionStarted(client.session_id)
                 if request.output_format is None:
@@ -287,7 +319,23 @@ class DroidRunner:
                         output_format=request.output_format,
                     )
 
+                prompt_timeline = current_timeline()
+                log_debug(
+                    "droid.prompt_sent",
+                    prompt_bytes=len(request.prompt.encode("utf-8")),
+                    images=len(request.images),
+                    documents=len(request.documents),
+                    structured=request.output_format is not None,
+                    prompt_sent_ms=(
+                        prompt_timeline.since_start("prompt_sent_ms")
+                        if prompt_timeline is not None
+                        else None
+                    ),
+                )
+
                 async for event in client.receive_response():
+                    if log_enabled(_TRACE_LEVEL):
+                        log_trace("droid.event", kind=type(event).__name__)
                     if isinstance(event, AssistantTextDelta):
                         yield TextDelta(event.text)
                     elif isinstance(event, ThinkingTextDelta):
@@ -301,6 +349,18 @@ class DroidRunner:
                         if event.token_usage is not None:
                             usage = _map_usage(event.token_usage)
                         completed = True
+                        turn_timeline = current_timeline()
+                        log_debug(
+                            "droid.turn_complete",
+                            input_tokens=usage.input_tokens,
+                            output_tokens=usage.output_tokens,
+                            cache_read_tokens=usage.cache_read_tokens,
+                            turn_ms=(
+                                turn_timeline.since_start("turn_ms")
+                                if turn_timeline is not None
+                                else None
+                            ),
+                        )
                         yield RunComplete(usage)
                     elif isinstance(event, (ToolUse, ToolResult, ToolProgress)):
                         raise RunnerError(
@@ -544,7 +604,8 @@ class DroidRunner:
         interrupt: bool,
     ) -> None:
         loop = asyncio.get_running_loop()
-        cleanup_deadline = loop.time() + self._cleanup_timeout_seconds
+        cleanup_started = loop.time()
+        cleanup_deadline = cleanup_started + self._cleanup_timeout_seconds
         force_reap_budget = min(1.0, self._cleanup_timeout_seconds / 3)
 
         if interrupt:
@@ -569,8 +630,12 @@ class DroidRunner:
                     OSError,
                 ):
                     forced = await transport.force_kill_and_reap(remaining)
-        if (forced or transport.consumed_forced_kill()) and self._metrics is not None:
-            self._metrics.increment_forced_kills()
+        if forced or transport.consumed_forced_kill():
+            log_warning("droid.forced_kill", cleanup_ms=_millis(loop.time() - cleanup_started))
+            if self._metrics is not None:
+                self._metrics.increment_forced_kills()
+            return
+        log_debug("droid.cleanup", cleanup_ms=_millis(loop.time() - cleanup_started))
 
 
 def _create_client(

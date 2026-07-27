@@ -5,6 +5,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from factory_droid_openai.logs import LOG_FORMATS, LOG_LEVELS
+
 
 @dataclass(frozen=True, slots=True)
 class Settings:
@@ -41,6 +43,8 @@ class Settings:
     worktree: str | None = None
     append_system_prompt_file: Path | None = None
     model_alias: str = "factory-droid"
+    log_level: str = "info"
+    log_format: str = "text"
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -159,6 +163,16 @@ class Settings:
         append_system_prompt_file = _optional_file(
             "FACTORY_DROID_OPENAI_APPEND_SYSTEM_PROMPT_FILE",
         )
+        log_level = _choice(
+            "FACTORY_DROID_OPENAI_LOG_LEVEL",
+            default="info",
+            allowed=LOG_LEVELS,
+        )
+        log_format = _choice(
+            "FACTORY_DROID_OPENAI_LOG_FORMAT",
+            default="text",
+            allowed=LOG_FORMATS,
+        )
         port = _positive_int("FACTORY_DROID_OPENAI_PORT", default=8787)
         if port > 65535:
             raise ValueError("FACTORY_DROID_OPENAI_PORT must be at most 65535")
@@ -196,6 +210,8 @@ class Settings:
             worktree=worktree,
             append_system_prompt_file=append_system_prompt_file,
             model_alias=os.getenv("FACTORY_DROID_OPENAI_MODEL_ALIAS", "factory-droid"),
+            log_level=log_level,
+            log_format=log_format,
         )
 
 
@@ -242,6 +258,16 @@ def _boolean(name: str, *, default: bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{name} must be a boolean value")
+
+
+def _choice(name: str, *, default: str, allowed: tuple[str, ...]) -> str:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip().lower()
+    if value not in allowed:
+        raise ValueError(f"{name} must be one of: {', '.join(allowed)}")
+    return value
 
 
 def _optional_file(name: str) -> Path | None:

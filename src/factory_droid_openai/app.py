@@ -22,6 +22,10 @@ from jsonschema.validators import validator_for
 
 from factory_droid_openai.config import Settings
 from factory_droid_openai.droid_rpc import DroidRpcExtension
+from factory_droid_openai.logs import bind_request, current_timeline
+from factory_droid_openai.logs import debug as log_debug
+from factory_droid_openai.logs import info as log_info
+from factory_droid_openai.logs import warning as log_warning
 from factory_droid_openai.metrics import BridgeMetrics
 from factory_droid_openai.models import (
     ChatCompletionRequest,
@@ -748,7 +752,10 @@ def create_app(
         discovered, degraded = await model_catalog.get()
         if degraded:
             metrics.increment_model_discovery_failures()
+            log_warning("models.discovery_degraded", cached=len(discovered))
             response.headers["x-factory-droid-model-discovery"] = "degraded"
+        else:
+            log_debug("models.listed", discovered=len(discovered))
         return ModelListResponse(
             data=_model_list(
                 resolved_settings.model_alias,
@@ -903,9 +910,23 @@ def create_app(
         )
         request_started_at = asyncio.get_running_loop().time()
         deadline = request_started_at + timeout_seconds
+        request_id = f"chatcmpl-{uuid.uuid4().hex}"
+        timeline = bind_request(request_id)
+        log_debug(
+            "chat.received",
+            model=payload.model,
+            stream=bool(payload.stream),
+            choices=payload.n,
+            messages=len(payload.messages),
+            tools=len(payload.tools or ()),
+            timeout_s=round(timeout_seconds, 1),
+            reasoning_effort=payload.factory_droid_reasoning_effort or payload.reasoning_effort,
+            continuation=payload.factory_droid_session_id is not None,
+        )
 
         rejection = _validate_options(payload, resolved_settings)
         if rejection is not None:
+            log_warning("chat.rejected", status=rejection.status_code, phase="options")
             return rejection
 
         session_id: str | None = None
@@ -947,17 +968,29 @@ def create_app(
             )
         except RequestTooLargeError as exc:
             metrics.increment_payload_rejections()
+            log_warning("chat.rejected", status=413, phase="prompt", reason=str(exc))
             return _error_response(str(exc), 413, "invalid_request_error")
         except ProtocolError as exc:
+            log_warning("chat.rejected", status=400, phase="prompt", reason=str(exc))
             return _error_response(str(exc), 400, "invalid_request_error")
+
+        log_debug(
+            "chat.prompt_built",
+            prompt_bytes=len(plan.prompt.encode("utf-8")),
+            allowed_tools=len(plan.allowed_tool_names),
+            require_tool_call=plan.require_tool_call,
+            images=len(plan.attachments.images),
+            documents=len(plan.attachments.documents),
+            prompt_ms=timeline.mark("prompt_ms"),
+        )
 
         reasoning_effort = payload.factory_droid_reasoning_effort or payload.reasoning_effort
         try:
             reasoning_effort = normalize_reasoning_effort(reasoning_effort)
         except RunnerError as exc:
+            log_warning("chat.rejected", status=exc.status_code, phase="reasoning_effort")
             return _error_response(str(exc), exc.status_code, exc.error_type)
 
-        request_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
         run_request = RunRequest(
             prompt=plan.prompt,
@@ -976,6 +1009,7 @@ def create_app(
             lease = await admission.acquire(deadline)
         except AdmissionRejectedError:
             metrics.increment_overload_rejections()
+            log_warning("chat.rejected", status=429, phase="queue")
             return _error_response(
                 "Factory Droid request queue is full.",
                 429,
@@ -983,11 +1017,19 @@ def create_app(
                 headers={"Retry-After": str(resolved_settings.retry_after_seconds)},
             )
         except TimeoutError:
+            log_warning(
+                "chat.rejected",
+                status=504,
+                phase="queue",
+                queue_ms=timeline.mark("queue_ms"),
+            )
             return _error_response(
                 f"Factory Droid timed out after {timeout_seconds:.1f} seconds.",
                 504,
                 "factory_droid_timeout",
             )
+
+        log_debug("chat.admitted", queue_ms=timeline.mark("queue_ms"))
 
         try:
             runner = resolved_runner_factory()
@@ -1080,9 +1122,23 @@ def create_app(
                     total_usage = _add_usage(total_usage, result.usage)
                     choices.append(_choice_dict(result, index))
         except ProtocolError as exc:
+            log_warning("chat.failed", status=502, error_type="factory_protocol_error")
             return _error_response(str(exc), 502, "factory_protocol_error")
         except RunnerError as exc:
+            log_warning("chat.failed", status=exc.status_code, error_type=exc.error_type)
             return _error_response(str(exc), exc.status_code, exc.error_type)
+
+        log_info(
+            "chat.completed",
+            status=200,
+            model=payload.model,
+            stream=False,
+            choices=len(choices),
+            tool_calls=sum(len(choice["message"].get("tool_calls") or ()) for choice in choices),
+            input_tokens=total_usage.input_tokens,
+            output_tokens=total_usage.output_tokens,
+            **timeline.fields(),
+        )
 
         body: dict[str, Any] = {
             "id": request_id,
@@ -1413,17 +1469,41 @@ async def _stream_completion(
                 yield _sse(_usage_chunk(request_id, created, model, usage))
         except ProtocolError as exc:
             outcome = "error"
+            log_warning("chat.failed", stream=True, error_type="factory_protocol_error")
             yield _sse(_error_body(str(exc), "factory_protocol_error"))
         except RunnerError as exc:
             outcome = "timeout" if exc.error_type == "factory_droid_timeout" else "error"
+            log_warning("chat.failed", stream=True, error_type=exc.error_type)
             yield _sse(_error_body(str(exc), exc.error_type))
         except asyncio.CancelledError:
+            log_warning("chat.cancelled", stream=True)
             if outcome_callback is not None:
                 outcome_callback("cancelled")
             raise
         if outcome_callback is not None:
             outcome_callback(outcome)
+        _log_stream_outcome(outcome, model=model, usage=usage, tool_calls=tool_call_index)
         yield "data: [DONE]\n\n"
+
+
+def _log_stream_outcome(
+    outcome: str,
+    *,
+    model: str,
+    usage: Usage,
+    tool_calls: int,
+) -> None:
+    timeline = current_timeline()
+    log_info(
+        "chat.completed",
+        outcome=outcome,
+        model=model,
+        stream=True,
+        tool_calls=tool_calls,
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        **(timeline.fields() if timeline is not None else {}),
+    )
 
 
 async def _finalize_stream(
@@ -1845,6 +1925,9 @@ def _observe_ttft(
         return True
     if metrics is not None and request_started_at is not None:
         metrics.observe_ttft(asyncio.get_running_loop().time() - request_started_at)
+    timeline = current_timeline()
+    if timeline is not None:
+        log_debug("chat.first_token", ttft_ms=timeline.since_start("ttft_ms"))
     return True
 
 

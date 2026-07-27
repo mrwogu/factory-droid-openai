@@ -43,6 +43,8 @@ _ENVIRONMENT_KEYS = (
     "FACTORY_DROID_OPENAI_UVICORN_LIMIT_CONCURRENCY",
     "FACTORY_DROID_OPENAI_UVICORN_BACKLOG",
     "FACTORY_DROID_OPENAI_MODEL_ALIAS",
+    "FACTORY_DROID_OPENAI_LOG_LEVEL",
+    "FACTORY_DROID_OPENAI_LOG_FORMAT",
 )
 
 
@@ -61,6 +63,42 @@ def test_settings_from_env_uses_safe_defaults(
     settings = Settings.from_env()
 
     assert settings == Settings(workdir=tmp_path)
+
+
+def test_settings_from_env_reads_log_options(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_environment(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_LOG_LEVEL", " DEBUG ")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_LOG_FORMAT", "json")
+
+    settings = Settings.from_env()
+
+    assert settings.log_level == "debug"
+    assert settings.log_format == "json"
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("FACTORY_DROID_OPENAI_LOG_LEVEL", "verbose"),
+        ("FACTORY_DROID_OPENAI_LOG_FORMAT", "logfmt"),
+    ],
+)
+def test_settings_from_env_rejects_unknown_log_options(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    name: str,
+    value: str,
+) -> None:
+    _clear_environment(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match="must be one of"):
+        Settings.from_env()
 
 
 def test_settings_from_env_reads_all_overrides(

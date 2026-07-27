@@ -35,6 +35,7 @@ Not affiliated with, endorsed by, or maintained by Factory.
 - [How it works](#how-it-works)
 - [Requirements](#requirements)
 - [Limits and metrics](#limits-and-metrics)
+- [Logging](#logging)
 - [Authentication](#authentication)
 - [Tool execution safety](#tool-execution-safety)
 - [Bridge architecture limits](#bridge-architecture-limits)
@@ -986,6 +987,8 @@ followed by `[DONE]`.
 | `FACTORY_DROID_OPENAI_MODEL_ALIAS` | `factory-droid` | Alias using Droid default model |
 | `FACTORY_DROID_OPENAI_MODEL_CACHE_SECONDS` | `300` | `GET /v1/models` catalog cache lifetime |
 | `FACTORY_DROID_OPENAI_MCP_SETTLE_SECONDS` | `0` | MCP initialization window before tool discovery |
+| `FACTORY_DROID_OPENAI_LOG_LEVEL` | `info` | Bridge and Uvicorn log level |
+| `FACTORY_DROID_OPENAI_LOG_FORMAT` | `text` | Bridge log rendering: `text` or `json` |
 
 Command-line options:
 
@@ -994,6 +997,8 @@ usage: factory-droid-openai [-h] [--host HOST] [--port PORT]
                             [--limit-concurrency LIMIT_CONCURRENCY]
                             [--backlog BACKLOG]
                             [--log-level {critical,error,warning,info,debug,trace}]
+                            [--log-format {text,json}]
+                            [--access-log | --no-access-log]
 ```
 
 Environment variables define defaults. The command-line options override the
@@ -1038,6 +1043,58 @@ period, so treat it as an upper bound on genuinely stuck processes.
 
 Serve `/metrics` on a loopback interface or behind your own access control;
 it carries no prompt content, but it does expose traffic shape.
+
+## Logging
+
+The bridge logs structured events on top of Uvicorn's access log. Every line
+carries an event name, the OpenAI request id, and phase timings in
+milliseconds, so a slow turn can be attributed to a phase instead of guessed
+at.
+
+```bash
+factory-droid-openai --log-level debug
+factory-droid-openai --log-level info --log-format json
+factory-droid-openai --log-level debug --no-access-log
+```
+
+| Level | Content |
+|---|---|
+| `warning` | Rejections, failures, degraded model discovery, forced process kills |
+| `info` | One `chat.completed` summary per request with phase timings and token usage |
+| `debug` | Per-phase events: prompt built, admission, Droid startup, session ready, first token, turn complete, cleanup |
+| `trace` | One line per Droid SDK event kind |
+
+```text
+DEBUG    2026-07-27T14:10:02+0200 event=chat.received request_id=chatcmpl-8f2a model=gpt-5.4 stream=true messages=6 tools=14
+DEBUG    2026-07-27T14:10:02+0200 event=chat.prompt_built request_id=chatcmpl-8f2a prompt_bytes=48213 allowed_tools=14 prompt_ms=7.9
+DEBUG    2026-07-27T14:10:02+0200 event=chat.admitted request_id=chatcmpl-8f2a queue_ms=0.2
+DEBUG    2026-07-27T14:10:04+0200 event=droid.connected request_id=chatcmpl-8f2a droid_startup_ms=1811.4
+DEBUG    2026-07-27T14:10:05+0200 event=droid.session_ready request_id=chatcmpl-8f2a session_ready_ms=2530.6
+DEBUG    2026-07-27T14:10:07+0200 event=chat.first_token request_id=chatcmpl-8f2a ttft_ms=4402.1
+INFO     2026-07-27T14:10:12+0200 event=chat.completed request_id=chatcmpl-8f2a outcome=success stream=true input_tokens=9123 output_tokens=412 total_ms=9860.3
+```
+
+Phase fields, in the order they occur:
+
+| Field | Covers |
+|---|---|
+| `prompt_ms` | Transcript and tool-schema serialization in the bridge |
+| `queue_ms` | Waiting for a Droid concurrency slot |
+| `droid_startup_ms` | `droid exec` process spawn and SDK handshake |
+| `session_ready_ms` | Elapsed until the Droid session accepts a prompt |
+| `prompt_sent_ms` | Elapsed until the prompt was handed to Droid |
+| `ttft_ms` | Elapsed until the first text or reasoning delta |
+| `turn_ms` | Elapsed until Droid reported turn completion |
+| `total_ms` | Whole request, including cleanup and response encoding |
+
+One Droid process is started per request, so `droid_startup_ms` plus
+`session_ready_ms` is the fixed cost every prompt pays before the model runs.
+A large `queue_ms` means requests are serialized behind
+`FACTORY_DROID_OPENAI_MAX_CONCURRENCY`, which also covers VS Code utility
+tasks such as title generation.
+
+Log lines carry no prompt or completion text: sizes, counts, timings, model
+IDs, and session IDs only.
 
 ## Authentication
 
