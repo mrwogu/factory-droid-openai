@@ -17,7 +17,7 @@ class Settings:
     workdir: Path = field(default_factory=Path.cwd)
     timeout_seconds: float = 600.0
     body_timeout_seconds: float = 30.0
-    max_concurrency: int = 1
+    max_concurrency: int = 2
     max_queue_size: int = 8
     max_request_bytes: int = 4_194_304
     max_messages: int = 512
@@ -45,6 +45,15 @@ class Settings:
     model_alias: str = "factory-droid"
     log_level: str = "info"
     log_format: str = "text"
+    warm_sessions: int = -1
+    warm_session_ttl_seconds: float = 600.0
+    detached_cleanup: bool = True
+
+    def warm_session_count(self) -> int:
+        """Warm sessions to keep ready; ``-1`` tracks ``max_concurrency``."""
+        if self.warm_sessions < 0:
+            return self.max_concurrency
+        return self.warm_sessions
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -62,7 +71,16 @@ class Settings:
         )
         max_concurrency = _positive_int(
             "FACTORY_DROID_OPENAI_MAX_CONCURRENCY",
-            default=1,
+            default=2,
+        )
+        warm_sessions = _optional_non_negative_int("FACTORY_DROID_OPENAI_WARM_SESSIONS")
+        warm_session_ttl_seconds = _positive_float(
+            "FACTORY_DROID_OPENAI_WARM_SESSION_TTL_SECONDS",
+            default=600.0,
+        )
+        detached_cleanup = _boolean(
+            "FACTORY_DROID_OPENAI_DETACHED_CLEANUP",
+            default=True,
         )
         max_queue_size = _non_negative_int(
             "FACTORY_DROID_OPENAI_MAX_QUEUE_SIZE",
@@ -212,6 +230,9 @@ class Settings:
             model_alias=os.getenv("FACTORY_DROID_OPENAI_MODEL_ALIAS", "factory-droid"),
             log_level=log_level,
             log_format=log_format,
+            warm_sessions=warm_sessions,
+            warm_session_ttl_seconds=warm_session_ttl_seconds,
+            detached_cleanup=detached_cleanup,
         )
 
 
@@ -289,3 +310,11 @@ def _non_negative_int(name: str, *, default: int) -> int:
     if value < 0:
         raise ValueError(f"{name} must be zero or greater")
     return value
+
+
+def _optional_non_negative_int(name: str) -> int:
+    """Return the configured count, or ``-1`` when the variable is unset."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return -1
+    return _non_negative_int(name, default=-1)

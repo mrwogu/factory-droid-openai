@@ -31,6 +31,7 @@ from factory_droid_openai.droid_rpc import (
     ContextStats,
 )
 from factory_droid_openai.metrics import BridgeMetrics
+from factory_droid_openai.pool import BackgroundReaper
 from factory_droid_openai.protocol import (
     TOOL_CALL_CLOSE,
     TOOL_CALL_OPEN,
@@ -43,11 +44,13 @@ from factory_droid_openai.runner import (
     RunEvent,
     RunnerError,
     RunRequest,
+    SessionKey,
     SessionStarted,
     StatusUpdate,
     TextDelta,
     Usage,
     UsageUpdate,
+    WarmSession,
 )
 
 if TYPE_CHECKING:
@@ -2104,3 +2107,154 @@ def test_json_depth_tracker_rejects_nesting_over_the_limit() -> None:
 
     with pytest.raises(Exception, match="depth limit"):
         tracker.feed(b"[")
+
+
+class WarmingRunner(FakeRunner):
+    def __init__(self) -> None:
+        super().__init__([RunComplete(Usage())])
+        self.warmed: list[SessionKey] = []
+        self.discarded: list[WarmSession] = []
+
+    async def warm(self, key: SessionKey, *, timeout_seconds: float) -> WarmSession:
+        del timeout_seconds
+        self.warmed.append(key)
+        return WarmSession(
+            key=key,
+            client=cast("Any", object()),
+            transport=None,
+            session_id="session-1",
+            created_at=asyncio.get_running_loop().time(),
+        )
+
+    async def discard(self, session: WarmSession) -> None:
+        self.discarded.append(session)
+
+
+def _warm_session(key: SessionKey) -> WarmSession:
+    return WarmSession(
+        key=key,
+        client=cast("Any", object()),
+        transport=None,
+        session_id="session-1",
+        created_at=asyncio.get_running_loop().time(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_uses_a_warm_session(tmp_path: Path) -> None:
+    runner = FakeRunner([TextDelta("hi"), RunComplete(Usage())])
+    app = _app(tmp_path, runner)
+    key = SessionKey(model_id=None, reasoning_effort=None)
+    app.state.pool.note(key)
+    app.state.pool.offer(_warm_session(key))
+
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=_payload())
+
+    assert response.status_code == 200
+    assert runner.requests[0].warm_session is not None
+    assert runner.requests[0].warm_session.session_id == "session-1"
+    assert "factory_droid_openai_warm_session_hits_total 1" in app.state.metrics.render()
+
+
+@pytest.mark.asyncio
+async def test_extra_choices_do_not_reuse_the_warm_session(tmp_path: Path) -> None:
+    runner = FakeRunner([TextDelta("hi"), RunComplete(Usage())])
+    app = _app(tmp_path, runner)
+    key = SessionKey(model_id=None, reasoning_effort=None)
+    app.state.pool.note(key)
+    app.state.pool.offer(_warm_session(key))
+
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=_payload(n=2))
+
+    assert response.status_code == 200
+    assert runner.requests[0].warm_session is not None
+    assert runner.requests[1].warm_session is None
+
+
+@pytest.mark.asyncio
+async def test_continuation_requests_skip_the_warm_pool(tmp_path: Path) -> None:
+    runner = FakeRunner([SessionStarted("session-9"), RunComplete(Usage())])
+    settings = Settings(
+        droid_path="droid",
+        workdir=tmp_path,
+        timeout_seconds=30.0,
+        session_continuity=True,
+    )
+    app = create_app(settings, runner_factory=cast("RunnerFactory", lambda: runner))
+    key = SessionKey(model_id=None, reasoning_effort=None)
+    app.state.pool.note(key)
+    app.state.pool.offer(_warm_session(key))
+
+    async with _client(app) as client:
+        first = await client.post("/v1/chat/completions", json=_payload())
+        session_id = first.json()["factory_droid_session_id"]
+        second = await client.post(
+            "/v1/chat/completions",
+            json=_payload(factory_droid_session_id=session_id),
+        )
+
+    assert second.status_code == 200
+    assert runner.requests[1].session_id == "session-9"
+    assert runner.requests[1].warm_session is None
+
+
+@pytest.mark.asyncio
+async def test_stream_finalizer_discards_an_unused_warm_session() -> None:
+    runner = WarmingRunner()
+    metrics = BridgeMetrics()
+    admission = AdmissionController(max_concurrency=1, max_queue_size=1, metrics=metrics)
+    lease = await admission.acquire(asyncio.get_running_loop().time() + 30)
+    stream = _make_stream(runner, lease=lease)
+    request = SimpleNamespace(state=SimpleNamespace(stream_outcome="pending"))
+    warm = _warm_session(SessionKey(model_id=None, reasoning_effort=None))
+    reaper = BackgroundReaper()
+
+    await _finalize_stream(
+        stream,
+        lease,
+        cast("Any", request),
+        warm_session=warm,
+        reaper=reaper,
+        runner_factory=cast("RunnerFactory", lambda: runner),
+    )
+    await reaper.drain()
+
+    assert runner.discarded == [warm]
+
+
+@pytest.mark.asyncio
+async def test_lifespan_prewarms_and_drains_the_pool(tmp_path: Path) -> None:
+    runner = WarmingRunner()
+    settings = Settings(
+        droid_path="droid",
+        workdir=tmp_path,
+        timeout_seconds=30.0,
+        max_concurrency=1,
+    )
+    app = create_app(settings, runner_factory=cast("RunnerFactory", lambda: runner))
+
+    async with app.router.lifespan_context(app):
+        await asyncio.sleep(0.05)
+        assert runner.warmed == [SessionKey(model_id=None, reasoning_effort=None)]
+        assert "factory_droid_openai_warm_sessions 1" in app.state.metrics.render()
+
+    assert len(runner.discarded) == 1
+    assert "factory_droid_openai_warm_sessions 0" in app.state.metrics.render()
+
+
+@pytest.mark.asyncio
+async def test_detached_cleanup_can_be_disabled(tmp_path: Path) -> None:
+    settings = Settings(
+        droid_path="droid",
+        workdir=tmp_path,
+        timeout_seconds=30.0,
+        warm_sessions=0,
+        detached_cleanup=False,
+    )
+    app = create_app(settings)
+
+    assert app.state.pool.enabled is False
+    async with app.router.lifespan_context(app):
+        assert "factory_droid_openai_warm_sessions 0" in app.state.metrics.render()

@@ -264,10 +264,11 @@ async def test_chat_completion_logs_phase_timings(
 
     assert response.status_code == 200
     events = _events(log_stream)
-    assert events[:4] == [
+    assert events[:5] == [
         "chat.received",
         "chat.prompt_built",
         "chat.admitted",
+        "pool.miss",
         "chat.first_token",
     ]
     assert events[-1] == "chat.completed"

@@ -9,7 +9,7 @@ import time
 import uuid
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Annotated, Any, TypeVar
 
 from fastapi import Depends, FastAPI, Request, Response, Security
@@ -44,6 +44,7 @@ from factory_droid_openai.models import (
     SessionContextResponse,
     SessionOperationResponse,
 )
+from factory_droid_openai.pool import BackgroundReaper, WarmSessionPool
 from factory_droid_openai.protocol import (
     ProtocolEmission,
     ProtocolError,
@@ -62,11 +63,13 @@ from factory_droid_openai.runner import (
     RunComplete,
     RunnerError,
     RunRequest,
+    SessionKey,
     SessionStarted,
     StatusUpdate,
     TextDelta,
     Usage,
     UsageUpdate,
+    WarmSession,
     normalize_reasoning_effort,
 )
 
@@ -79,6 +82,10 @@ BearerCredentials = Annotated[
     HTTPAuthorizationCredentials | None,
     Security(HTTPBearer(auto_error=False)),
 ]
+
+# Warming happens off the request path, so it never needs the full request
+# timeout budget.
+_WARM_TIMEOUT_CEILING = 120.0
 
 CHAT_COMPLETION_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {
@@ -566,6 +573,7 @@ def create_app(
 ) -> FastAPI:
     resolved_settings = settings or Settings.from_env()
     metrics = BridgeMetrics()
+    reaper = BackgroundReaper(metrics=metrics)
     resolved_runner_factory = runner_factory or (
         lambda: DroidRunner(
             droid_path=resolved_settings.droid_path,
@@ -578,6 +586,7 @@ def create_app(
             rpc_extension=DroidRpcExtension(
                 mcp_settle_seconds=resolved_settings.mcp_settle_seconds,
             ),
+            reaper=reaper if resolved_settings.detached_cleanup else None,
         )
     )
     bridge_created = int(time.time())
@@ -587,7 +596,34 @@ def create_app(
         max_queue_size=resolved_settings.max_queue_size,
         metrics=metrics,
     )
+    pool = WarmSessionPool(
+        runner_factory=resolved_runner_factory,
+        reaper=reaper,
+        size=resolved_settings.warm_session_count(),
+        warm_timeout_seconds=min(resolved_settings.timeout_seconds, _WARM_TIMEOUT_CEILING),
+        ttl_seconds=resolved_settings.warm_session_ttl_seconds,
+        metrics=metrics,
+    )
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        pool.start(
+            initial_key=SessionKey(model_id=None, reasoning_effort=None),
+        )
+        log_info(
+            "bridge.started",
+            warm_sessions=resolved_settings.warm_session_count(),
+            max_concurrency=resolved_settings.max_concurrency,
+            detached_cleanup=resolved_settings.detached_cleanup,
+        )
+        try:
+            yield
+        finally:
+            await pool.aclose()
+            await reaper.drain()
+
     application = FastAPI(
+        lifespan=lifespan,
         title="Factory Droid OpenAI Bridge",
         summary="OpenAI-compatible access to Factory Droid.",
         description=(
@@ -624,6 +660,8 @@ def create_app(
     application.state.admission = admission
     application.state.metrics = metrics
     application.state.sessions = sessions
+    application.state.pool = pool
+    application.state.reaper = reaper
 
     async def require_auth(credentials: BearerCredentials) -> None:
         expected = resolved_settings.api_key
@@ -1037,6 +1075,11 @@ def create_app(
             await lease.release()
             raise
 
+        if session_id is None:
+            warm_session = pool.acquire(run_request.session_key())
+            if warm_session is not None:
+                run_request = replace(run_request, warm_session=warm_session)
+
         if payload.stream:
             request.state.stream_outcome = "pending"
             event_stream = _stream_completion(
@@ -1074,6 +1117,9 @@ def create_app(
                     event_stream,
                     lease,
                     request,
+                    warm_session=run_request.warm_session,
+                    reaper=reaper,
+                    runner_factory=resolved_runner_factory,
                 ),
                 headers={
                     "Cache-Control": "no-cache",
@@ -1091,10 +1137,15 @@ def create_app(
                 # configured Droid process concurrency.
                 for index in range(payload.n):
                     choice_runner = runner if index == 0 else resolved_runner_factory()
+                    # A warm session serves a single turn, so extra choices run
+                    # on their own cold sessions.
+                    choice_request = (
+                        run_request if index == 0 else replace(run_request, warm_session=None)
+                    )
                     result = await _collect_completion_or_disconnect(
                         request=request,
                         runner=choice_runner,
-                        run_request=run_request,
+                        run_request=choice_request,
                         parser=ToolCallStreamParser(
                             plan.allowed_tool_names,
                             require_tool_call=plan.require_tool_call,
@@ -1510,6 +1561,10 @@ async def _finalize_stream(
     stream: AsyncIterator[str],
     lease: AdmissionLease,
     request: Request,
+    *,
+    warm_session: WarmSession | None = None,
+    reaper: BackgroundReaper | None = None,
+    runner_factory: RunnerFactory | None = None,
 ) -> None:
     close = getattr(stream, "aclose", None)
     try:
@@ -1518,6 +1573,15 @@ async def _finalize_stream(
     finally:
         if getattr(request.state, "stream_outcome", None) == "pending":
             request.state.stream_outcome = "cancelled"
+        if (
+            warm_session is not None
+            and not warm_session.consumed
+            and reaper is not None
+            and runner_factory is not None
+        ):
+            # The stream was discarded before the run started, so nothing else
+            # will tear this session down.
+            reaper.submit(runner_factory().discard(warm_session))
         await lease.release()
 
 

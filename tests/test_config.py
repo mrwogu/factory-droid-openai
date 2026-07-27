@@ -45,6 +45,9 @@ _ENVIRONMENT_KEYS = (
     "FACTORY_DROID_OPENAI_MODEL_ALIAS",
     "FACTORY_DROID_OPENAI_LOG_LEVEL",
     "FACTORY_DROID_OPENAI_LOG_FORMAT",
+    "FACTORY_DROID_OPENAI_WARM_SESSIONS",
+    "FACTORY_DROID_OPENAI_WARM_SESSION_TTL_SECONDS",
+    "FACTORY_DROID_OPENAI_DETACHED_CLEANUP",
 )
 
 
@@ -98,6 +101,57 @@ def test_settings_from_env_rejects_unknown_log_options(
     monkeypatch.setenv(name, value)
 
     with pytest.raises(ValueError, match="must be one of"):
+        Settings.from_env()
+
+
+def test_warm_session_count_tracks_max_concurrency_unless_set(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_environment(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_CONCURRENCY", "3")
+
+    tracking = Settings.from_env()
+    assert tracking.warm_sessions == -1
+    assert tracking.warm_session_count() == 3
+
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WARM_SESSIONS", " ")
+    assert Settings.from_env().warm_session_count() == 3
+
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WARM_SESSIONS", "0")
+    disabled = Settings.from_env()
+    assert disabled.warm_sessions == 0
+    assert disabled.warm_session_count() == 0
+
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WARM_SESSIONS", "5")
+    assert Settings.from_env().warm_session_count() == 5
+
+
+def test_settings_from_env_reads_pool_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_environment(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WARM_SESSION_TTL_SECONDS", "90")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_DETACHED_CLEANUP", "off")
+
+    settings = Settings.from_env()
+
+    assert settings.warm_session_ttl_seconds == 90.0
+    assert settings.detached_cleanup is False
+
+
+def test_settings_from_env_rejects_negative_warm_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_environment(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WARM_SESSIONS", "-2")
+
+    with pytest.raises(ValueError, match="zero or greater"):
         Settings.from_env()
 
 

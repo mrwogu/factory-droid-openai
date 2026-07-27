@@ -27,6 +27,7 @@ services:
       FACTORY_DROID_OPENAI_API_KEY: ${FACTORY_DROID_OPENAI_API_KEY:?FACTORY_DROID_OPENAI_API_KEY must be set}
       # Optional overrides:
       # FACTORY_DROID_OPENAI_MAX_CONCURRENCY: "2"
+      # FACTORY_DROID_OPENAI_WARM_SESSIONS: "2"
       # FACTORY_DROID_OPENAI_TIMEOUT_SECONDS: "600"
       # FACTORY_DROID_OPENAI_MODEL_CACHE_SECONDS: "300"
     # Optional: expose your project to Droid as /work. Read-only is safe

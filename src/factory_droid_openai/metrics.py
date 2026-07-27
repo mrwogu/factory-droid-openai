@@ -22,6 +22,11 @@ class BridgeMetrics:
         self._payload_rejections = 0
         self._forced_kills = 0
         self._model_discovery_failures = 0
+        self._warm_sessions = 0
+        self._warm_hits = 0
+        self._warm_misses = 0
+        self._warm_failures = 0
+        self._pending_reaps = 0
 
     def record_request(self, outcome: str, status_code: int, seconds: float) -> None:
         with self._lock:
@@ -65,6 +70,26 @@ class BridgeMetrics:
         with self._lock:
             self._model_discovery_failures += 1
 
+    def set_warm_sessions(self, count: int) -> None:
+        with self._lock:
+            self._warm_sessions = count
+
+    def increment_warm_hits(self) -> None:
+        with self._lock:
+            self._warm_hits += 1
+
+    def increment_warm_misses(self) -> None:
+        with self._lock:
+            self._warm_misses += 1
+
+    def increment_warm_failures(self) -> None:
+        with self._lock:
+            self._warm_failures += 1
+
+    def set_pending_reaps(self, count: int) -> None:
+        with self._lock:
+            self._pending_reaps = count
+
     def render(self) -> str:
         with self._lock:
             request_totals = sorted(self._request_totals.items())
@@ -83,6 +108,11 @@ class BridgeMetrics:
                 "payload_rejections": self._payload_rejections,
                 "forced_kills": self._forced_kills,
                 "model_discovery_failures": self._model_discovery_failures,
+                "warm_sessions": self._warm_sessions,
+                "warm_hits": self._warm_hits,
+                "warm_misses": self._warm_misses,
+                "warm_failures": self._warm_failures,
+                "pending_reaps": self._pending_reaps,
             }
 
         lines = [
@@ -124,5 +154,15 @@ class BridgeMetrics:
                 "factory_droid_openai_model_discovery_failures_total "
                 f"{values['model_discovery_failures']}"
             ),
+            "# TYPE factory_droid_openai_warm_sessions gauge",
+            f"factory_droid_openai_warm_sessions {values['warm_sessions']}",
+            "# TYPE factory_droid_openai_warm_session_hits_total counter",
+            f"factory_droid_openai_warm_session_hits_total {values['warm_hits']}",
+            "# TYPE factory_droid_openai_warm_session_misses_total counter",
+            f"factory_droid_openai_warm_session_misses_total {values['warm_misses']}",
+            "# TYPE factory_droid_openai_warm_session_failures_total counter",
+            f"factory_droid_openai_warm_session_failures_total {values['warm_failures']}",
+            "# TYPE factory_droid_openai_pending_reaps gauge",
+            f"factory_droid_openai_pending_reaps {values['pending_reaps']}",
         ]
         return "\n".join(lines) + "\n"

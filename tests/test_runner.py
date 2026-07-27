@@ -36,11 +36,13 @@ from factory_droid_openai.runner import (
     RunComplete,
     RunnerError,
     RunRequest,
+    SessionKey,
     SessionStarted,
     StatusUpdate,
     TextDelta,
     Usage,
     UsageUpdate,
+    WarmSession,
     _build_exec_args,
     _create_client,
     _run_until,
@@ -1030,3 +1032,113 @@ async def test_session_operations_time_out_on_a_slow_droid(tmp_path: Path) -> No
         await runner.close_session("session", timeout_seconds=0.01)
 
     assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_runner_warms_a_session_with_the_requested_settings(tmp_path: Path) -> None:
+    client = FakeClient([])
+    metrics = BridgeMetrics()
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+        metrics=metrics,
+    )
+
+    session = await runner.warm(
+        SessionKey(model_id="claude-sonnet-4", reasoning_effort="low"),
+        timeout_seconds=1.0,
+    )
+
+    assert session.session_id == "session-1"
+    assert session.is_alive() is True
+    assert client.connected is True
+    assert client.init_kwargs["model_id"] == "claude-sonnet-4"
+    assert client.init_kwargs["reasoning_effort"] is ReasoningEffort.Low
+    assert client.disabled_tool_ids == {"read-cli", "exit-spec-mode"}
+    assert client.closed is False
+    assert "factory_droid_openai_droid_startup_seconds_count 1" in metrics.render()
+
+
+@pytest.mark.asyncio
+async def test_runner_warm_closes_the_session_when_startup_fails(tmp_path: Path) -> None:
+    class FailingClient(FakeClient):
+        async def initialize_session(self, **kwargs: Any) -> None:
+            del kwargs
+            raise DroidClientError("no session for you")
+
+    client = FailingClient([])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    with pytest.raises(DroidClientError):
+        await runner.warm(SessionKey(model_id=None, reasoning_effort=None), timeout_seconds=1.0)
+
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_runner_reuses_a_warm_session_without_reinitializing(tmp_path: Path) -> None:
+    client = FakeClient([AssistantTextDelta("hi"), TurnComplete()])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+    warm = WarmSession(
+        key=SessionKey(model_id=None, reasoning_effort="high"),
+        client=cast("Any", client),
+        transport=None,
+        session_id="session-1",
+        created_at=0.0,
+    )
+
+    events = [event async for event in runner.run(_request(warm_session=warm))]
+
+    assert events == [
+        SessionStarted("session-1"),
+        TextDelta("hi"),
+        RunComplete(usage=Usage()),
+    ]
+    assert warm.consumed is True
+    assert client.connected is False
+    assert client.init_kwargs == {}
+    assert client.prompt == "prompt"
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_runner_hands_cleanup_to_the_reaper(tmp_path: Path) -> None:
+    client = FakeClient([TurnComplete()])
+    reaped: list[object] = []
+
+    class Reaper:
+        def submit(self, coroutine: Any) -> None:
+            reaped.append(coroutine)
+
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+        reaper=cast("Any", Reaper()),
+    )
+
+    events = [event async for event in runner.run(_request())]
+
+    assert isinstance(events[-1], RunComplete)
+    assert client.closed is False
+    assert len(reaped) == 1
+    await cast("Any", reaped[0])
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_run_request_session_key_resolves_the_model_alias() -> None:
+    assert _request().session_key() == SessionKey(model_id=None, reasoning_effort="high")
+    assert _request(model="gpt-5.4").session_key() == SessionKey(
+        model_id="gpt-5.4",
+        reasoning_effort="high",
+    )

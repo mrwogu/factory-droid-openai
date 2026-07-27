@@ -35,6 +35,7 @@ Not affiliated with, endorsed by, or maintained by Factory.
 - [How it works](#how-it-works)
 - [Requirements](#requirements)
 - [Limits and metrics](#limits-and-metrics)
+- [Warm sessions](#warm-sessions)
 - [Logging](#logging)
 - [Authentication](#authentication)
 - [Tool execution safety](#tool-execution-safety)
@@ -169,9 +170,11 @@ Factory Droid
 ```
 
 Factory's SDK controls a complete Droid agent rather than exposing a raw model
-inference endpoint. The bridge creates a new Droid session for each completion,
+inference endpoint. The bridge uses a fresh Droid session for each completion,
 serializes the complete OpenAI transcript into one prompt, and maps Droid stream
-events back to OpenAI response objects.
+events back to OpenAI response objects. Sessions are started ahead of time and
+kept warm, so the startup cost stays off the request path; see
+[Warm sessions](#warm-sessions).
 
 External tools use a strict text protocol. Droid emits:
 
@@ -669,10 +672,12 @@ a Copilot plan and a GitHub account. Without a GitHub sign-in, set
 `chat.utilityModel` and `chat.utilitySmallModel` to a configured model so
 title generation, commit messages, and intent detection keep working.
 
-The bridge defaults to one concurrent Droid subprocess
-(`FACTORY_DROID_OPENAI_MAX_CONCURRENCY=1`), so a chat turn blocks utility
-tasks until it finishes. Raise that limit, or point utility tasks at a
-separate lightweight model, to avoid serial stalls.
+The bridge defaults to two concurrent Droid subprocesses
+(`FACTORY_DROID_OPENAI_MAX_CONCURRENCY=2`), so a chat turn and one utility
+task can run side by side. Raise that limit, or point utility tasks at a
+separate lightweight model, to avoid serial stalls. Utility tasks pay the
+same per-request cost as chat, so pointing `chat.utilitySmallModel` at a
+cheap model keeps title and commit-message generation out of the way.
 
 ### Coverage with VS Code BYOK
 
@@ -961,7 +966,10 @@ followed by `[DONE]`.
 | `FACTORY_DROID_OPENAI_WORKDIR` | current directory | Droid working directory |
 | `FACTORY_DROID_OPENAI_TIMEOUT_SECONDS` | `600` | Maximum request duration |
 | `FACTORY_DROID_OPENAI_BODY_TIMEOUT_SECONDS` | `30` | Maximum time to receive a request body |
-| `FACTORY_DROID_OPENAI_MAX_CONCURRENCY` | `1` | Concurrent Droid subprocesses |
+| `FACTORY_DROID_OPENAI_MAX_CONCURRENCY` | `2` | Concurrent Droid subprocesses |
+| `FACTORY_DROID_OPENAI_WARM_SESSIONS` | `MAX_CONCURRENCY` | Pre-started Droid sessions kept ready (`0` disables) |
+| `FACTORY_DROID_OPENAI_WARM_SESSION_TTL_SECONDS` | `600` | Age at which an unused warm session is replaced |
+| `FACTORY_DROID_OPENAI_DETACHED_CLEANUP` | `true` | Tear down Droid processes after the response is sent |
 | `FACTORY_DROID_OPENAI_MAX_QUEUE_SIZE` | `8` | Requests waiting for a Droid slot |
 | `FACTORY_DROID_OPENAI_RETRY_AFTER_SECONDS` | `1` | `Retry-After` value sent with `429` |
 | `FACTORY_DROID_OPENAI_MAX_REQUEST_BYTES` | `4194304` | Request body size limit |
@@ -1020,6 +1028,28 @@ Admission control then bounds how many requests reach Droid. Requests beyond
 `FACTORY_DROID_OPENAI_MAX_QUEUE_SIZE`; once that is full the bridge answers
 `429` with a `Retry-After` header rather than queueing without limit.
 
+## Warm sessions
+
+Starting a Droid session takes about three seconds, and tearing one down
+costs another second, so by default the bridge keeps
+`FACTORY_DROID_OPENAI_WARM_SESSIONS` sessions initialized and idle and hands
+one to each incoming request. A warm session serves a single turn and is then
+discarded, so requests stay isolated exactly as before.
+
+Warm sessions are keyed by model and reasoning effort, because switching the
+model on a live session costs as much as starting a new one. The pool tracks
+the settings recent traffic used and rebalances itself when clients switch
+models; the first request for a new model still starts its own session and
+shows up as `pool.miss`.
+
+Teardown runs after the response is finished, so the grace period and the
+final kill no longer delay the last token. Set
+`FACTORY_DROID_OPENAI_DETACHED_CLEANUP=false` to wait for teardown on the
+request path instead, and `FACTORY_DROID_OPENAI_WARM_SESSIONS=0` to disable
+pre-warming. Both keep one Droid process per request either way; warm
+sessions only move the startup cost off the request path, and each idle
+session holds a Droid process while it waits.
+
 `GET /metrics` renders Prometheus-style text. It is excluded from the OpenAPI
 contract because it is an operational endpoint, not part of the OpenAI API
 surface.
@@ -1037,6 +1067,11 @@ surface.
 | `factory_droid_openai_payload_rejections_total` | Requests rejected with `413` |
 | `factory_droid_openai_forced_kills_total` | Droid processes that needed a kill |
 | `factory_droid_openai_model_discovery_failures_total` | Failed Droid model discovery attempts |
+| `factory_droid_openai_warm_sessions` | Warm Droid sessions ready now |
+| `factory_droid_openai_warm_session_hits_total` | Requests served from a warm session |
+| `factory_droid_openai_warm_session_misses_total` | Requests that had to start their own session |
+| `factory_droid_openai_warm_session_failures_total` | Failed warm-up attempts |
+| `factory_droid_openai_pending_reaps` | Droid teardowns still running in the background |
 
 `forced_kills_total` counts any process that did not exit within its grace
 period, so treat it as an upper bound on genuinely stuck processes.
@@ -1087,9 +1122,10 @@ Phase fields, in the order they occur:
 | `turn_ms` | Elapsed until Droid reported turn completion |
 | `total_ms` | Whole request, including cleanup and response encoding |
 
-One Droid process is started per request, so `droid_startup_ms` plus
-`session_ready_ms` is the fixed cost every prompt pays before the model runs.
-A large `queue_ms` means requests are serialized behind
+One Droid process serves each request. A warm session brings
+`session_ready_ms` down to a few milliseconds, so a request that logs
+seconds there ran on a cold session; check for a preceding `pool.miss`. A
+large `queue_ms` means requests are serialized behind
 `FACTORY_DROID_OPENAI_MAX_CONCURRENCY`, which also covers VS Code utility
 tasks such as title generation.
 
