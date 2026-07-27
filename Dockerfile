@@ -9,13 +9,15 @@
 #
 # Build args:
 #   PYTHON_VERSION   Python base image tag (default 3.13-slim).
-#   DROID_VERSION    Pinned Factory Droid CLI release (default 0.174.0).
+#   DROID_VERSION    Factory Droid CLI version (default: latest from npm registry).
 #   BRIDGE_VERSION   factory-droid-openai PyPI version (default: install from source).
 #
-# Droid auto-update is disabled so the pinned CLI version stays reproducible.
+# Droid auto-update is disabled so the resolved CLI version is locked in for the
+# lifetime of the image. Omit DROID_VERSION to auto-resolve latest at build time;
+# set it to pin a specific release.
 
 ARG PYTHON_VERSION=3.13-slim
-ARG DROID_VERSION=0.174.0
+ARG DROID_VERSION
 
 FROM python:${PYTHON_VERSION} AS base
 
@@ -34,10 +36,20 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl git \
  && rm -rf /var/lib/apt/lists/*
 
-# Install the pinned Droid CLI binary with SHA256 verification.
-# Direct binary download is used instead of the curl|sh installer so the
-# image is reproducible and the checksum is enforced.
+# Install the Droid CLI binary with SHA256 verification.
+# When DROID_VERSION is unset, resolve the latest release from the npm
+# registry first. Direct binary download is used instead of the curl|sh
+# installer so the image is reproducible and the checksum is enforced.
 RUN set -eu; \
+    if [ -z "${DROID_VERSION}" ]; then \
+      DROID_VERSION=$(curl -fsSL https://registry.npmjs.org/@factory/cli/latest \
+        | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4); \
+      if [ -z "${DROID_VERSION}" ]; then \
+        echo "Failed to resolve latest Droid CLI version from npm registry" >&2; \
+        exit 1; \
+      fi; \
+      echo "Resolved latest Droid CLI: ${DROID_VERSION}"; \
+    fi; \
     case "$(uname -m)" in \
       x86_64) arch=x64 ;; \
       aarch64) arch=arm64 ;; \
