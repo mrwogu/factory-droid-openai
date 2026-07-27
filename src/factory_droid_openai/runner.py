@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import re
+import signal
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
 from dataclasses import dataclass
@@ -221,10 +222,11 @@ class _ManagedProcessTransport(ProcessTransport):
         was_running = process is not None and process.returncode is None
         await super().close()
         if was_running and process is not None and process.returncode is not None:
-            # A signal death is the only reliable evidence of a kill: droid
-            # takes about a second to shut down cleanly, so timing the close
-            # against the grace period misreports every graceful exit.
-            self._forced_kill = process.returncode < 0
+            # Only SIGKILL proves a forced kill. The SDK's own close() sends
+            # SIGTERM as its first shutdown step, so a droid build that does
+            # not trap SIGTERM dies with -SIGTERM during a fully graceful
+            # close and must not be counted.
+            self._forced_kill = process.returncode == -signal.SIGKILL
 
     async def force_kill_and_reap(self, timeout: float) -> bool:
         process = self._owned_process
