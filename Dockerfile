@@ -40,22 +40,23 @@ RUN apt-get update \
 # When DROID_VERSION is unset, resolve the latest release from the npm
 # registry first. Direct binary download is used instead of the curl|sh
 # installer so the image is reproducible and the checksum is enforced.
-RUN set -eu; \
-    if [ -z "${DROID_VERSION}" ]; then \
-      DROID_VERSION=$(curl -fsSL https://registry.npmjs.org/@factory/cli/latest \
+RUN set -e; \
+    _droid_version="${DROID_VERSION:-}"; \
+    if [ -z "${_droid_version}" ]; then \
+      _droid_version=$(curl -fsSL https://registry.npmjs.org/@factory/cli/latest \
         | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4); \
-      if [ -z "${DROID_VERSION}" ]; then \
+      if [ -z "${_droid_version}" ]; then \
         echo "Failed to resolve latest Droid CLI version from npm registry" >&2; \
         exit 1; \
       fi; \
-      echo "Resolved latest Droid CLI: ${DROID_VERSION}"; \
+      echo "Resolved latest Droid CLI: ${_droid_version}"; \
     fi; \
     case "$(uname -m)" in \
       x86_64) arch=x64 ;; \
       aarch64) arch=arm64 ;; \
       *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;; \
     esac; \
-    base="https://downloads.factory.ai/factory-cli/releases/${DROID_VERSION}/linux/${arch}"; \
+    base="https://downloads.factory.ai/factory-cli/releases/${_droid_version}/linux/${arch}"; \
     curl -fsSLO "${base}/droid"; \
     curl -fsSLO "${base}/droid.sha256"; \
     echo "$(awk '{print $1}' droid.sha256)  droid" | sha256sum --check -; \
