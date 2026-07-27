@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/mrwogu/factory-droid-openai/actions/workflows/ci.yml/badge.svg)](https://github.com/mrwogu/factory-droid-openai/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/factory-droid-openai.svg)](https://pypi.org/project/factory-droid-openai/)
+[![Docker](https://img.shields.io/badge/docker-ghcr.io-blue.svg)](https://github.com/mrwogu/factory-droid-openai/pkgs/container/factory-droid-openai)
 [![Codecov](https://codecov.io/github/mrwogu/factory-droid-openai/graph/badge.svg)](https://codecov.io/github/mrwogu/factory-droid-openai)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
@@ -57,8 +58,16 @@ factory-droid-openai
 ```
 
 `pipx install factory-droid-openai` works the same way if you prefer pipx.
+
 No `droid` CLI on the host? Use [Docker](#docker) - it bundles Droid inside
 the container, you only need `FACTORY_API_KEY`.
+
+```bash
+docker run -d --name droid-bridge \
+  -p 127.0.0.1:8787:8787 \
+  -e FACTORY_API_KEY="$FACTORY_API_KEY" \
+  ghcr.io/mrwogu/factory-droid-openai:latest
+```
 
 From another terminal, send a request:
 
