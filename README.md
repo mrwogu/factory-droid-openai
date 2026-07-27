@@ -612,9 +612,11 @@ opens `chatLanguageModels.json`; add this provider entry:
         "name": "GPT-5.4 via Factory Droid",
         "url": "http://127.0.0.1:8787/v1/chat/completions",
         "toolCalling": true,
+        "vision": true,
         "thinking": true,
         "streaming": true,
-        "supportsReasoningEffort": ["minimal", "low", "medium", "high"],
+        "supportsReasoningEffort": ["low", "medium", "high", "xhigh"],
+        "reasoningEffortFormat": "chat-completions",
         "maxInputTokens": 180000,
         "maxOutputTokens": 20000
       }
@@ -623,14 +625,36 @@ opens `chatLanguageModels.json`; add this provider entry:
 ]
 ```
 
+A ready-to-use provider entry with several Droid models is committed at
+[`examples/vscode/chatLanguageModels.json`](examples/vscode/chatLanguageModels.json).
+Copy its contents into VS Code's `chatLanguageModels.json`, then adjust
+`apiKey` and the endpoint URL. Regenerate it against a running bridge, which
+reads image support and reasoning effort levels from `GET /v1/models`:
+
+```bash
+uv run python scripts/generate_vscode_models.py
+uv run python scripts/generate_vscode_models.py --all-models
+uv run python scripts/generate_vscode_models.py --model gpt-5.4 --model claude-opus-5
+```
+
 `id` is the explicit Droid model ID. Replace it with another ID from
 `GET /v1/models` or `droid exec --help`, such as `gemini-3.1-pro-preview` or
 the `factory-droid` alias. Each ID needs its own entry in `models`.
 
 When bearer authentication is enabled, set the same token as `apiKey`. The
 placeholder `none` works only on a loopback bridge without a configured token.
+A mismatch makes VS Code report `Invalid API key.`, which is the bridge
+answering `401`; verify the token with
+`curl -H "Authorization: Bearer $FACTORY_DROID_OPENAI_API_KEY" http://127.0.0.1:8787/v1/models`.
+
+`id`, `name`, `url`, `toolCalling`, `vision`, `maxInputTokens`, and
+`maxOutputTokens` are required by the
+[model configuration reference](https://code.visualstudio.com/docs/agent-customization/language-models#_model-configuration-reference).
+Omitting `vision` makes VS Code report a missing-property error for the entry.
 
 `toolCalling: true` is required for the model to appear in agent sessions.
+`vision: true` enables image and PDF attachments, which the bridge forwards as
+base64 `data:` URIs; set it to `false` for text-only Droid models.
 `thinking` and `supportsReasoningEffort` surface the reasoning effort picker;
 the bridge maps those levels to Droid reasoning effort.
 

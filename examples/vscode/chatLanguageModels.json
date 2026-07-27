@@ -1,0 +1,133 @@
+[
+  {
+    "name": "Factory Droid",
+    "vendor": "customendpoint",
+    "apiKey": "none",
+    "apiType": "chat-completions",
+    "models": [
+      {
+        "id": "factory-droid",
+        "name": "Factory Droid (server default model)",
+        "url": "http://127.0.0.1:8787/v1/chat/completions",
+        "toolCalling": true,
+        "vision": true,
+        "streaming": true,
+        "thinking": false,
+        "maxInputTokens": 180000,
+        "maxOutputTokens": 20000
+      },
+      {
+        "id": "claude-opus-5",
+        "name": "Opus 5 via Factory Droid",
+        "url": "http://127.0.0.1:8787/v1/chat/completions",
+        "toolCalling": true,
+        "vision": true,
+        "streaming": true,
+        "thinking": true,
+        "maxInputTokens": 180000,
+        "maxOutputTokens": 20000,
+        "supportsReasoningEffort": [
+          "off",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "reasoningEffortFormat": "chat-completions"
+      },
+      {
+        "id": "claude-sonnet-5",
+        "name": "Sonnet 5 via Factory Droid",
+        "url": "http://127.0.0.1:8787/v1/chat/completions",
+        "toolCalling": true,
+        "vision": true,
+        "streaming": true,
+        "thinking": true,
+        "maxInputTokens": 180000,
+        "maxOutputTokens": 20000,
+        "supportsReasoningEffort": [
+          "off",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "reasoningEffortFormat": "chat-completions"
+      },
+      {
+        "id": "gpt-5.6-sol",
+        "name": "GPT-5.6 Sol via Factory Droid",
+        "url": "http://127.0.0.1:8787/v1/chat/completions",
+        "toolCalling": true,
+        "vision": true,
+        "streaming": true,
+        "thinking": true,
+        "maxInputTokens": 180000,
+        "maxOutputTokens": 20000,
+        "supportsReasoningEffort": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "reasoningEffortFormat": "chat-completions"
+      },
+      {
+        "id": "gpt-5.4",
+        "name": "GPT-5.4 via Factory Droid",
+        "url": "http://127.0.0.1:8787/v1/chat/completions",
+        "toolCalling": true,
+        "vision": true,
+        "streaming": true,
+        "thinking": true,
+        "maxInputTokens": 180000,
+        "maxOutputTokens": 20000,
+        "supportsReasoningEffort": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ],
+        "reasoningEffortFormat": "chat-completions"
+      },
+      {
+        "id": "gemini-3.1-pro-preview",
+        "name": "Gemini 3.1 Pro via Factory Droid",
+        "url": "http://127.0.0.1:8787/v1/chat/completions",
+        "toolCalling": true,
+        "vision": true,
+        "streaming": true,
+        "thinking": true,
+        "maxInputTokens": 180000,
+        "maxOutputTokens": 20000,
+        "supportsReasoningEffort": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "reasoningEffortFormat": "chat-completions"
+      },
+      {
+        "id": "glm-5.2",
+        "name": "GLM-5.2 (Droid Core) via Factory Droid",
+        "url": "http://127.0.0.1:8787/v1/chat/completions",
+        "toolCalling": true,
+        "vision": false,
+        "streaming": true,
+        "thinking": true,
+        "maxInputTokens": 180000,
+        "maxOutputTokens": 20000,
+        "supportsReasoningEffort": [
+          "off",
+          "high",
+          "max"
+        ],
+        "reasoningEffortFormat": "chat-completions"
+      }
+    ]
+  }
+]
