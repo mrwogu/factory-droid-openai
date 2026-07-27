@@ -516,6 +516,55 @@ async def test_runner_kills_and_reaps_process_ignoring_sigterm(
     assert "factory_droid_openai_forced_kills_total 1" in metrics.render()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal behavior")
+@pytest.mark.asyncio
+async def test_runner_does_not_count_sigterm_death_as_forced_kill(
+    tmp_path: Path,
+) -> None:
+    """A process that dies from the SDK's own SIGTERM is a graceful close."""
+    executable = tmp_path / "fake-droid"
+    pid_file = tmp_path / "child.pid"
+    executable.write_text(
+        textwrap.dedent(
+            f"""\
+            #!{sys.executable}
+            import os
+            import time
+            from pathlib import Path
+
+            Path({str(pid_file)!r}).write_text(str(os.getpid()), encoding="utf-8")
+            while True:
+                time.sleep(1)
+            """
+        ),
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+    metrics = BridgeMetrics()
+    runner = DroidRunner(
+        droid_path=str(executable),
+        workdir=tmp_path,
+        process_grace_seconds=0.05,
+        cleanup_timeout_seconds=0.5,
+        metrics=metrics,
+    )
+
+    task = asyncio.create_task(_collect(runner, _request(timeout_seconds=10)))
+    for _ in range(100):
+        if pid_file.exists():
+            break
+        await asyncio.sleep(0.01)
+    assert pid_file.exists()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    pid = int(pid_file.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+    assert "factory_droid_openai_forced_kills_total 0" in metrics.render()
+
+
 @pytest.mark.asyncio
 async def test_runner_clamps_negative_usage_to_zero(tmp_path: Path) -> None:
     usage = TokenUsageUpdate(
