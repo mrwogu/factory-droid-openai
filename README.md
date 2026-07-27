@@ -5,21 +5,40 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
-Unofficial, local-first OpenAI-compatible HTTP bridge for
-[Factory Droid](https://www.factory.ai/) using
-[`droid-sdk-python`](https://github.com/Factory-AI/droid-sdk-python).
+Use your [Factory Droid](https://www.factory.ai/) models in VS Code, Cursor,
+Continue, Aider, Zed - any tool that speaks the OpenAI Chat Completions API.
 
-The bridge exposes `/v1/chat/completions`, so you can drive any client that
-speaks the OpenAI Chat Completions protocol with your Factory Droid account
-instead of an OpenAI API key. Examples include the GitHub Copilot chat
-experience in VS Code through its Bring Your Own Key Custom Endpoint, plus
-Continue, Cursor, Aider, Zed, Cline, Roo Code, Open WebUI, LLM CLI,
-LangChain and LlamaIndex agents, Hermes, OpenClaw, and any framework that lets
-you set a custom `base_url`. The OpenAI transcript and external tool schemas
-are serialized into one strict prompt per request, and the client keeps
-ownership of tool execution.
+This bridge runs locally on your machine. It translates between OpenAI's
+API format and Factory Droid, so your tools talk to `http://127.0.0.1:8787/v1`
+like it's OpenAI. Models like GPT-5.4 and Gemini 3.1 Pro become available
+anywhere you can set a custom `base_url`. The bridge never runs tools and
+never reads your credentials.
 
-This project is not affiliated with, endorsed by, or maintained by Factory.
+Not affiliated with, endorsed by, or maintained by Factory.
+
+## Contents
+
+- [Quick start](#quick-start)
+- [Client guides](#client-guides)
+  - [VS Code (Copilot BYOK)](#vs-code)
+  - [OpenClaw](#openclaw)
+  - [Hermes Agent](#hermes-agent)
+  - [OpenAI Python client](#openai-python-client)
+- [API compatibility](#api-compatibility)
+- [API reference](#api-reference)
+- [Installation](#installation)
+  - [Docker](#docker)
+- [Configuration](#configuration)
+- [Features](#features)
+- [How it works](#how-it-works)
+- [Requirements](#requirements)
+- [Limits and metrics](#limits-and-metrics)
+- [Authentication](#authentication)
+- [Tool execution safety](#tool-execution-safety)
+- [Bridge architecture limits](#bridge-architecture-limits)
+- [Troubleshooting](#troubleshooting)
+- [Development](#development)
+- [License](#license)
 
 ## Quick start
 
@@ -38,14 +57,7 @@ factory-droid-openai
 
 `pipx install factory-droid-openai` works the same way if you prefer pipx.
 
-To point Droid at a different directory than the one you launched from, set
-`FACTORY_DROID_OPENAI_WORKDIR` as an override:
-
-```bash
-FACTORY_DROID_OPENAI_WORKDIR="/path/to/your/project" factory-droid-openai
-```
-
-From another terminal, send an explicit Droid model ID:
+From another terminal, send a request:
 
 ```bash
 curl --fail http://127.0.0.1:8787/v1/chat/completions \
@@ -58,11 +70,8 @@ curl --fail http://127.0.0.1:8787/v1/chat/completions \
   }'
 ```
 
-Use an ID returned by `GET /v1/models`. The bridge
-forwards every model value except its `factory-droid` alias directly to Droid.
-The alias requests the Droid CLI's configured default instead of selecting a
-model explicitly. Examples below use explicit `gpt-5.4` and
-`gemini-3.1-pro-preview` model IDs.
+Use any model ID from `GET /v1/models`, or the `factory-droid` alias to pick
+Droid's configured default.
 
 ## API compatibility
 
