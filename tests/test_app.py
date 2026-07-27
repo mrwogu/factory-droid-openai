@@ -24,6 +24,12 @@ from factory_droid_openai.app import (
     create_app,
 )
 from factory_droid_openai.config import Settings
+from factory_droid_openai.droid_rpc import (
+    CompactionResult,
+    ContextBreakdown,
+    ContextCategory,
+    ContextStats,
+)
 from factory_droid_openai.metrics import BridgeMetrics
 from factory_droid_openai.protocol import (
     TOOL_CALL_CLOSE,
@@ -31,6 +37,7 @@ from factory_droid_openai.protocol import (
     ToolCallStreamParser,
 )
 from factory_droid_openai.runner import (
+    DroidModel,
     ReasoningDelta,
     RunComplete,
     RunEvent,
@@ -62,6 +69,7 @@ class FakeRunner:
         self.error = error
         self.requests: list[RunRequest] = []
         self.closed = False
+        self.session_operations: list[tuple[str, str, object | None]] = []
 
     async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
         self.requests.append(request)
@@ -72,6 +80,70 @@ class FakeRunner:
                 yield event
         finally:
             self.closed = True
+
+    async def list_models(self, *, timeout_seconds: float) -> tuple[DroidModel, ...]:
+        del timeout_seconds
+        return (
+            DroidModel(
+                id="gpt-5.4",
+                display_name="GPT-5.4",
+                provider="openai",
+                supported_reasoning_efforts=("low", "high"),
+                default_reasoning_effort="high",
+                supports_images=True,
+                supports_pdfs=True,
+            ),
+        )
+
+    async def get_context(
+        self,
+        session_id: str,
+        *,
+        timeout_seconds: float,
+    ) -> tuple[ContextStats, ContextBreakdown]:
+        del timeout_seconds
+        self.session_operations.append(("context", session_id, None))
+        return (
+            ContextStats(100, 900, 1000, "exact", "2026-07-27T00:00:00Z"),
+            ContextBreakdown(
+                "gpt-5.4",
+                "GPT-5.4",
+                1000,
+                100,
+                900,
+                (ContextCategory("messages", 100, "blue"),),
+            ),
+        )
+
+    async def compact_session(
+        self,
+        session_id: str,
+        *,
+        custom_instructions: str | None,
+        timeout_seconds: float,
+    ) -> CompactionResult:
+        del timeout_seconds
+        self.session_operations.append(("compact", session_id, custom_instructions))
+        return CompactionResult("session-compact", 4)
+
+    async def fork_session(self, session_id: str, *, timeout_seconds: float) -> str:
+        del timeout_seconds
+        self.session_operations.append(("fork", session_id, None))
+        return "session-fork"
+
+    async def rename_session(
+        self,
+        session_id: str,
+        *,
+        title: str,
+        timeout_seconds: float,
+    ) -> None:
+        del timeout_seconds
+        self.session_operations.append(("rename", session_id, title))
+
+    async def close_session(self, session_id: str, *, timeout_seconds: float) -> None:
+        del timeout_seconds
+        self.session_operations.append(("close", session_id, None))
 
 
 class BlockingRunner(FakeRunner):
@@ -164,6 +236,38 @@ async def test_health_and_models(tmp_path: Path) -> None:
 
     assert health.json() == {"status": "ok"}
     assert models.json()["data"][0]["id"] == "factory-droid"
+    assert models.json()["data"][1] == {
+        "id": "gpt-5.4",
+        "object": "model",
+        "created": 0,
+        "owned_by": "openai",
+        "factory_droid_display_name": "GPT-5.4",
+        "factory_droid_supported_reasoning_efforts": ["low", "high"],
+        "factory_droid_default_reasoning_effort": "high",
+        "factory_droid_supports_images": True,
+        "factory_droid_supports_pdfs": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_models_falls_back_to_alias_when_droid_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    class UnavailableRunner(FakeRunner):
+        async def list_models(self, *, timeout_seconds: float) -> tuple[DroidModel, ...]:
+            del timeout_seconds
+            raise RunnerError(
+                "Droid missing",
+                status_code=503,
+                error_type="factory_droid_unavailable",
+            )
+
+    runner = UnavailableRunner([])
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.get("/v1/models")
+
+    assert response.status_code == 200
+    assert [model["id"] for model in response.json()["data"]] == ["factory-droid"]
 
 
 @pytest.mark.asyncio
@@ -1347,6 +1451,275 @@ async def test_rejected_attachment_returns_a_client_error(tmp_path: Path) -> Non
 
     assert response.status_code == 400
     assert "remote image URLs" in response.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_json_schema_response_format_is_enforced_and_forwarded(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner([TextDelta('{"answer":7}'), RunComplete(Usage())])
+    schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "integer"}},
+        "required": ["answer"],
+        "additionalProperties": False,
+    }
+    payload = _payload(
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "answer",
+                "strict": True,
+                "schema": schema,
+            },
+        }
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == '{"answer":7}'
+    assert runner.requests[0].output_format == {
+        "type": "json_schema",
+        "schema": schema,
+    }
+
+
+@pytest.mark.asyncio
+async def test_json_object_response_format_maps_to_a_generic_schema(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner([TextDelta('{"ok":true}'), RunComplete(Usage())])
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(response_format={"type": "json_object"}),
+        )
+
+    assert response.status_code == 200
+    assert runner.requests[0].output_format == {
+        "type": "json_schema",
+        "schema": {"type": "object", "additionalProperties": True},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response_format",
+    [
+        {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "not_object",
+                "schema": {"type": "array"},
+            },
+        },
+        {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "invalid",
+                "schema": {"type": "object", "required": "not-an-array"},
+            },
+        },
+        {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "remote",
+                "schema": {
+                    "type": "object",
+                    "properties": {"value": {"$ref": "https://example.com/schema"}},
+                },
+            },
+        },
+    ],
+)
+async def test_invalid_response_format_is_rejected_before_the_runner(
+    tmp_path: Path,
+    response_format: dict[str, object],
+) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(response_format=response_format),
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert runner.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ['{"answer":"wrong"}', '{"answer":1,"answer":2}', "NaN"])
+async def test_invalid_structured_output_fails_closed(
+    tmp_path: Path,
+    text: str,
+) -> None:
+    runner = FakeRunner([TextDelta(text), RunComplete(Usage())])
+    schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "integer"}},
+        "required": ["answer"],
+    }
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {"name": "answer", "schema": schema},
+                }
+            ),
+        )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "factory_protocol_error"
+
+
+@pytest.mark.asyncio
+async def test_streaming_structured_output_is_checked_before_finish(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner([TextDelta('{"answer":7}'), RunComplete(Usage())])
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(
+                stream=True,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "answer",
+                        "schema": {
+                            "type": "object",
+                            "properties": {"answer": {"type": "integer"}},
+                            "required": ["answer"],
+                        },
+                    },
+                },
+            ),
+        )
+
+    assert '"content":"{\\"answer\\":7}"' in response.text
+    assert '"finish_reason":"stop"' in response.text
+
+
+@pytest.mark.asyncio
+async def test_invalid_streaming_structured_output_is_not_emitted(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner([TextDelta('{"answer":"wrong"}'), RunComplete(Usage())])
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(
+                stream=True,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "answer",
+                        "schema": {
+                            "type": "object",
+                            "properties": {"answer": {"type": "integer"}},
+                            "required": ["answer"],
+                        },
+                    },
+                },
+            ),
+        )
+
+    chunks = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: {")
+    ]
+    content = [
+        choice["delta"].get("content")
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+        if choice["delta"].get("content")
+    ]
+    assert content == []
+    assert chunks[-1]["error"]["type"] == "factory_protocol_error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"stop": "HALT"},
+        {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "lookup", "parameters": {}},
+                }
+            ]
+        },
+    ],
+)
+async def test_response_format_rejects_incompatible_bridge_options(
+    tmp_path: Path,
+    extra: dict[str, object],
+) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+    payload = _payload(response_format={"type": "json_object"}, **extra)
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 400
+    assert runner.requests == []
+
+
+@pytest.mark.asyncio
+async def test_guarded_factory_session_operations(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [
+            SessionStarted("session-77"),
+            TextDelta("created"),
+            RunComplete(Usage()),
+        ]
+    )
+    app = _feature_app(tmp_path, runner, session_continuity=True)
+    async with _client(app) as client:
+        assert (await client.post("/v1/chat/completions", json=_payload())).status_code == 200
+        context = await client.get("/v1/factory/sessions/session-77/context")
+        compact = await client.post(
+            "/v1/factory/sessions/session-77/compact",
+            json={"custom_instructions": "Keep decisions."},
+        )
+        fork = await client.post("/v1/factory/sessions/session-77/fork")
+        rename = await client.patch(
+            "/v1/factory/sessions/session-77",
+            json={"title": "New title"},
+        )
+        close = await client.delete("/v1/factory/sessions/session-77")
+        missing = await client.get("/v1/factory/sessions/session-77/context")
+
+    assert context.json()["stats"]["used"] == 100
+    assert context.json()["breakdown"]["categories"][0]["name"] == "messages"
+    assert compact.json() == {"session_id": "session-compact", "removed_count": 4}
+    assert fork.json() == {"session_id": "session-fork"}
+    assert rename.json()["status"] == "renamed"
+    assert close.json()["status"] == "closed"
+    assert missing.status_code == 404
+    assert runner.session_operations == [
+        ("context", "session-77", None),
+        ("compact", "session-77", "Keep decisions."),
+        ("fork", "session-77", None),
+        ("rename", "session-77", "New title"),
+        ("close", "session-77", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_factory_session_operations_require_continuity(tmp_path: Path) -> None:
+    runner = FakeRunner([])
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.get("/v1/factory/sessions/session-1/context")
+
+    assert response.status_code == 400
+    assert "disabled" in response.json()["error"]["message"]
 
 
 def test_session_registry_evicts_the_oldest_entries() -> None:

@@ -23,7 +23,15 @@ def test_openapi_contract_documents_compatibility_surface(tmp_path: Path) -> Non
     schema: dict[str, Any] = create_app(Settings(workdir=tmp_path)).openapi()
     paths = schema["paths"]
 
-    assert set(paths) == {"/health", "/v1/models", "/v1/chat/completions"}
+    assert set(paths) == {
+        "/health",
+        "/v1/models",
+        "/v1/chat/completions",
+        "/v1/factory/sessions/{session_id}",
+        "/v1/factory/sessions/{session_id}/compact",
+        "/v1/factory/sessions/{session_id}/context",
+        "/v1/factory/sessions/{session_id}/fork",
+    }
     assert "security" not in paths["/health"]["get"]
     assert paths["/v1/models"]["get"]["security"] == [{"HTTPBearer": []}]
 
@@ -45,3 +53,8 @@ def test_openapi_contract_documents_compatibility_surface(tmp_path: Path) -> Non
         "text/event-stream",
     }
     assert schema["components"]["securitySchemes"]["HTTPBearer"]["scheme"].lower() == "bearer"
+    assert paths["/v1/factory/sessions/{session_id}/context"]["get"]["security"] == [
+        {"HTTPBearer": []}
+    ]
+    request_schema = schema["components"]["schemas"]["ChatCompletionRequest"]
+    assert "response_format" in request_schema["properties"]

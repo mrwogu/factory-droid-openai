@@ -132,7 +132,7 @@
           },
           "n": {
             "default": 1,
-            "minimum": 1,
+            "minimum": 1.0,
             "title": "N",
             "type": "integer"
           },
@@ -151,6 +151,31 @@
               }
             ],
             "title": "Reasoning Effort"
+          },
+          "response_format": {
+            "anyOf": [
+              {
+                "discriminator": {
+                  "mapping": {
+                    "json_object": "#/components/schemas/JsonObjectResponseFormat",
+                    "json_schema": "#/components/schemas/JsonSchemaResponseFormat"
+                  },
+                  "propertyName": "type"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/JsonSchemaResponseFormat"
+                  },
+                  {
+                    "$ref": "#/components/schemas/JsonObjectResponseFormat"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Response Format"
           },
           "stop": {
             "anyOf": [
@@ -187,7 +212,7 @@
           "timeout": {
             "anyOf": [
               {
-                "exclusiveMinimum": 0,
+                "exclusiveMinimum": 0.0,
                 "type": "number"
               },
               {
@@ -370,6 +395,139 @@
         "title": "ChatMessage",
         "type": "object"
       },
+      "CompactSessionRequest": {
+        "properties": {
+          "custom_instructions": {
+            "anyOf": [
+              {
+                "maxLength": 16384,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Custom Instructions"
+          }
+        },
+        "title": "CompactSessionRequest",
+        "type": "object"
+      },
+      "CompactSessionResponse": {
+        "properties": {
+          "removed_count": {
+            "title": "Removed Count",
+            "type": "integer"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "removed_count"
+        ],
+        "title": "CompactSessionResponse",
+        "type": "object"
+      },
+      "ContextBreakdownResponse": {
+        "properties": {
+          "categories": {
+            "items": {
+              "$ref": "#/components/schemas/ContextCategoryResponse"
+            },
+            "title": "Categories",
+            "type": "array"
+          },
+          "context_budget": {
+            "title": "Context Budget",
+            "type": "integer"
+          },
+          "free_tokens": {
+            "title": "Free Tokens",
+            "type": "integer"
+          },
+          "model_display_name": {
+            "title": "Model Display Name",
+            "type": "string"
+          },
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "used_tokens": {
+            "title": "Used Tokens",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "model_id",
+          "model_display_name",
+          "context_budget",
+          "used_tokens",
+          "free_tokens",
+          "categories"
+        ],
+        "title": "ContextBreakdownResponse",
+        "type": "object"
+      },
+      "ContextCategoryResponse": {
+        "properties": {
+          "color_key": {
+            "title": "Color Key",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "tokens": {
+            "title": "Tokens",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "tokens",
+          "color_key"
+        ],
+        "title": "ContextCategoryResponse",
+        "type": "object"
+      },
+      "ContextStatsResponse": {
+        "properties": {
+          "accuracy": {
+            "title": "Accuracy",
+            "type": "string"
+          },
+          "limit": {
+            "title": "Limit",
+            "type": "integer"
+          },
+          "remaining": {
+            "title": "Remaining",
+            "type": "integer"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          },
+          "used": {
+            "title": "Used",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "used",
+          "remaining",
+          "limit",
+          "accuracy",
+          "updated_at"
+        ],
+        "title": "ContextStatsResponse",
+        "type": "object"
+      },
       "ErrorDetail": {
         "properties": {
           "code": {
@@ -422,6 +580,19 @@
         "title": "ErrorResponse",
         "type": "object"
       },
+      "ForkSessionResponse": {
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "ForkSessionResponse",
+        "type": "object"
+      },
       "FunctionCall": {
         "properties": {
           "arguments": {
@@ -454,11 +625,148 @@
         "title": "HealthResponse",
         "type": "object"
       },
+      "JsonObjectResponseFormat": {
+        "additionalProperties": false,
+        "properties": {
+          "type": {
+            "const": "json_object",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "title": "JsonObjectResponseFormat",
+        "type": "object"
+      },
+      "JsonSchemaDefinition": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "name": {
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "title": "Name",
+            "type": "string"
+          },
+          "schema": {
+            "additionalProperties": true,
+            "title": "Schema",
+            "type": "object"
+          },
+          "strict": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Strict"
+          }
+        },
+        "required": [
+          "name",
+          "schema"
+        ],
+        "title": "JsonSchemaDefinition",
+        "type": "object"
+      },
+      "JsonSchemaResponseFormat": {
+        "additionalProperties": false,
+        "properties": {
+          "json_schema": {
+            "$ref": "#/components/schemas/JsonSchemaDefinition"
+          },
+          "type": {
+            "const": "json_schema",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "json_schema"
+        ],
+        "title": "JsonSchemaResponseFormat",
+        "type": "object"
+      },
       "ModelInfo": {
         "properties": {
           "created": {
             "title": "Created",
             "type": "integer"
+          },
+          "factory_droid_default_reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Factory Droid Default Reasoning Effort"
+          },
+          "factory_droid_display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Factory Droid Display Name"
+          },
+          "factory_droid_supported_reasoning_efforts": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Factory Droid Supported Reasoning Efforts"
+          },
+          "factory_droid_supports_images": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Factory Droid Supports Images"
+          },
+          "factory_droid_supports_pdfs": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Factory Droid Supports Pdfs"
           },
           "id": {
             "title": "Id",
@@ -503,6 +811,64 @@
           "data"
         ],
         "title": "ModelListResponse",
+        "type": "object"
+      },
+      "RenameSessionRequest": {
+        "properties": {
+          "title": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "title": "RenameSessionRequest",
+        "type": "object"
+      },
+      "SessionContextResponse": {
+        "properties": {
+          "breakdown": {
+            "$ref": "#/components/schemas/ContextBreakdownResponse"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "stats": {
+            "$ref": "#/components/schemas/ContextStatsResponse"
+          }
+        },
+        "required": [
+          "session_id",
+          "stats",
+          "breakdown"
+        ],
+        "title": "SessionContextResponse",
+        "type": "object"
+      },
+      "SessionOperationResponse": {
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "renamed",
+              "closed"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "status"
+        ],
+        "title": "SessionOperationResponse",
         "type": "object"
       },
       "StreamOptions": {
@@ -721,6 +1087,16 @@
               }
             }
           },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
           "502": {
             "content": {
               "application/json": {
@@ -750,16 +1126,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -770,6 +1136,549 @@
         "summary": "Create a chat completion",
         "tags": [
           "OpenAI compatibility"
+        ]
+      }
+    },
+    "/v1/factory/sessions/{session_id}": {
+      "delete": {
+        "operationId": "close_session_v1_factory_sessions__session_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionOperationResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The requested Factory Droid session is unknown to this bridge."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The bounded Droid request queue is full.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Droid SDK, process, or bridge protocol failure."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Droid executable unavailable."
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Droid request timeout."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Close a Factory Droid session",
+        "tags": [
+          "Factory extensions"
+        ]
+      },
+      "patch": {
+        "operationId": "rename_session_v1_factory_sessions__session_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RenameSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionOperationResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The requested Factory Droid session is unknown to this bridge."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The bounded Droid request queue is full.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Droid SDK, process, or bridge protocol failure."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Droid executable unavailable."
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Droid request timeout."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Rename a Factory Droid session",
+        "tags": [
+          "Factory extensions"
+        ]
+      }
+    },
+    "/v1/factory/sessions/{session_id}/compact": {
+      "post": {
+        "operationId": "compact_session_v1_factory_sessions__session_id__compact_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompactSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompactSessionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The requested Factory Droid session is unknown to this bridge."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The bounded Droid request queue is full.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Droid SDK, process, or bridge protocol failure."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Droid executable unavailable."
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Droid request timeout."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Compact a Factory Droid session",
+        "tags": [
+          "Factory extensions"
+        ]
+      }
+    },
+    "/v1/factory/sessions/{session_id}/context": {
+      "get": {
+        "operationId": "session_context_v1_factory_sessions__session_id__context_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionContextResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The requested Factory Droid session is unknown to this bridge."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The bounded Droid request queue is full.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Droid SDK, process, or bridge protocol failure."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Droid executable unavailable."
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Droid request timeout."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Read Factory Droid context utilization",
+        "tags": [
+          "Factory extensions"
+        ]
+      }
+    },
+    "/v1/factory/sessions/{session_id}/fork": {
+      "post": {
+        "operationId": "fork_session_v1_factory_sessions__session_id__fork_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForkSessionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The requested Factory Droid session is unknown to this bridge."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The bounded Droid request queue is full.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Droid SDK, process, or bridge protocol failure."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Droid executable unavailable."
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Droid request timeout."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Fork a Factory Droid session",
+        "tags": [
+          "Factory extensions"
         ]
       }
     },
@@ -787,6 +1696,24 @@
             },
             "description": "Successful Response"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The bounded Droid request queue is full.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
           "4XX": {
             "content": {
               "application/json": {
@@ -795,7 +1722,37 @@
                 }
               }
             },
-            "description": "Bearer authentication failure."
+            "description": "Invalid request or bearer authentication failure."
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Droid SDK, process, or bridge protocol failure."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Droid executable unavailable."
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Droid request timeout."
           }
         },
         "security": [
@@ -803,7 +1760,7 @@
             "HTTPBearer": []
           }
         ],
-        "summary": "List the bridge model alias",
+        "summary": "List available Factory Droid models",
         "tags": [
           "OpenAI compatibility"
         ]
@@ -818,6 +1775,10 @@
     {
       "description": "OpenAI-compatible model and chat endpoints.",
       "name": "OpenAI compatibility"
+    },
+    {
+      "description": "Guarded operations for bridge-created Droid sessions.",
+      "name": "Factory extensions"
     }
   ]
 }
