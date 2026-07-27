@@ -1,6 +1,7 @@
 # Factory Droid OpenAI Bridge
 
 [![CI](https://github.com/mrwogu/factory-droid-openai/actions/workflows/ci.yml/badge.svg)](https://github.com/mrwogu/factory-droid-openai/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/factory-droid-openai.svg)](https://pypi.org/project/factory-droid-openai/)
 [![Codecov](https://codecov.io/github/mrwogu/factory-droid-openai/graph/badge.svg)](https://codecov.io/github/mrwogu/factory-droid-openai)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
