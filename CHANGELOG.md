@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.1](https://github.com/mrwogu/factory-droid-openai/compare/v1.2.0...v1.2.1) (2026-07-27)
+
+
+### Bug Fixes
+
+* **ci:** pin valid docker action commit SHAs ([fd62b4e](https://github.com/mrwogu/factory-droid-openai/commit/fd62b4ef92bba95831120601830c2d839d8ee706))
+
 ## [1.2.0](https://github.com/mrwogu/factory-droid-openai/compare/v1.1.0...v1.2.0) (2026-07-27)
 
 
