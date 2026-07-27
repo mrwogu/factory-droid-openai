@@ -40,6 +40,7 @@ class Settings:
     max_tracked_sessions: int = 256
     mcp_settle_seconds: float = 0.0
     model_cache_seconds: float = 300.0
+    model_quarantine_seconds: float = 900.0
     worktree: str | None = None
     append_system_prompt_file: Path | None = None
     model_alias: str = "factory-droid"
@@ -183,6 +184,10 @@ class Settings:
             "FACTORY_DROID_OPENAI_MODEL_CACHE_SECONDS",
             default=300.0,
         )
+        model_quarantine_seconds = _non_negative_float(
+            "FACTORY_DROID_OPENAI_MODEL_QUARANTINE_SECONDS",
+            default=900.0,
+        )
         worktree = os.getenv("FACTORY_DROID_OPENAI_WORKTREE") or None
         append_system_prompt_file = _optional_file(
             "FACTORY_DROID_OPENAI_APPEND_SYSTEM_PROMPT_FILE",
@@ -231,6 +236,7 @@ class Settings:
             max_tracked_sessions=max_tracked_sessions,
             mcp_settle_seconds=mcp_settle_seconds,
             model_cache_seconds=model_cache_seconds,
+            model_quarantine_seconds=model_quarantine_seconds,
             worktree=worktree,
             append_system_prompt_file=append_system_prompt_file,
             model_alias=os.getenv("FACTORY_DROID_OPENAI_MODEL_ALIAS", "factory-droid"),

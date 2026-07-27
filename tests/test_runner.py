@@ -21,7 +21,7 @@ from droid_sdk import (
     WorkingStateChanged,
 )
 from droid_sdk import TimeoutError as DroidTimeoutError
-from droid_sdk.errors import SessionNotFoundError
+from droid_sdk.errors import ProtocolError, SessionNotFoundError
 from droid_sdk.schemas.enums import (
     AutonomyLevel,
     DroidInteractionMode,
@@ -1210,6 +1210,47 @@ async def test_runner_rejects_a_warm_session_it_cannot_retune(tmp_path: Path) ->
 
     assert client.rpc_requests == []
     assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_runner_reports_a_policy_blocked_model_as_unavailable(tmp_path: Path) -> None:
+    class DeniedClient(FakeClient):
+        async def initialize_session(self, **kwargs: Any) -> None:
+            del kwargs
+            raise ProtocolError("Model not allowed by organization policy", code=-32603)
+
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: DeniedClient([])),
+    )
+
+    with pytest.raises(RunnerError, match="not available for this Factory account") as caught:
+        _ = [event async for event in runner.run(_request(model="claude-fable-5"))]
+
+    assert caught.value.status_code == 404
+    assert caught.value.error_type == "model_not_found"
+    assert "claude-fable-5" in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_runner_keeps_other_sdk_failures_as_bridge_errors(tmp_path: Path) -> None:
+    class BrokenClient(FakeClient):
+        async def initialize_session(self, **kwargs: Any) -> None:
+            del kwargs
+            raise DroidClientError("session storage exploded")
+
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: BrokenClient([])),
+    )
+
+    with pytest.raises(RunnerError, match="Factory Droid SDK failed") as caught:
+        _ = [event async for event in runner.run(_request())]
+
+    assert caught.value.status_code == 502
+    assert caught.value.error_type == "factory_droid_sdk_error"
 
 
 def test_session_key_retuning_requires_an_expressible_target() -> None:

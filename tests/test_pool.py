@@ -230,6 +230,32 @@ async def test_pool_records_warm_failures_and_keeps_running() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pool_stops_warming_a_key_droid_rejects() -> None:
+    class CountingRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__(fail=True)
+            self.attempts = 0
+
+        async def warm(self, key: SessionKey, *, timeout_seconds: float) -> WarmSession:
+            self.attempts += 1
+            return await super().warm(key, timeout_seconds=timeout_seconds)
+
+    runner = CountingRunner()
+    pool = _pool(runner, retry_seconds=0.01)
+
+    pool.start(initial_key=KEY)
+    await asyncio.sleep(0.1)
+
+    assert runner.attempts == 1
+
+    pool.note(KEY)
+    await asyncio.sleep(0.05)
+
+    assert runner.attempts == 2
+    await pool.aclose()
+
+
+@pytest.mark.asyncio
 async def test_pool_spreads_warm_sessions_across_keys() -> None:
     log: list[str] = []
     runner = FakeRunner(log=log)
