@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.2](https://github.com/mrwogu/factory-droid-openai/compare/v1.3.1...v1.3.2) (2026-07-27)
+
+
+### Bug Fixes
+
+* **runner:** count only SIGKILL as a forced kill ([#19](https://github.com/mrwogu/factory-droid-openai/issues/19)) ([a0f183d](https://github.com/mrwogu/factory-droid-openai/commit/a0f183db4f854a285210cc60486894e17d50819d))
+
 ## [1.3.1](https://github.com/mrwogu/factory-droid-openai/compare/v1.3.0...v1.3.1) (2026-07-27)
 
 
