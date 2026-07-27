@@ -88,6 +88,33 @@ class DroidRpcExtension:
             params["outputFormat"] = output_format
         await self._request(client, DroidServerMethod.ADD_USER_MESSAGE.value, params)
 
+    async def retune_session(
+        self,
+        client: DroidClient,
+        *,
+        model_id: str,
+        reasoning_effort: str | None,
+    ) -> None:
+        """Repoint an initialized session at another model and effort.
+
+        Droid applies this without restarting the process, so a warm session
+        can serve a model it was not initialized with. Interaction mode and
+        autonomy level are resent so the bridge invariants stay pinned; the
+        disabled native tool list is preserved by Droid.
+        """
+        params: dict[str, Any] = {
+            "modelId": model_id,
+            "interactionMode": DroidInteractionMode.Auto.value,
+            "autonomyLevel": AutonomyLevel.Off.value,
+        }
+        if reasoning_effort is not None:
+            params["reasoningEffort"] = reasoning_effort
+        await self._request(
+            client,
+            DroidServerMethod.UPDATE_SESSION_SETTINGS.value,
+            params,
+        )
+
     async def disable_native_tools(self, client: DroidClient) -> None:
         await self._wait_for_mcp_catalog(client)
         tools = await self._list_tools(client)

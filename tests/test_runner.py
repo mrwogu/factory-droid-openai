@@ -133,7 +133,8 @@ class FakeClient:
                 }
             }
         if method == "droid.update_session_settings":
-            self.disabled_tool_ids = set(params["disabledToolIds"])
+            if "disabledToolIds" in params:
+                self.disabled_tool_ids = set(params["disabledToolIds"])
             return {"result": {}}
         if method == "droid.add_user_message":
             self.prompt = params["text"]
@@ -1108,6 +1109,117 @@ async def test_runner_reuses_a_warm_session_without_reinitializing(tmp_path: Pat
     assert client.init_kwargs == {}
     assert client.prompt == "prompt"
     assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_runner_retunes_a_warm_session_to_the_requested_model(tmp_path: Path) -> None:
+    client = FakeClient([TurnComplete()])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+    warm = WarmSession(
+        key=SessionKey(model_id=None, reasoning_effort=None),
+        client=cast("Any", client),
+        transport=None,
+        session_id="session-1",
+        created_at=0.0,
+    )
+
+    events = [
+        event
+        async for event in runner.run(
+            _request(model="gpt-5.4", reasoning_effort="low", warm_session=warm),
+        )
+    ]
+
+    assert isinstance(events[-1], RunComplete)
+    assert client.init_kwargs == {}
+    retunes = [
+        params
+        for method, params, _timeout in client.rpc_requests
+        if method == "droid.update_session_settings"
+    ]
+    assert retunes == [
+        {
+            "modelId": "gpt-5.4",
+            "interactionMode": "auto",
+            "autonomyLevel": "off",
+            "reasoningEffort": "low",
+        }
+    ]
+    assert warm.key == SessionKey(model_id="gpt-5.4", reasoning_effort="low")
+    assert client.disabled_tool_ids == set()
+
+
+@pytest.mark.asyncio
+async def test_runner_retune_keeps_the_droid_default_effort(tmp_path: Path) -> None:
+    client = FakeClient([TurnComplete()])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+    warm = WarmSession(
+        key=SessionKey(model_id=None, reasoning_effort=None),
+        client=cast("Any", client),
+        transport=None,
+        session_id="session-1",
+        created_at=0.0,
+    )
+
+    events = [
+        event
+        async for event in runner.run(
+            _request(model="glm-5.2", reasoning_effort=None, warm_session=warm),
+        )
+    ]
+
+    assert isinstance(events[-1], RunComplete)
+    assert client.rpc_requests[0][1] == {
+        "modelId": "glm-5.2",
+        "interactionMode": "auto",
+        "autonomyLevel": "off",
+    }
+
+
+@pytest.mark.asyncio
+async def test_runner_rejects_a_warm_session_it_cannot_retune(tmp_path: Path) -> None:
+    client = FakeClient([TurnComplete()])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+    warm = WarmSession(
+        key=SessionKey(model_id="gpt-5.4", reasoning_effort="high"),
+        client=cast("Any", client),
+        transport=None,
+        session_id="session-1",
+        created_at=0.0,
+    )
+
+    with pytest.raises(RunnerError, match="cannot be repointed"):
+        _ = [
+            event
+            async for event in runner.run(
+                _request(model="gpt-5.4", reasoning_effort=None, warm_session=warm),
+            )
+        ]
+
+    assert client.rpc_requests == []
+    assert client.closed is True
+
+
+def test_session_key_retuning_requires_an_expressible_target() -> None:
+    default = SessionKey(model_id=None, reasoning_effort=None)
+    explicit = SessionKey(model_id="gpt-5.4", reasoning_effort="high")
+
+    assert explicit.can_retune_from(default) is True
+    assert SessionKey(model_id="glm-5.2", reasoning_effort=None).can_retune_from(default) is True
+    assert default.can_retune_from(explicit) is False
+    assert SessionKey(model_id="glm-5.2", reasoning_effort=None).can_retune_from(explicit) is False
 
 
 @pytest.mark.asyncio

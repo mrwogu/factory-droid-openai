@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import signal
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
 from dataclasses import dataclass
@@ -72,15 +71,21 @@ class RunnerError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class SessionKey:
-    """Droid session settings a warm session must already have applied.
-
-    Switching the model on an initialized session costs about as much as a
-    fresh session, so warm sessions are only reusable for the exact settings
-    they were created with.
-    """
+    """Droid session settings a warm session was initialized with."""
 
     model_id: str | None
     reasoning_effort: str | None
+
+    def can_retune_from(self, other: SessionKey) -> bool:
+        """Whether a session warmed for ``other`` can be repointed at ``self``.
+
+        ``None`` means "whatever Droid defaults to", which cannot be restored
+        on a session that already carries an explicit value, so those keys are
+        only reusable for an exact match.
+        """
+        if self.model_id is None:
+            return False
+        return not (self.reasoning_effort is None and other.reasoning_effort is not None)
 
 
 @dataclass(slots=True)
@@ -198,7 +203,6 @@ class _ManagedProcessTransport(ProcessTransport):
         )
         self._owned_process: asyncio.subprocess.Process | None = None
         self._forced_kill = False
-        self._grace_period_seconds = grace_period
 
     async def connect(self) -> None:
         await super().connect()
@@ -207,18 +211,12 @@ class _ManagedProcessTransport(ProcessTransport):
     async def close(self) -> None:
         process = self._owned_process
         was_running = process is not None and process.returncode is None
-        started = asyncio.get_running_loop().time()
         await super().close()
-        elapsed = asyncio.get_running_loop().time() - started
         if was_running and process is not None and process.returncode is not None:
-            sigkill = getattr(signal, "SIGKILL", None)
-            # The elapsed-time arm reports a forced kill the SDK performed
-            # internally, where the exit status is no longer visible here. A
-            # process that happens to exit on its own right at the grace
-            # boundary is counted too, so treat the metric as an upper bound.
-            self._forced_kill = (
-                sigkill is not None and process.returncode == -sigkill
-            ) or elapsed >= self._grace_period_seconds
+            # A signal death is the only reliable evidence of a kill: droid
+            # takes about a second to shut down cleanly, so timing the close
+            # against the grace period misreports every graceful exit.
+            self._forced_kill = process.returncode < 0
 
     async def force_kill_and_reap(self, timeout: float) -> bool:
         process = self._owned_process
@@ -307,6 +305,38 @@ class DroidRunner:
         """Tear down a warm session that will not serve a turn."""
         await self._cleanup(session.client, session.transport, interrupt=False)
 
+    async def _retune(self, warm: WarmSession, key: SessionKey) -> None:
+        """Repoint a warm session at the settings this turn asked for."""
+        if key == warm.key:
+            return
+        model_id = key.model_id
+        if model_id is None or not key.can_retune_from(warm.key):
+            raise RunnerError(
+                "Warm Droid session cannot be repointed at the requested model.",
+            )
+        started = time.perf_counter()
+        effort = _resolve_reasoning_effort(key.reasoning_effort)
+        await self._rpc.retune_session(
+            warm.client,
+            model_id=model_id,
+            reasoning_effort=effort.value if effort is not None else None,
+        )
+        previous = warm.key
+        warm.key = key
+        timeline = current_timeline()
+        retune_seconds = time.perf_counter() - started
+        log_debug(
+            "droid.session_retuned",
+            model=key.model_id,
+            previous_model=previous.model_id,
+            reasoning_effort=key.reasoning_effort,
+            retune_ms=(
+                timeline.observe("retune_ms", retune_seconds)
+                if timeline is not None
+                else _millis(retune_seconds)
+            ),
+        )
+
     async def run(self, request: RunRequest) -> AsyncGenerator[RunEvent, None]:
         reasoning_effort = _resolve_reasoning_effort(request.reasoning_effort)
         loop = asyncio.get_running_loop()
@@ -374,6 +404,8 @@ class DroidRunner:
                         )
                     initialized = True
                     await self._rpc.disable_native_tools(client)
+                else:
+                    await self._retune(warm, request.session_key())
                 session_timeline = current_timeline()
                 log_debug(
                     "droid.session_ready",

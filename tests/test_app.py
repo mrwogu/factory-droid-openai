@@ -2237,10 +2237,11 @@ async def test_lifespan_prewarms_and_drains_the_pool(tmp_path: Path) -> None:
 
     async with app.router.lifespan_context(app):
         await asyncio.sleep(0.05)
-        assert runner.warmed == [SessionKey(model_id=None, reasoning_effort=None)]
-        assert "factory_droid_openai_warm_sessions 1" in app.state.metrics.render()
+        # One session per concurrency slot plus a spare for the refill window.
+        assert runner.warmed == [SessionKey(model_id=None, reasoning_effort=None)] * 2
+        assert "factory_droid_openai_warm_sessions 2" in app.state.metrics.render()
 
-    assert len(runner.discarded) == 1
+    assert len(runner.discarded) == 2
     assert "factory_droid_openai_warm_sessions 0" in app.state.metrics.render()
 
 

@@ -69,6 +69,36 @@ async def test_add_user_message_forwards_all_structured_fields() -> None:
 
 
 @pytest.mark.asyncio
+async def test_retune_session_pins_modes_and_omits_a_default_effort() -> None:
+    protocol = FakeProtocol(lambda _method, _params: {"result": {}})
+    extension = DroidRpcExtension()
+
+    await extension.retune_session(
+        _client(protocol),
+        model_id="gpt-5.4",
+        reasoning_effort="low",
+    )
+    await extension.retune_session(
+        _client(protocol),
+        model_id="glm-5.2",
+        reasoning_effort=None,
+    )
+
+    assert protocol.calls[0][0] == "droid.update_session_settings"
+    assert protocol.calls[0][1] == {
+        "modelId": "gpt-5.4",
+        "interactionMode": "auto",
+        "autonomyLevel": "off",
+        "reasoningEffort": "low",
+    }
+    assert protocol.calls[1][1] == {
+        "modelId": "glm-5.2",
+        "interactionMode": "auto",
+        "autonomyLevel": "off",
+    }
+
+
+@pytest.mark.asyncio
 async def test_disable_native_tools_verifies_exec_and_mcp_catalogs() -> None:
     disabled: set[str] = set()
 

@@ -19,6 +19,8 @@ class PoolMetrics(Protocol):
 
     def increment_warm_hits(self) -> None: ...
 
+    def increment_warm_retunes(self) -> None: ...
+
     def increment_warm_misses(self) -> None: ...
 
     def increment_warm_failures(self) -> None: ...
@@ -77,9 +79,11 @@ class BackgroundReaper:
 class WarmSessionPool:
     """Keeps initialized Droid sessions ready so requests skip session startup.
 
-    Sessions are keyed by the settings they were initialized with, because
-    switching a model on a live session costs as much as starting a new one.
-    A session serves at most one turn, which keeps the bridge stateless.
+    Sessions are keyed by the settings they were initialized with. An exact
+    key match serves a turn with no extra round trip; otherwise a session
+    warmed for another model is handed over and the runner repoints it, which
+    costs milliseconds instead of a fresh process. A session serves at most
+    one turn, which keeps the bridge stateless.
     """
 
     def __init__(
@@ -154,20 +158,51 @@ class WarmSessionPool:
         if not self.enabled:
             return None
         self.note(key)
-        queue = self._sessions.get(key)
-        while queue:
-            session = queue.popleft()
-            if self._usable(session):
-                self._publish()
-                if self._metrics is not None:
-                    self._metrics.increment_warm_hits()
-                log_debug("pool.hit", model=key.model_id, warm_sessions=self._total())
-                return session
-            self._discard(session)
+        session = self._take(key)
+        if session is not None:
+            self._publish()
+            if self._metrics is not None:
+                self._metrics.increment_warm_hits()
+            log_debug("pool.hit", model=key.model_id, warm_sessions=self._total())
+            return session
+        session = self._take_retunable(key)
+        if session is not None:
+            self._publish()
+            if self._metrics is not None:
+                self._metrics.increment_warm_hits()
+                self._metrics.increment_warm_retunes()
+            log_debug(
+                "pool.retune",
+                model=key.model_id,
+                warmed_for=session.key.model_id,
+                warm_sessions=self._total(),
+            )
+            return session
         self._publish()
         if self._metrics is not None:
             self._metrics.increment_warm_misses()
         log_debug("pool.miss", model=key.model_id, warm_sessions=self._total())
+        return None
+
+    def _take(self, key: SessionKey) -> WarmSession | None:
+        queue = self._sessions.get(key)
+        while queue:
+            session = queue.popleft()
+            if self._usable(session):
+                return session
+            self._discard(session)
+        return None
+
+    def _take_retunable(self, key: SessionKey) -> WarmSession | None:
+        """Borrow a session warmed for other settings the runner can repoint."""
+        for warmed_key, queue in self._sessions.items():
+            if warmed_key == key or not key.can_retune_from(warmed_key):
+                continue
+            while queue:
+                session = queue.popleft()
+                if self._usable(session):
+                    return session
+                self._discard(session)
         return None
 
     async def _loop(self) -> None:
@@ -185,21 +220,30 @@ class WarmSessionPool:
         self._drop_stale()
         self._rebalance()
         while True:
-            key = self._deficit_key()
-            if key is None:
+            deficits = self._deficits()
+            if not deficits:
                 return
-            runner = self._runner_factory()
-            try:
-                session = await runner.warm(key, timeout_seconds=self._warm_timeout_seconds)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                if self._metrics is not None:
-                    self._metrics.increment_warm_failures()
-                log_warning("pool.warm_failed", model=key.model_id, error=type(exc).__name__)
+            # Droid startup is seconds of mostly idle waiting, so a burst that
+            # drained the pool refills in one startup instead of N.
+            warmed = await asyncio.gather(*(self._warm(key) for key in deficits))
+            for session in warmed:
+                if session is not None:
+                    self.offer(session)
+            if any(session is None for session in warmed):
                 await asyncio.sleep(self._retry_seconds)
                 return
-            self.offer(session)
+
+    async def _warm(self, key: SessionKey) -> WarmSession | None:
+        runner = self._runner_factory()
+        try:
+            return await runner.warm(key, timeout_seconds=self._warm_timeout_seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if self._metrics is not None:
+                self._metrics.increment_warm_failures()
+            log_warning("pool.warm_failed", model=key.model_id, error=type(exc).__name__)
+            return None
 
     def _targets(self) -> dict[SessionKey, int]:
         """Split the pool size across the keys traffic is currently using."""
@@ -208,11 +252,12 @@ class WarmSessionPool:
         base, extra = divmod(self._size, len(self._wanted))
         return {key: base + (1 if index < extra else 0) for index, key in enumerate(self._wanted)}
 
-    def _deficit_key(self) -> SessionKey | None:
+    def _deficits(self) -> list[SessionKey]:
+        deficits: list[SessionKey] = []
         for key, target in self._targets().items():
-            if len(self._sessions.get(key, ())) < target:
-                return key
-        return None
+            missing = target - len(self._sessions.get(key, ()))
+            deficits.extend([key] * max(0, missing))
+        return deficits
 
     def _rebalance(self) -> None:
         """Free capacity held for keys that traffic has moved away from."""
