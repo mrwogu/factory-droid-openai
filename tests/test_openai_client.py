@@ -11,6 +11,7 @@ from factory_droid_openai.app import create_app
 from factory_droid_openai.config import Settings
 from factory_droid_openai.protocol import TOOL_CALL_CLOSE, TOOL_CALL_OPEN
 from factory_droid_openai.runner import (
+    DroidModel,
     ReasoningDelta,
     RunComplete,
     RunEvent,
@@ -36,6 +37,20 @@ class ScriptedRunner:
         self.requests.append(request)
         for event in self.events:
             yield event
+
+    async def list_models(self, *, timeout_seconds: float) -> tuple[DroidModel, ...]:
+        del timeout_seconds
+        return (
+            DroidModel(
+                id="gpt-5.4",
+                display_name="GPT-5.4",
+                provider="openai",
+                supported_reasoning_efforts=("low", "high"),
+                default_reasoning_effort="high",
+                supports_images=True,
+                supports_pdfs=True,
+            ),
+        )
 
 
 class BlockingRunner(ScriptedRunner):
@@ -140,6 +155,36 @@ async def test_official_openai_client_parses_stream(
     assert chunks[-1].choices == []
     assert chunks[-1].usage is not None
     assert chunks[-1].usage.total_tokens == 6
+
+
+@pytest.mark.asyncio
+async def test_official_openai_client_sends_structured_output_format(
+    tmp_path: Path,
+) -> None:
+    runner = ScriptedRunner([TextDelta('{"answer":7}'), RunComplete(Usage())])
+    client, http_client = _sdk_client(tmp_path, runner)
+    async with http_client:
+        completion = await client.chat.completions.create(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Pick a number."}],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "integer"}},
+                        "required": ["answer"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        )
+
+    assert completion.choices[0].message.content == '{"answer":7}'
+    assert runner.requests[0].output_format is not None
+    assert runner.requests[0].output_format["type"] == "json_schema"
 
 
 @pytest.mark.asyncio

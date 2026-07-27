@@ -8,23 +8,37 @@ import secrets
 import time
 import uuid
 from collections import OrderedDict, deque
-from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import TYPE_CHECKING, Annotated, Any
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Annotated, Any, TypeVar
 
-from fastapi import Depends, FastAPI, Request, Security
+from fastapi import Depends, FastAPI, Request, Response, Security
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jsonschema import ValidationError as JsonSchemaValidationError
+from jsonschema.exceptions import SchemaError
+from jsonschema.validators import validator_for
 
 from factory_droid_openai.config import Settings
+from factory_droid_openai.droid_rpc import DroidRpcExtension
 from factory_droid_openai.metrics import BridgeMetrics
 from factory_droid_openai.models import (
     ChatCompletionRequest,
     ChatCompletionResponse,
+    CompactSessionRequest,
+    CompactSessionResponse,
+    ContextBreakdownResponse,
+    ContextCategoryResponse,
+    ContextStatsResponse,
     ErrorResponse,
+    ForkSessionResponse,
     HealthResponse,
     ModelInfo,
     ModelListResponse,
+    RenameSessionRequest,
+    SessionContextResponse,
+    SessionOperationResponse,
 )
 from factory_droid_openai.protocol import (
     ProtocolEmission,
@@ -35,8 +49,10 @@ from factory_droid_openai.protocol import (
     ToolCallEmission,
     ToolCallStreamParser,
     build_prompt,
+    parse_strict_json,
 )
 from factory_droid_openai.runner import (
+    DroidModel,
     DroidRunner,
     ReasoningDelta,
     RunComplete,
@@ -51,6 +67,7 @@ from factory_droid_openai.runner import (
 )
 
 if TYPE_CHECKING:
+    from jsonschema.protocols import Validator
     from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 RunnerFactory = Callable[[], DroidRunner]
@@ -106,9 +123,119 @@ CHAT_COMPLETION_RESPONSES: dict[int | str, dict[str, Any]] = {
     },
 }
 
+FACTORY_OPERATION_RESPONSES: dict[int | str, dict[str, Any]] = {
+    "4XX": {
+        "model": ErrorResponse,
+        "description": "Invalid request or bearer authentication failure.",
+    },
+    404: {
+        "model": ErrorResponse,
+        "description": "The requested Factory Droid session is unknown to this bridge.",
+    },
+    429: CHAT_COMPLETION_RESPONSES[429],
+    502: CHAT_COMPLETION_RESPONSES[502],
+    503: CHAT_COMPLETION_RESPONSES[503],
+    504: CHAT_COMPLETION_RESPONSES[504],
+}
+MODEL_LIST_RESPONSES: dict[int | str, dict[str, Any]] = {
+    200: {
+        "model": ModelListResponse,
+        "description": "The bridge alias and the discovered Droid model catalog.",
+        "headers": {
+            "x-factory-droid-model-discovery": {
+                "description": (
+                    "Set to 'degraded' when discovery failed and the bridge served the "
+                    "last known catalog, or the alias alone."
+                ),
+                "schema": {"type": "string"},
+            }
+        },
+    },
+    **{
+        status: response
+        for status, response in FACTORY_OPERATION_RESPONSES.items()
+        if status != 404
+    },
+}
+
+
+FactoryOperationResult = TypeVar("FactoryOperationResult")
+
 
 class AdmissionRejectedError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredOutput:
+    """A validated ``response_format`` request, compiled once per completion."""
+
+    payload: dict[str, Any]
+    validator: Validator
+    max_bytes: int
+
+
+class StructuredOutputBuffer:
+    """Collects structured completion text until it can be validated.
+
+    Structured output is only useful once the whole JSON document is present,
+    so the bridge holds it back instead of streaming partial JSON. The byte
+    cap keeps a runaway generation from growing the buffer without bound.
+    """
+
+    def __init__(self, max_bytes: int) -> None:
+        self._max_bytes = max_bytes
+        self._parts: list[str] = []
+        self._bytes = 0
+
+    def append(self, text: str) -> None:
+        self._bytes += len(text.encode("utf-8"))
+        if self._bytes > self._max_bytes:
+            raise ProtocolError(
+                f"Factory Droid structured output exceeds maximum of {self._max_bytes} bytes"
+            )
+        self._parts.append(text)
+
+    def text(self) -> str:
+        return "".join(self._parts)
+
+
+class ModelCatalog:
+    """Caches discovered Droid models behind a single-flight lock.
+
+    Model discovery starts a Droid process and takes an admission slot, so an
+    uncached endpoint would let routine ``GET /v1/models`` polling stall chat
+    traffic. Concurrent callers share one discovery; a failed discovery serves
+    the last known catalog instead of replacing it.
+    """
+
+    def __init__(
+        self,
+        *,
+        ttl_seconds: float,
+        load: Callable[[], Awaitable[tuple[DroidModel, ...]]],
+    ) -> None:
+        self._ttl_seconds = ttl_seconds
+        self._load = load
+        self._lock = asyncio.Lock()
+        self._models: tuple[DroidModel, ...] | None = None
+        self._expires_at = 0.0
+
+    async def get(self) -> tuple[tuple[DroidModel, ...], bool]:
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            cached = self._models
+            if cached is not None and loop.time() < self._expires_at:
+                return cached, False
+            try:
+                models = await self._load()
+            except BridgeHTTPError as exc:
+                if exc.status_code not in {502, 503, 504}:
+                    raise
+                return cached or (), True
+            self._models = models
+            self._expires_at = loop.time() + self._ttl_seconds
+            return models, False
 
 
 class SessionRegistry:
@@ -135,6 +262,9 @@ class SessionRegistry:
             return False
         self._sessions.move_to_end(session_id)
         return True
+
+    def forget(self, session_id: str) -> None:
+        self._sessions.pop(session_id, None)
 
 
 class AdmissionLease:
@@ -323,7 +453,10 @@ class RequestSizeLimitMiddleware:
         receive: Receive,
         send: Send,
     ) -> None:
-        if scope["type"] != "http" or scope.get("path") != "/v1/chat/completions":
+        # Every HTTP route is covered, not only chat completions: the session
+        # extensions accept request bodies too, and FastAPI buffers a body
+        # before authentication runs.
+        if scope["type"] != "http":
             await self._app(scope, receive, send)
             return
 
@@ -438,8 +571,12 @@ def create_app(
             metrics=metrics,
             worktree=resolved_settings.worktree,
             append_system_prompt_file=resolved_settings.append_system_prompt_file,
+            rpc_extension=DroidRpcExtension(
+                mcp_settle_seconds=resolved_settings.mcp_settle_seconds,
+            ),
         )
     )
+    bridge_created = int(time.time())
     sessions = SessionRegistry(resolved_settings.max_tracked_sessions)
     admission = AdmissionController(
         max_concurrency=resolved_settings.max_concurrency,
@@ -466,6 +603,10 @@ def create_app(
             {
                 "name": "OpenAI compatibility",
                 "description": "OpenAI-compatible model and chat endpoints.",
+            },
+            {
+                "name": "Factory extensions",
+                "description": "Guarded operations for bridge-created Droid sessions.",
             },
         ],
     )
@@ -496,7 +637,12 @@ def create_app(
 
     @application.exception_handler(BridgeHTTPError)
     async def handle_bridge_error(_request: Request, exc: BridgeHTTPError) -> JSONResponse:
-        return _error_response(exc.message, exc.status_code, exc.error_type)
+        return _error_response(
+            exc.message,
+            exc.status_code,
+            exc.error_type,
+            headers=exc.headers,
+        )
 
     @application.exception_handler(RequestValidationError)
     async def handle_validation_error(
@@ -508,6 +654,70 @@ def create_app(
             400,
             "invalid_request_error",
         )
+
+    async def run_factory_operation(
+        operation: Callable[[DroidRunner, float], Awaitable[FactoryOperationResult]],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> FactoryOperationResult:
+        timeout = min(
+            timeout_seconds or resolved_settings.timeout_seconds,
+            resolved_settings.timeout_seconds,
+        )
+        deadline = asyncio.get_running_loop().time() + timeout
+        try:
+            lease = await admission.acquire(deadline)
+        except AdmissionRejectedError as exc:
+            metrics.increment_overload_rejections()
+            raise BridgeHTTPError(
+                "Factory Droid request queue is full.",
+                status_code=429,
+                error_type="rate_limit_error",
+                headers={"Retry-After": str(resolved_settings.retry_after_seconds)},
+            ) from exc
+        except TimeoutError as exc:
+            raise BridgeHTTPError(
+                f"Factory Droid timed out after {timeout:.1f} seconds.",
+                status_code=504,
+                error_type="factory_droid_timeout",
+            ) from exc
+
+        async with lease:
+            try:
+                # A budget already spent in the queue is forwarded as-is; the
+                # runner's own timeout turns it into a 504.
+                remaining = deadline - asyncio.get_running_loop().time()
+                runner = resolved_runner_factory()
+                return await operation(runner, remaining)
+            except RunnerError as exc:
+                raise BridgeHTTPError(
+                    str(exc),
+                    status_code=exc.status_code,
+                    error_type=exc.error_type,
+                ) from exc
+
+    model_catalog = ModelCatalog(
+        ttl_seconds=resolved_settings.model_cache_seconds,
+        load=lambda: run_factory_operation(
+            lambda runner, remaining: runner.list_models(timeout_seconds=remaining),
+            timeout_seconds=min(30.0, resolved_settings.timeout_seconds),
+        ),
+    )
+
+    def require_known_session(session_id: str) -> None:
+        if not resolved_settings.session_continuity:
+            raise BridgeHTTPError(
+                "Session continuity is disabled on this bridge.",
+                status_code=400,
+                error_type="invalid_request_error",
+            )
+        if not sessions.knows(session_id):
+            raise BridgeHTTPError(
+                "Unknown Factory Droid session. Only sessions created by this "
+                "bridge process can be managed.",
+                status_code=404,
+                error_type="session_not_found",
+            )
 
     @application.get(
         "/health",
@@ -528,26 +738,152 @@ def create_app(
     @application.get(
         "/v1/models",
         response_model=ModelListResponse,
+        response_model_exclude_none=True,
         dependencies=[Depends(require_auth)],
-        responses={
-            "4XX": {
-                "model": ErrorResponse,
-                "description": "Bearer authentication failure.",
-            }
-        },
+        responses=MODEL_LIST_RESPONSES,
         tags=["OpenAI compatibility"],
-        summary="List the bridge model alias",
+        summary="List available Factory Droid models",
     )
-    async def models() -> ModelListResponse:
+    async def models(response: Response) -> ModelListResponse:
+        discovered, degraded = await model_catalog.get()
+        if degraded:
+            metrics.increment_model_discovery_failures()
+            response.headers["x-factory-droid-model-discovery"] = "degraded"
         return ModelListResponse(
-            data=[
-                ModelInfo(
-                    id=resolved_settings.model_alias,
-                    created=0,
-                    owned_by="factory",
-                )
-            ]
+            data=_model_list(
+                resolved_settings.model_alias,
+                discovered,
+                created=bridge_created,
+            )
         )
+
+    @application.get(
+        "/v1/factory/sessions/{session_id}/context",
+        response_model=SessionContextResponse,
+        dependencies=[Depends(require_auth)],
+        responses=FACTORY_OPERATION_RESPONSES,
+        tags=["Factory extensions"],
+        summary="Read Factory Droid context utilization",
+    )
+    async def session_context(session_id: str) -> SessionContextResponse:
+        require_known_session(session_id)
+        stats, breakdown = await run_factory_operation(
+            lambda runner, remaining: runner.get_context(
+                session_id,
+                timeout_seconds=remaining,
+            )
+        )
+        return SessionContextResponse(
+            session_id=session_id,
+            stats=ContextStatsResponse(
+                used=stats.used,
+                remaining=stats.remaining,
+                limit=stats.limit,
+                accuracy=stats.accuracy,
+                updated_at=stats.updated_at,
+            ),
+            breakdown=ContextBreakdownResponse(
+                model_id=breakdown.model_id,
+                model_display_name=breakdown.model_display_name,
+                context_budget=breakdown.context_budget,
+                used_tokens=breakdown.used_tokens,
+                free_tokens=breakdown.free_tokens,
+                categories=[
+                    ContextCategoryResponse(
+                        name=category.name,
+                        tokens=category.tokens,
+                        color_key=category.color_key,
+                    )
+                    for category in breakdown.categories
+                ],
+            ),
+        )
+
+    @application.post(
+        "/v1/factory/sessions/{session_id}/compact",
+        response_model=CompactSessionResponse,
+        dependencies=[Depends(require_auth)],
+        responses=FACTORY_OPERATION_RESPONSES,
+        tags=["Factory extensions"],
+        summary="Compact a Factory Droid session",
+    )
+    async def compact_session(
+        session_id: str,
+        payload: CompactSessionRequest,
+    ) -> CompactSessionResponse:
+        require_known_session(session_id)
+        result = await run_factory_operation(
+            lambda runner, remaining: runner.compact_session(
+                session_id,
+                custom_instructions=payload.custom_instructions,
+                timeout_seconds=remaining,
+            )
+        )
+        sessions.remember(result.new_session_id)
+        return CompactSessionResponse(
+            session_id=result.new_session_id,
+            removed_count=result.removed_count,
+        )
+
+    @application.post(
+        "/v1/factory/sessions/{session_id}/fork",
+        response_model=ForkSessionResponse,
+        dependencies=[Depends(require_auth)],
+        responses=FACTORY_OPERATION_RESPONSES,
+        tags=["Factory extensions"],
+        summary="Fork a Factory Droid session",
+    )
+    async def fork_session(session_id: str) -> ForkSessionResponse:
+        require_known_session(session_id)
+        new_session_id = await run_factory_operation(
+            lambda runner, remaining: runner.fork_session(
+                session_id,
+                timeout_seconds=remaining,
+            )
+        )
+        sessions.remember(new_session_id)
+        return ForkSessionResponse(session_id=new_session_id)
+
+    @application.patch(
+        "/v1/factory/sessions/{session_id}",
+        response_model=SessionOperationResponse,
+        dependencies=[Depends(require_auth)],
+        responses=FACTORY_OPERATION_RESPONSES,
+        tags=["Factory extensions"],
+        summary="Rename a Factory Droid session",
+    )
+    async def rename_session(
+        session_id: str,
+        payload: RenameSessionRequest,
+    ) -> SessionOperationResponse:
+        require_known_session(session_id)
+        await run_factory_operation(
+            lambda runner, remaining: runner.rename_session(
+                session_id,
+                title=payload.title,
+                timeout_seconds=remaining,
+            )
+        )
+        return SessionOperationResponse(session_id=session_id, status="renamed")
+
+    @application.delete(
+        "/v1/factory/sessions/{session_id}",
+        response_model=SessionOperationResponse,
+        dependencies=[Depends(require_auth)],
+        responses=FACTORY_OPERATION_RESPONSES,
+        tags=["Factory extensions"],
+        summary="Close a Factory Droid session",
+    )
+    async def close_session(session_id: str) -> SessionOperationResponse:
+        require_known_session(session_id)
+        await run_factory_operation(
+            lambda runner, remaining: runner.close_session(
+                session_id,
+                timeout_seconds=remaining,
+            )
+        )
+        sessions.forget(session_id)
+        return SessionOperationResponse(session_id=session_id, status="closed")
 
     @application.post(
         "/v1/chat/completions",
@@ -590,6 +926,11 @@ def create_app(
             session_id = payload.factory_droid_session_id
 
         try:
+            structured = _prepare_output_format(
+                payload,
+                max_schema_bytes=resolved_settings.max_tool_schema_bytes,
+                max_output_bytes=resolved_settings.max_structured_output_bytes,
+            )
             plan = build_prompt(
                 payload,
                 max_messages=resolved_settings.max_messages,
@@ -628,6 +969,7 @@ def create_app(
             images=tuple(image.to_sdk() for image in plan.attachments.images),
             documents=tuple(document.to_sdk() for document in plan.attachments.documents),
             session_id=session_id,
+            output_format=structured.payload if structured is not None else None,
         )
 
         try:
@@ -681,6 +1023,7 @@ def create_app(
                 emit_status=payload.factory_droid_status,
                 session_callback=sessions.remember,
                 expose_session=resolved_settings.session_continuity,
+                structured=structured,
             )
             return FinalizingStreamingResponse(
                 event_stream,
@@ -732,6 +1075,8 @@ def create_app(
                     if result.session_id is not None:
                         sessions.remember(result.session_id)
                         started_session = result.session_id
+                    if structured is not None:
+                        _validate_structured_output(result.text, structured)
                     total_usage = _add_usage(total_usage, result.usage)
                     choices.append(_choice_dict(result, index))
         except ProtocolError as exc:
@@ -758,11 +1103,19 @@ def create_app(
 
 
 class BridgeHTTPError(Exception):
-    def __init__(self, message: str, *, status_code: int, error_type: str) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        error_type: str,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.status_code = status_code
         self.error_type = error_type
+        self.headers = headers
 
 
 class CollectedCompletion:
@@ -899,6 +1252,7 @@ async def _stream_completion(
     emit_status: bool = False,
     session_callback: Callable[[str], None] | None = None,
     expose_session: bool = False,
+    structured: StructuredOutput | None = None,
 ) -> AsyncIterator[str]:
     usage = Usage()
     completed = False
@@ -907,6 +1261,23 @@ async def _stream_completion(
     outcome = "success"
     stop_buffer = StopSequenceBuffer(stop_sequences)
     tool_call_index = 0
+    structured_buffer = (
+        StructuredOutputBuffer(structured.max_bytes) if structured is not None else None
+    )
+
+    def text_chunk(text: str) -> str | None:
+        if structured_buffer is not None:
+            structured_buffer.append(text)
+            return None
+        return _sse(
+            _chunk_for_emission(
+                request_id,
+                created,
+                model,
+                TextEmission(text),
+                include_usage=include_usage,
+            )
+        )
 
     async with lease:
         yield _sse(
@@ -943,15 +1314,9 @@ async def _stream_completion(
                                 continue
                             text = stop_buffer.feed(emission.text)
                             if text:
-                                yield _sse(
-                                    _chunk_for_emission(
-                                        request_id,
-                                        created,
-                                        model,
-                                        TextEmission(text),
-                                        include_usage=include_usage,
-                                    )
-                                )
+                                chunk_payload = text_chunk(text)
+                                if chunk_payload is not None:
+                                    yield chunk_payload
                         if stop_buffer.triggered:
                             # Closing the runner generator interrupts the Droid
                             # turn instead of draining output nobody will read.
@@ -1012,41 +1377,28 @@ async def _stream_completion(
                 )
             if not stop_buffer.triggered:
                 for emission in parser.finish():
-                    if isinstance(emission, ToolCallEmission):
-                        saw_tool_call = True
-                        chunk = _chunk_for_emission(
-                            request_id,
-                            created,
-                            model,
-                            emission,
-                            include_usage=include_usage,
-                            tool_call_index=tool_call_index,
-                        )
-                        tool_call_index += 1
-                        yield _sse(chunk)
-                        continue
                     text = stop_buffer.feed(emission.text)
                     if text:
-                        yield _sse(
-                            _chunk_for_emission(
-                                request_id,
-                                created,
-                                model,
-                                TextEmission(text),
-                                include_usage=include_usage,
-                            )
-                        )
+                        chunk_payload = text_chunk(text)
+                        if chunk_payload is not None:
+                            yield chunk_payload
                 held = stop_buffer.flush()
                 if held:
-                    yield _sse(
-                        _chunk_for_emission(
-                            request_id,
-                            created,
-                            model,
-                            TextEmission(held),
-                            include_usage=include_usage,
-                        )
+                    chunk_payload = text_chunk(held)
+                    if chunk_payload is not None:
+                        yield chunk_payload
+            if structured is not None and structured_buffer is not None:
+                structured_text = structured_buffer.text()
+                _validate_structured_output(structured_text, structured)
+                yield _sse(
+                    _chunk_for_emission(
+                        request_id,
+                        created,
+                        model,
+                        TextEmission(structured_text),
+                        include_usage=include_usage,
                     )
+                )
             yield _sse(
                 _chunk(
                     request_id,
@@ -1091,7 +1443,7 @@ async def _finalize_stream(
 
 def _apply_emissions(
     result: CollectedCompletion,
-    emissions: list[ProtocolEmission],
+    emissions: Sequence[ProtocolEmission],
     stop_buffer: StopSequenceBuffer | None = None,
 ) -> None:
     for emission in emissions:
@@ -1211,7 +1563,125 @@ def _validate_options(
             400,
             "invalid_request_error",
         )
+    if payload.response_format is not None and payload.stop_sequences:
+        return _error_response(
+            "stop is not supported together with response_format.",
+            400,
+            "invalid_request_error",
+        )
+    if payload.response_format is not None and payload.tools and payload.tool_choice != "none":
+        return _error_response(
+            "tools are not supported together with response_format on this bridge.",
+            400,
+            "invalid_request_error",
+        )
     return None
+
+
+def _model_list(
+    alias: str,
+    discovered: tuple[DroidModel, ...],
+    *,
+    created: int,
+) -> list[ModelInfo]:
+    models = [
+        ModelInfo(
+            id=alias,
+            created=created,
+            owned_by="factory",
+        )
+    ]
+    seen = {alias}
+    for model in discovered:
+        if model.id in seen:
+            continue
+        seen.add(model.id)
+        models.append(
+            ModelInfo(
+                id=model.id,
+                created=created,
+                owned_by=model.provider,
+                factory_droid_display_name=model.display_name,
+                factory_droid_supported_reasoning_efforts=list(model.supported_reasoning_efforts),
+                factory_droid_default_reasoning_effort=model.default_reasoning_effort,
+                factory_droid_supports_images=model.supports_images,
+                factory_droid_supports_pdfs=model.supports_pdfs,
+            )
+        )
+    return models
+
+
+def _prepare_output_format(
+    payload: ChatCompletionRequest,
+    *,
+    max_schema_bytes: int,
+    max_output_bytes: int,
+) -> StructuredOutput | None:
+    response_format = payload.response_format
+    if response_format is None:
+        return None
+    if response_format.type == "json_object":
+        schema: dict[str, Any] = {
+            "type": "object",
+            "additionalProperties": True,
+        }
+    else:
+        schema = response_format.json_schema.schema_
+        if schema.get("type") != "object":
+            raise ProtocolError("response_format JSON schema must have type 'object'")
+    serialized = json.dumps(
+        schema,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+    if len(serialized.encode("utf-8")) > max_schema_bytes:
+        raise RequestTooLargeError(
+            f"response_format schema exceeds maximum of {max_schema_bytes} bytes"
+        )
+    _reject_remote_schema_refs(schema)
+    validator_class = validator_for(schema)
+    try:
+        validator_class.check_schema(schema)
+    except SchemaError as exc:
+        raise ProtocolError(
+            f"response_format contains an invalid JSON schema: {exc.message}"
+        ) from exc
+    return StructuredOutput(
+        payload={"type": "json_schema", "schema": schema},
+        validator=validator_class(schema),
+        max_bytes=max_output_bytes,
+    )
+
+
+def _validate_structured_output(text: str, structured: StructuredOutput) -> None:
+    if len(text.encode("utf-8")) > structured.max_bytes:
+        raise ProtocolError(
+            f"Factory Droid structured output exceeds maximum of {structured.max_bytes} bytes"
+        )
+    try:
+        value = parse_strict_json(text)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ProtocolError("Factory Droid returned invalid structured JSON output") from exc
+    try:
+        structured.validator.validate(value)
+    except JsonSchemaValidationError as exc:
+        raise ProtocolError(
+            f"Factory Droid structured output violated the requested schema: {exc.message}"
+        ) from exc
+
+
+def _reject_remote_schema_refs(value: Any) -> None:
+    if isinstance(value, dict):
+        for keyword in ("$ref", "$dynamicRef", "$recursiveRef"):
+            reference = value.get(keyword)
+            if isinstance(reference, str) and not reference.startswith("#"):
+                raise ProtocolError("response_format does not allow remote JSON schema references")
+        for item in value.values():
+            _reject_remote_schema_refs(item)
+    elif isinstance(value, list):
+        for item in value:
+            _reject_remote_schema_refs(item)
 
 
 def _choice_dict(result: CollectedCompletion, index: int) -> dict[str, Any]:

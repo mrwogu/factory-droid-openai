@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -28,6 +29,7 @@ __all__ = [
     "ToolCallEmission",
     "ToolCallStreamParser",
     "build_prompt",
+    "parse_strict_json",
 ]
 
 
@@ -257,10 +259,11 @@ class ToolCallStreamParser:
             return self._consume_tool_payload(chunk)
         return self._consume_text(chunk)
 
-    def finish(self) -> list[ProtocolEmission]:
+    def finish(self) -> list[TextEmission]:
+        """Flushes buffered text. A tool call can only complete inside ``feed``."""
         if self._capturing:
             raise ProtocolError("incomplete tool-call marker")
-        emissions: list[ProtocolEmission] = []
+        emissions: list[TextEmission] = []
         if self._text_tail:
             # After a tool call only whitespace may separate further calls; any
             # residual non-whitespace is trailing output and must fail closed.
@@ -359,7 +362,7 @@ class ToolCallStreamParser:
         if not self._allowed_tool_names:
             raise ProtocolError("the model requested a tool when none are available")
         try:
-            parsed = json.loads(payload, object_pairs_hook=_reject_duplicate_keys)
+            parsed = parse_strict_json(payload)
         except (json.JSONDecodeError, ValueError) as exc:
             raise ProtocolError(f"invalid tool-call JSON: {exc}") from exc
         if not isinstance(parsed, dict):
@@ -431,6 +434,21 @@ class StopSequenceBuffer:
         return held
 
 
+def parse_strict_json(text: str) -> Any:
+    """Parses model-generated JSON, rejecting everything outside RFC 8259.
+
+    Duplicate keys, ``NaN``/``Infinity`` literals and numbers that overflow to
+    a non-finite float are all refused, so a caller never forwards a value a
+    strict JSON parser on the client side would reject.
+    """
+    return json.loads(
+        text,
+        object_pairs_hook=_reject_duplicate_keys,
+        parse_constant=_reject_non_json_constant,
+        parse_float=_parse_finite_float,
+    )
+
+
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -438,6 +456,17 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise ValueError(f"duplicate key '{key}'")
         result[key] = value
     return result
+
+
+def _reject_non_json_constant(value: str) -> None:
+    raise ValueError(f"non-JSON numeric constant '{value}'")
+
+
+def _parse_finite_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite number '{value}'")
+    return parsed
 
 
 def _serialize_json(value: Any) -> tuple[str, int]:

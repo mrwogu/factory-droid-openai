@@ -7,7 +7,7 @@ import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 
 from droid_sdk import (
     AssistantTextDelta,
@@ -25,7 +25,18 @@ from droid_sdk import (
     WorkingStateChanged,
 )
 from droid_sdk import TimeoutError as DroidTimeoutError
-from droid_sdk.schemas.enums import AutonomyLevel, ReasoningEffort
+from droid_sdk.schemas.enums import (
+    AutonomyLevel,
+    DroidInteractionMode,
+    ReasoningEffort,
+)
+
+from factory_droid_openai.droid_rpc import (
+    CompactionResult,
+    ContextBreakdown,
+    ContextStats,
+    DroidRpcExtension,
+)
 
 # droid exec flags the SDK's ProcessTransport always passes. Overriding
 # exec_args replaces this list wholesale, so extra flags must be appended
@@ -63,6 +74,18 @@ class RunRequest:
     images: tuple[dict[str, Any], ...] = ()
     documents: tuple[dict[str, Any], ...] = ()
     session_id: str | None = None
+    output_format: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DroidModel:
+    id: str
+    display_name: str
+    provider: str
+    supported_reasoning_efforts: tuple[str, ...]
+    default_reasoning_effort: str
+    supports_images: bool
+    supports_pdfs: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +128,7 @@ class StatusUpdate:
 
 RunEvent = TextDelta | ReasoningDelta | UsageUpdate | RunComplete | SessionStarted | StatusUpdate
 ClientFactory = Callable[[str, Path], DroidClient]
+OperationResult = TypeVar("OperationResult")
 
 
 class RunnerMetrics(Protocol):
@@ -183,6 +207,7 @@ class DroidRunner:
         metrics: RunnerMetrics | None = None,
         worktree: str | None = None,
         append_system_prompt_file: Path | None = None,
+        rpc_extension: DroidRpcExtension | None = None,
     ) -> None:
         self._droid_path = droid_path
         self._workdir = workdir
@@ -190,6 +215,7 @@ class DroidRunner:
         self._process_grace_seconds = process_grace_seconds
         self._cleanup_timeout_seconds = cleanup_timeout_seconds
         self._metrics = metrics
+        self._rpc = rpc_extension or DroidRpcExtension()
         self._exec_args = _build_exec_args(
             worktree=worktree,
             append_system_prompt_file=append_system_prompt_file,
@@ -226,25 +252,40 @@ class DroidRunner:
                 if request.session_id is not None:
                     # Continuation: reuse the stored Droid session so only the
                     # new turn is sent instead of the whole transcript.
-                    await client.load_session(session_id=request.session_id)
+                    await client.load_session(
+                        session_id=request.session_id,
+                        mcp_servers=[],
+                    )
                 else:
                     await client.initialize_session(
                         machine_id="factory-droid-openai",
                         cwd=str(self._workdir),
+                        mcp_servers=[],
                         model_id=_resolve_model_id(request.model, request.model_alias),
                         reasoning_effort=reasoning_effort,
+                        interaction_mode=DroidInteractionMode.Auto,
                         autonomy_level=AutonomyLevel.Off,
                         skip_permissions_unsafe=False,
                         enabled_tool_ids=[],
                     )
                 initialized = True
+                await self._rpc.disable_native_tools(client)
                 if client.session_id is not None:
                     yield SessionStarted(client.session_id)
-                await client.add_user_message(
-                    text=request.prompt,
-                    images=list(request.images) or None,
-                    files=list(request.documents) or None,
-                )
+                if request.output_format is None:
+                    await client.add_user_message(
+                        text=request.prompt,
+                        images=list(request.images) or None,
+                        files=list(request.documents) or None,
+                    )
+                else:
+                    await self._rpc.add_user_message(
+                        client,
+                        text=request.prompt,
+                        images=list(request.images) or None,
+                        files=list(request.documents) or None,
+                        output_format=request.output_format,
+                    )
 
                 async for event in client.receive_response():
                     if isinstance(event, AssistantTextDelta):
@@ -299,6 +340,185 @@ class DroidRunner:
                     interrupt=initialized and not completed,
                 )
             )
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                await cleanup_task
+                raise
+
+    async def list_models(self, *, timeout_seconds: float) -> tuple[DroidModel, ...]:
+        async def operation(client: DroidClient) -> tuple[DroidModel, ...]:
+            result = await client.initialize_session(
+                machine_id="factory-droid-openai-models",
+                cwd=str(self._workdir),
+                mcp_servers=[],
+                interaction_mode=DroidInteractionMode.Auto,
+                autonomy_level=AutonomyLevel.Off,
+                skip_permissions_unsafe=False,
+                enabled_tool_ids=[],
+            )
+            models = result.available_models or []
+            await self._rpc.close_session(client, reason="clear")
+            return tuple(
+                DroidModel(
+                    id=model.id,
+                    display_name=model.display_name,
+                    provider=_state_value(model.model_provider),
+                    supported_reasoning_efforts=tuple(
+                        _state_value(effort) for effort in model.supported_reasoning_efforts
+                    ),
+                    default_reasoning_effort=_state_value(model.default_reasoning_effort),
+                    supports_images=not bool(model.no_image_support),
+                    supports_pdfs=bool(model.supports_pdfs),
+                )
+                for model in models
+            )
+
+        return await self._session_operation(
+            operation,
+            timeout_seconds=timeout_seconds,
+        )
+
+    async def get_context(
+        self,
+        session_id: str,
+        *,
+        timeout_seconds: float,
+    ) -> tuple[ContextStats, ContextBreakdown]:
+        async def operation(
+            client: DroidClient,
+        ) -> tuple[ContextStats, ContextBreakdown]:
+            stats, breakdown = await asyncio.gather(
+                self._rpc.get_context_stats(client),
+                self._rpc.get_context_breakdown(client),
+            )
+            return stats, breakdown
+
+        return await self._loaded_session_operation(
+            session_id,
+            operation,
+            timeout_seconds=timeout_seconds,
+            disable_tools=False,
+        )
+
+    async def compact_session(
+        self,
+        session_id: str,
+        *,
+        custom_instructions: str | None,
+        timeout_seconds: float,
+    ) -> CompactionResult:
+        async def operation(client: DroidClient) -> CompactionResult:
+            return await self._rpc.compact_session(
+                client,
+                custom_instructions=custom_instructions,
+            )
+
+        return await self._loaded_session_operation(
+            session_id,
+            operation,
+            timeout_seconds=timeout_seconds,
+        )
+
+    async def fork_session(self, session_id: str, *, timeout_seconds: float) -> str:
+        return await self._loaded_session_operation(
+            session_id,
+            self._rpc.fork_session,
+            timeout_seconds=timeout_seconds,
+            disable_tools=False,
+        )
+
+    async def rename_session(
+        self,
+        session_id: str,
+        *,
+        title: str,
+        timeout_seconds: float,
+    ) -> None:
+        async def operation(client: DroidClient) -> None:
+            await self._rpc.rename_session(client, title=title)
+
+        await self._loaded_session_operation(
+            session_id,
+            operation,
+            timeout_seconds=timeout_seconds,
+            disable_tools=False,
+        )
+
+    async def close_session(self, session_id: str, *, timeout_seconds: float) -> None:
+        async def operation(client: DroidClient) -> None:
+            await self._rpc.close_session(client)
+
+        await self._loaded_session_operation(
+            session_id,
+            operation,
+            timeout_seconds=timeout_seconds,
+            disable_tools=False,
+        )
+
+    async def _loaded_session_operation(
+        self,
+        session_id: str,
+        operation: Callable[[DroidClient], Awaitable[OperationResult]],
+        *,
+        timeout_seconds: float,
+        disable_tools: bool = True,
+    ) -> OperationResult:
+        async def loaded(client: DroidClient) -> OperationResult:
+            await client.load_session(session_id=session_id, mcp_servers=[])
+            # Metadata-only operations never run a model turn, so they neither
+            # need the tool guard nor should they rewrite session settings.
+            if disable_tools:
+                await self._rpc.disable_native_tools(client)
+            return await operation(client)
+
+        return await self._session_operation(
+            loaded,
+            timeout_seconds=timeout_seconds,
+            session_id=session_id,
+        )
+
+    async def _session_operation(
+        self,
+        operation: Callable[[DroidClient], Awaitable[OperationResult]],
+        *,
+        timeout_seconds: float,
+        session_id: str | None = None,
+    ) -> OperationResult:
+        client, transport = self._new_client()
+        client.set_permission_handler(lambda _params: "cancel")
+        client.set_ask_user_handler(
+            lambda _params: {"cancelled": True, "answers": []},
+        )
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                await client.connect()
+                return await operation(client)
+        except (TimeoutError, DroidTimeoutError) as exc:
+            raise RunnerError(
+                f"Factory Droid timed out after {timeout_seconds:.1f} seconds.",
+                status_code=504,
+                error_type="factory_droid_timeout",
+            ) from exc
+        except FileNotFoundError as exc:
+            raise RunnerError(
+                f"Factory Droid executable was not found: {self._droid_path}",
+                status_code=503,
+                error_type="factory_droid_unavailable",
+            ) from exc
+        except SessionNotFoundError as exc:
+            raise RunnerError(
+                f"Factory Droid session '{session_id}' was not found.",
+                status_code=404,
+                error_type="session_not_found",
+            ) from exc
+        except DroidClientError as exc:
+            raise RunnerError(
+                f"Factory Droid SDK failed: {exc}",
+                error_type="factory_droid_sdk_error",
+            ) from exc
+        finally:
+            cleanup_task = asyncio.create_task(self._cleanup(client, transport, interrupt=False))
             try:
                 await asyncio.shield(cleanup_task)
             except asyncio.CancelledError:

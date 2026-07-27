@@ -5,6 +5,7 @@ import os
 import sys
 import textwrap
 import time
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
 import pytest
@@ -23,6 +24,7 @@ from droid_sdk import TimeoutError as DroidTimeoutError
 from droid_sdk.errors import SessionNotFoundError
 from droid_sdk.schemas.enums import (
     AutonomyLevel,
+    DroidInteractionMode,
     DroidWorkingState,
     ReasoningEffort,
 )
@@ -64,6 +66,10 @@ class FakeClient:
         self.init_kwargs: dict[str, Any] = {}
         self.permission_handler: Any = None
         self.ask_user_handler: Any = None
+        self.rpc_requests: list[tuple[str, dict[str, Any], float | None]] = []
+        self.disabled_tool_ids: set[str] = set()
+        self.output_format: dict[str, Any] | None = None
+        self._protocol = self
 
     def set_permission_handler(self, handler: Any) -> None:
         self.permission_handler = handler
@@ -77,7 +83,13 @@ class FakeClient:
     async def initialize_session(self, **kwargs: Any) -> None:
         self.init_kwargs = kwargs
 
-    async def load_session(self, *, session_id: str) -> None:
+    async def load_session(
+        self,
+        *,
+        session_id: str,
+        mcp_servers: list[dict[str, Any]] | None = None,
+    ) -> None:
+        del mcp_servers
         self.loaded_session_id = session_id
         self.session_id = session_id
 
@@ -91,6 +103,45 @@ class FakeClient:
         self.prompt = text
         self.images = images
         self.files = files
+
+    async def send_request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        timeout: float | None = None,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        del request_id
+        self.rpc_requests.append((method, params, timeout))
+        if method == "droid.list_mcp_servers":
+            return {"result": {"servers": []}}
+        if method == "droid.list_tools":
+            return {
+                "result": {
+                    "tools": [
+                        {
+                            "id": "read-cli",
+                            "currentlyAllowed": "read-cli" not in self.disabled_tool_ids,
+                        },
+                        {
+                            "id": "exit-spec-mode",
+                            "currentlyAllowed": True,
+                        },
+                    ]
+                }
+            }
+        if method == "droid.update_session_settings":
+            self.disabled_tool_ids = set(params["disabledToolIds"])
+            return {"result": {}}
+        if method == "droid.add_user_message":
+            self.prompt = params["text"]
+            self.images = params.get("images")
+            self.files = params.get("files")
+            self.output_format = params.get("outputFormat")
+            return {"result": {}}
+        if method in {"droid.close_session", "droid.rename_session"}:
+            return {"result": {"success": True}}
+        raise AssertionError(f"unexpected RPC method: {method}")
 
     async def receive_response(self) -> AsyncIterator[object]:
         for event in self.events:
@@ -150,7 +201,10 @@ async def test_runner_maps_sdk_stream_and_usage(tmp_path: Path) -> None:
     assert events[3].usage.cache_read_tokens == 3
     assert client.init_kwargs["model_id"] is None
     assert client.init_kwargs["reasoning_effort"] is ReasoningEffort.High
+    assert client.init_kwargs["interaction_mode"] is DroidInteractionMode.Auto
     assert client.init_kwargs["autonomy_level"] is AutonomyLevel.Off
+    assert client.init_kwargs["mcp_servers"] == []
+    assert client.disabled_tool_ids == {"read-cli", "exit-spec-mode"}
     assert client.permission_handler({}) == "cancel"
     assert client.ask_user_handler({}) == {"cancelled": True, "answers": []}
     assert client.closed is True
@@ -517,7 +571,13 @@ async def test_runner_loads_existing_session_instead_of_initializing(
 @pytest.mark.asyncio
 async def test_runner_reports_unknown_session_as_not_found(tmp_path: Path) -> None:
     class MissingSessionClient(FakeClient):
-        async def load_session(self, *, session_id: str) -> None:
+        async def load_session(
+            self,
+            *,
+            session_id: str,
+            mcp_servers: list[dict[str, Any]] | None = None,
+        ) -> None:
+            del mcp_servers
             raise SessionNotFoundError(session_id)
 
     client = MissingSessionClient([])
@@ -555,6 +615,64 @@ async def test_runner_forwards_attachments_to_the_sdk(tmp_path: Path) -> None:
 
     assert client.images == [image]
     assert client.files == [document]
+
+
+@pytest.mark.asyncio
+async def test_runner_forwards_structured_output_through_raw_rpc(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient([AssistantTextDelta('{"answer":7}'), TurnComplete()])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+    output_format = {
+        "type": "json_schema",
+        "schema": {"type": "object", "properties": {"answer": {"type": "integer"}}},
+    }
+
+    events = await _collect(runner, _request(output_format=output_format))
+
+    assert TextDelta('{"answer":7}') in events
+    assert client.output_format == output_format
+    assert client.prompt == "prompt"
+
+
+@pytest.mark.asyncio
+async def test_runner_fails_before_prompt_if_native_tools_remain_enabled(
+    tmp_path: Path,
+) -> None:
+    class UnsafeClient(FakeClient):
+        async def send_request(
+            self,
+            method: str,
+            params: dict[str, Any],
+            timeout: float | None = None,
+            request_id: str | None = None,
+        ) -> dict[str, Any]:
+            if method == "droid.list_tools":
+                return {
+                    "result": {
+                        "tools": [
+                            {"id": "execute-cli", "currentlyAllowed": True},
+                        ]
+                    }
+                }
+            return await super().send_request(method, params, timeout, request_id)
+
+    client = UnsafeClient([TurnComplete()])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    with pytest.raises(RunnerError, match="Failed to disable native Droid tools"):
+        await _collect(runner, _request())
+
+    assert client.prompt == ""
+    assert client.interrupted is True
 
 
 @pytest.mark.asyncio
@@ -731,4 +849,184 @@ async def test_cleanup_completes_when_the_caller_is_cancelled_again(
 
     with pytest.raises(asyncio.CancelledError):
         await task
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_runner_discovers_models_from_session_initialization(
+    tmp_path: Path,
+) -> None:
+    class ModelClient(FakeClient):
+        async def initialize_session(self, **kwargs: Any) -> Any:
+            await super().initialize_session(**kwargs)
+            return SimpleNamespace(
+                available_models=[
+                    SimpleNamespace(
+                        id="gpt-5.4",
+                        display_name="GPT-5.4",
+                        model_provider=SimpleNamespace(value="openai"),
+                        supported_reasoning_efforts=[
+                            ReasoningEffort.Low,
+                            ReasoningEffort.High,
+                        ],
+                        default_reasoning_effort=ReasoningEffort.High,
+                        no_image_support=False,
+                        supports_pdfs=True,
+                    )
+                ]
+            )
+
+    client = ModelClient([])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    models = await runner.list_models(timeout_seconds=1)
+
+    assert models[0].id == "gpt-5.4"
+    assert models[0].provider == "openai"
+    assert models[0].supported_reasoning_efforts == ("low", "high")
+    assert models[0].supports_images is True
+    assert models[0].supports_pdfs is True
+    assert ("droid.close_session", {"reason": "clear"}, 30.0) in client.rpc_requests
+
+
+@pytest.mark.asyncio
+async def test_runner_exposes_guarded_session_rpc_operations(tmp_path: Path) -> None:
+    class SessionOperationClient(FakeClient):
+        async def send_request(
+            self,
+            method: str,
+            params: dict[str, Any],
+            timeout: float | None = None,
+            request_id: str | None = None,
+        ) -> dict[str, Any]:
+            if method == "droid.get_context_stats":
+                return {
+                    "result": {
+                        "used": 10,
+                        "remaining": 90,
+                        "limit": 100,
+                        "accuracy": "exact",
+                        "updatedAt": "now",
+                    }
+                }
+            if method == "droid.get_context_breakdown":
+                return {
+                    "result": {
+                        "modelId": "gpt-5.4",
+                        "modelDisplayName": "GPT-5.4",
+                        "contextBudget": 100,
+                        "usedTokens": 10,
+                        "freeTokens": 90,
+                        "categories": [{"name": "messages", "tokens": 10, "colorKey": "blue"}],
+                    }
+                }
+            if method == "droid.compact_session":
+                return {"result": {"newSessionId": "compact", "removedCount": 3}}
+            if method == "droid.fork_session":
+                return {"result": {"newSessionId": "fork"}}
+            return await super().send_request(method, params, timeout, request_id)
+
+    client = SessionOperationClient([])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    stats, breakdown = await runner.get_context("session", timeout_seconds=1)
+    compacted = await runner.compact_session(
+        "session",
+        custom_instructions="Keep decisions.",
+        timeout_seconds=1,
+    )
+    forked = await runner.fork_session("session", timeout_seconds=1)
+    await runner.rename_session(
+        "session",
+        title="Title",
+        timeout_seconds=1,
+    )
+    await runner.close_session("session", timeout_seconds=1)
+
+    assert stats.used == 10
+    assert breakdown.categories[0].name == "messages"
+    assert compacted.new_session_id == "compact"
+    assert compacted.removed_count == 3
+    assert forked == "fork"
+    assert client.loaded_session_id == "session"
+    assert any(method == "droid.rename_session" for method, _, _ in client.rpc_requests)
+    assert any(method == "droid.close_session" for method, _, _ in client.rpc_requests)
+    # Metadata operations run no model turn, so they must not touch the tool
+    # catalog or rewrite session settings. Compaction does run a turn.
+    assert [method for method, _, _ in client.rpc_requests].count(
+        "droid.update_session_settings"
+    ) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "status_code", "error_type"),
+    [
+        (SessionNotFoundError("session"), 404, "session_not_found"),
+        (FileNotFoundError("droid"), 503, "factory_droid_unavailable"),
+        (DroidClientError("broken"), 502, "factory_droid_sdk_error"),
+        (DroidTimeoutError("slow"), 504, "factory_droid_timeout"),
+    ],
+)
+async def test_session_operations_map_sdk_failures(
+    tmp_path: Path,
+    failure: Exception,
+    status_code: int,
+    error_type: str,
+) -> None:
+    class FailingClient(FakeClient):
+        async def load_session(
+            self,
+            *,
+            session_id: str,
+            mcp_servers: list[dict[str, Any]] | None = None,
+        ) -> None:
+            del session_id, mcp_servers
+            raise failure
+
+    client = FailingClient([])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    with pytest.raises(RunnerError) as excinfo:
+        await runner.rename_session("session", title="Title", timeout_seconds=1)
+
+    assert excinfo.value.status_code == status_code
+    assert excinfo.value.error_type == error_type
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_session_operations_time_out_on_a_slow_droid(tmp_path: Path) -> None:
+    class SlowClient(FakeClient):
+        async def load_session(
+            self,
+            *,
+            session_id: str,
+            mcp_servers: list[dict[str, Any]] | None = None,
+        ) -> None:
+            del session_id, mcp_servers
+            await asyncio.sleep(1)
+
+    client = SlowClient([])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    with pytest.raises(RunnerError, match="timed out"):
+        await runner.close_session("session", timeout_seconds=0.01)
+
     assert client.closed is True

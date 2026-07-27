@@ -1,4 +1,5 @@
 .venv/
+.env
 .code-review-graph/
 .mypy_cache/
 .pytest_cache/
