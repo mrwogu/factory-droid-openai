@@ -142,6 +142,8 @@ Droid's configured default.
 - Optional constant-time bearer authentication
 - Bounded request timeout, payload size, and process concurrency
 - Queue-based admission control and Prometheus-style metrics
+- Warm Droid session pool and detached teardown for low request latency
+- Structured phase-timed logging in text or JSON
 - Inline image and document attachments over the native SDK channel
 - Stop sequences, `n` choices, and multiple tool calls per turn
 - Optional Droid session continuity across requests
@@ -1028,28 +1030,6 @@ Admission control then bounds how many requests reach Droid. Requests beyond
 `FACTORY_DROID_OPENAI_MAX_QUEUE_SIZE`; once that is full the bridge answers
 `429` with a `Retry-After` header rather than queueing without limit.
 
-## Warm sessions
-
-Starting a Droid session takes about three seconds, and tearing one down
-costs another second, so by default the bridge keeps
-`FACTORY_DROID_OPENAI_WARM_SESSIONS` sessions initialized and idle and hands
-one to each incoming request. A warm session serves a single turn and is then
-discarded, so requests stay isolated exactly as before.
-
-Warm sessions are keyed by model and reasoning effort, because switching the
-model on a live session costs as much as starting a new one. The pool tracks
-the settings recent traffic used and rebalances itself when clients switch
-models; the first request for a new model still starts its own session and
-shows up as `pool.miss`.
-
-Teardown runs after the response is finished, so the grace period and the
-final kill no longer delay the last token. Set
-`FACTORY_DROID_OPENAI_DETACHED_CLEANUP=false` to wait for teardown on the
-request path instead, and `FACTORY_DROID_OPENAI_WARM_SESSIONS=0` to disable
-pre-warming. Both keep one Droid process per request either way; warm
-sessions only move the startup cost off the request path, and each idle
-session holds a Droid process while it waits.
-
 `GET /metrics` renders Prometheus-style text. It is excluded from the OpenAPI
 contract because it is an operational endpoint, not part of the OpenAI API
 surface.
@@ -1074,10 +1054,46 @@ surface.
 | `factory_droid_openai_pending_reaps` | Droid teardowns still running in the background |
 
 `forced_kills_total` counts any process that did not exit within its grace
-period, so treat it as an upper bound on genuinely stuck processes.
+period. `droid exec` usually keeps running after its session is closed, so in
+practice most requests end with a kill and the counter tracks traffic rather
+than stuck processes.
 
 Serve `/metrics` on a loopback interface or behind your own access control;
 it carries no prompt content, but it does expose traffic shape.
+
+## Warm sessions
+
+Starting a Droid session and tearing it down again dominates the cost of a
+short request. Measured on an Apple M-series laptop with a trivial prompt:
+
+| Phase | Cost | On the request path? |
+|---|---:|---|
+| `droid exec` spawn and JSON-RPC connect | 3 ms | yes |
+| `droid.initialize_session` | 2.4-3.2 s | no, pre-warmed |
+| Disabling Factory-native tools | 6 ms | no, pre-warmed |
+| Prompt serialization and send | 4 ms | yes |
+| Model time to first token | 2.8-3.8 s | yes |
+| Session close, grace period, kill | 1.0 s | no, detached |
+
+So the bridge keeps `FACTORY_DROID_OPENAI_WARM_SESSIONS` sessions initialized
+and idle, and hands one to each incoming request. A warm session serves a
+single turn and is then discarded, so requests stay isolated exactly as
+before. End to end, the same prompt drops from about 7.2 s to about 2.8 s,
+leaving little more than model time.
+
+Warm sessions are keyed by model and reasoning effort, because switching the
+model on a live session costs about 2 s, as much as starting a new one. The
+pool tracks the settings recent traffic used and rebalances itself when
+clients switch models; the first request for a new model still starts its own
+session and logs `pool.miss`.
+
+Teardown runs after the response is finished, so the grace period and the
+final kill no longer delay the last token. Set
+`FACTORY_DROID_OPENAI_DETACHED_CLEANUP=false` to wait for teardown on the
+request path instead, and `FACTORY_DROID_OPENAI_WARM_SESSIONS=0` to disable
+pre-warming. Either way one Droid process serves one request; warm sessions
+only move the startup cost off the request path, and each idle session holds
+a Droid process while it waits.
 
 ## Logging
 
@@ -1096,18 +1112,22 @@ factory-droid-openai --log-level debug --no-access-log
 |---|---|
 | `warning` | Rejections, failures, degraded model discovery, forced process kills |
 | `info` | One `chat.completed` summary per request with phase timings and token usage |
-| `debug` | Per-phase events: prompt built, admission, Droid startup, session ready, first token, turn complete, cleanup |
+| `debug` | Per-phase events: prompt built, admission, warm-session hit or miss, Droid startup, session ready, first token, turn complete, cleanup |
 | `trace` | One line per Droid SDK event kind |
 
 ```text
 DEBUG    2026-07-27T14:10:02+0200 event=chat.received request_id=chatcmpl-8f2a model=gpt-5.4 stream=true messages=6 tools=14
 DEBUG    2026-07-27T14:10:02+0200 event=chat.prompt_built request_id=chatcmpl-8f2a prompt_bytes=48213 allowed_tools=14 prompt_ms=7.9
 DEBUG    2026-07-27T14:10:02+0200 event=chat.admitted request_id=chatcmpl-8f2a queue_ms=0.2
-DEBUG    2026-07-27T14:10:04+0200 event=droid.connected request_id=chatcmpl-8f2a droid_startup_ms=1811.4
-DEBUG    2026-07-27T14:10:05+0200 event=droid.session_ready request_id=chatcmpl-8f2a session_ready_ms=2530.6
-DEBUG    2026-07-27T14:10:07+0200 event=chat.first_token request_id=chatcmpl-8f2a ttft_ms=4402.1
-INFO     2026-07-27T14:10:12+0200 event=chat.completed request_id=chatcmpl-8f2a outcome=success stream=true input_tokens=9123 output_tokens=412 total_ms=9860.3
+DEBUG    2026-07-27T14:10:02+0200 event=pool.hit request_id=chatcmpl-8f2a model=gpt-5.4 warm_sessions=1
+DEBUG    2026-07-27T14:10:02+0200 event=droid.session_ready request_id=chatcmpl-8f2a warm=true session_ready_ms=3.1
+DEBUG    2026-07-27T14:10:06+0200 event=chat.first_token request_id=chatcmpl-8f2a ttft_ms=3908.4
+INFO     2026-07-27T14:10:11+0200 event=chat.completed request_id=chatcmpl-8f2a outcome=success stream=true input_tokens=9123 output_tokens=412 total_ms=8712.6
+WARNING  2026-07-27T14:10:12+0200 event=droid.forced_kill request_id=chatcmpl-8f2a cleanup_ms=1014.1
 ```
+
+`droid.connected` and `droid_startup_ms` only appear on a cold session, and
+`droid.forced_kill` is logged after the response because cleanup is detached.
 
 Phase fields, in the order they occur:
 
@@ -1120,7 +1140,7 @@ Phase fields, in the order they occur:
 | `prompt_sent_ms` | Elapsed until the prompt was handed to Droid |
 | `ttft_ms` | Elapsed until the first text or reasoning delta |
 | `turn_ms` | Elapsed until Droid reported turn completion |
-| `total_ms` | Whole request, including cleanup and response encoding |
+| `total_ms` | Whole request, including response encoding |
 
 One Droid process serves each request. A warm session brings
 `session_ready_ms` down to a few milliseconds, so a request that logs
@@ -1189,7 +1209,7 @@ This is a compatibility bridge, not a native OpenAI inference implementation.
 |---|---|
 | No native SDK chat-history input | History is serialized into one prompt unless session continuity is enabled |
 | No native SDK external-tool schemas | Tool definitions are serialized into the prompt |
-| No native SDK tool-result continuation | Each request creates a new Droid session |
+| No native SDK tool-result continuation | Each request runs a fresh Droid session; warm sessions remove its startup cost, not its empty state |
 | Python SDK protocol drift | A small isolated compatibility shim supplies structured output, tool controls, and session RPCs |
 | Session-per-request execution | Prompt caching differs from a native inference endpoint |
 | Strict tool marker protocol | Invalid generated tool payloads fail closed |
@@ -1233,6 +1253,20 @@ factory_incomplete_response
 
 The Droid stream ended without a turn-complete event. Check Droid CLI health,
 request timeout, and bridge logs.
+
+### One slow request after switching models
+
+The warm pool holds sessions for the model and reasoning effort recent traffic
+used, so the first request with new settings pays full session startup and
+logs `pool.miss` with a multi-second `session_ready_ms`. Following requests
+for the same settings hit the pool. Raise
+`FACTORY_DROID_OPENAI_WARM_SESSIONS` when clients alternate between models.
+
+### Every request logs a forced kill
+
+Expected. `droid exec` normally stays alive after its session is closed, so
+the bridge kills it once the grace period expires. With detached cleanup this
+happens after the response, so it costs the client nothing.
 
 ## Development
 
