@@ -57,6 +57,8 @@ factory-droid-openai
 ```
 
 `pipx install factory-droid-openai` works the same way if you prefer pipx.
+No `droid` CLI on the host? Use [Docker](#docker) - it bundles Droid inside
+the container, you only need `FACTORY_API_KEY`.
 
 From another terminal, send a request:
 
