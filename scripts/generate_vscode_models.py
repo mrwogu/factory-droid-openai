@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
+import sys
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -14,6 +16,7 @@ ALIAS_LABEL = "Factory Droid (server default model)"
 DEFAULT_MAX_INPUT_TOKENS = 180000
 DEFAULT_MAX_OUTPUT_TOKENS = 20000
 NON_THINKING_EFFORTS = frozenset({"off", "none"})
+ALIAS_MODEL_ID = "factory-droid"
 CURATED_MODELS = (
     "factory-droid",
     "claude-opus-5",
@@ -37,6 +40,69 @@ def _fetch_models(base_url: str, api_key: str | None) -> list[dict[str, Any]]:
         payload = json.load(response)
     models: list[dict[str, Any]] = payload["data"]
     return models
+
+
+async def _probe_model(
+    model_id: str,
+    *,
+    droid_path: str,
+    workdir: Path,
+    timeout_seconds: float,
+    gate: asyncio.Semaphore,
+) -> str | None:
+    """Return why ``model_id`` is unusable, or ``None`` when it works.
+
+    Only a session is initialized, which is where Droid refuses models an
+    organization policy blocks. No model turn runs, so probing the whole
+    catalog costs no tokens.
+    """
+    from factory_droid_openai.runner import DroidRunner, SessionKey
+
+    runner = DroidRunner(droid_path=droid_path, workdir=workdir)
+    async with gate:
+        try:
+            session = await runner.warm(
+                SessionKey(model_id=model_id, reasoning_effort=None),
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception as exc:
+            # Any refusal disqualifies the model, whatever its shape.
+            return str(exc) or type(exc).__name__
+    await runner.discard(session)
+    return None
+
+
+def _verify_models(
+    model_ids: list[str],
+    *,
+    droid_path: str,
+    workdir: Path,
+    timeout_seconds: float,
+    concurrency: int,
+) -> dict[str, str]:
+    """Probe every model and map the unusable ones to their refusal."""
+
+    async def run() -> dict[str, str]:
+        gate = asyncio.Semaphore(max(1, concurrency))
+        results = await asyncio.gather(
+            *(
+                _probe_model(
+                    model_id,
+                    droid_path=droid_path,
+                    workdir=workdir,
+                    timeout_seconds=timeout_seconds,
+                    gate=gate,
+                )
+                for model_id in model_ids
+            )
+        )
+        return {
+            model_id: reason
+            for model_id, reason in zip(model_ids, results, strict=True)
+            if reason is not None
+        }
+
+    return asyncio.run(run())
 
 
 def _model_entry(
@@ -113,6 +179,16 @@ def _parse_args() -> argparse.Namespace:
         help="Model ID to include; repeatable. Defaults to a curated set.",
     )
     parser.add_argument("--all-models", action="store_true", help="Include every discovered model.")
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Drop models Droid refuses to start a session with, such as ones "
+        "blocked by an organization policy.",
+    )
+    parser.add_argument("--verify-concurrency", type=int, default=4)
+    parser.add_argument("--verify-timeout-seconds", type=float, default=60.0)
+    parser.add_argument("--droid-path", default=os.getenv("FACTORY_DROID_PATH", "droid"))
+    parser.add_argument("--workdir", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
     return parser.parse_args()
 
@@ -133,6 +209,24 @@ def main() -> None:
             message = f"Models not available on the bridge: {', '.join(missing)}"
             raise SystemExit(message)
         selected = [by_id[model_id] for model_id in wanted]
+
+    if args.verify:
+        alias = ALIAS_MODEL_ID
+        probed = [str(model["id"]) for model in selected if str(model["id"]) != alias]
+        refused = _verify_models(
+            probed,
+            droid_path=str(args.droid_path),
+            workdir=Path(args.workdir) if args.workdir else Path.cwd(),
+            timeout_seconds=float(args.verify_timeout_seconds),
+            concurrency=int(args.verify_concurrency),
+        )
+        for model_id, reason in sorted(refused.items()):
+            print(f"skipping {model_id}: {reason}", file=sys.stderr)
+        print(
+            f"verified {len(probed) - len(refused)}/{len(probed)} models",
+            file=sys.stderr,
+        )
+        selected = [model for model in selected if str(model["id"]) not in refused]
 
     config = _build_config(
         selected,

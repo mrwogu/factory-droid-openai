@@ -642,7 +642,16 @@ reads image support and reasoning effort levels from `GET /v1/models`:
 uv run python scripts/generate_vscode_models.py
 uv run python scripts/generate_vscode_models.py --all-models
 uv run python scripts/generate_vscode_models.py --model gpt-5.4 --model claude-opus-5
+uv run python scripts/generate_vscode_models.py --all-models --verify
 ```
+
+The committed example lists every model the reference host exposed. `GET
+/v1/models` returns the whole Droid catalog, including models an organization
+policy blocks for the signed-in account, so generate your own file with
+`--verify`: it starts a session for every selected model, drops the ones Droid
+refuses, and prints the refusals to stderr. No model turn runs, so verification
+costs no tokens; it spawns Droid directly and takes roughly a minute for a full
+catalog.
 
 `id` is the explicit Droid model ID. Replace it with another ID from
 `GET /v1/models` or `droid exec --help`, such as `gemini-3.1-pro-preview` or
@@ -810,6 +819,15 @@ endpoint preserves compatibility by serving the last known catalog, or the
 bridge alias alone, and marks the response with the
 `x-factory-droid-model-discovery: degraded` header while incrementing
 `factory_droid_openai_model_discovery_failures_total`.
+
+The Droid catalog also lists models an organization policy blocks for the
+signed-in account. Droid rejects those when a session starts, which the bridge
+maps to `404 model_not_found` and remembers for
+`FACTORY_DROID_OPENAI_MODEL_QUARANTINE_SECONDS`. While a model is quarantined,
+`GET /v1/models` withholds it and reports how many entries were withheld in the
+`x-factory-droid-models-quarantined` header, chat requests for it are refused
+without starting Droid, and the warm-session pool stops warming it. Set the
+value to `0` to disable quarantining.
 
 ### Reasoning
 
@@ -997,6 +1015,7 @@ followed by `[DONE]`.
 | `FACTORY_DROID_OPENAI_APPEND_SYSTEM_PROMPT_FILE` | unset | File appended to the Droid system prompt |
 | `FACTORY_DROID_OPENAI_MODEL_ALIAS` | `factory-droid` | Alias using Droid default model |
 | `FACTORY_DROID_OPENAI_MODEL_CACHE_SECONDS` | `300` | `GET /v1/models` catalog cache lifetime |
+| `FACTORY_DROID_OPENAI_MODEL_QUARANTINE_SECONDS` | `900` | How long a refused model stays withheld |
 | `FACTORY_DROID_OPENAI_MCP_SETTLE_SECONDS` | `0` | MCP initialization window before tool discovery |
 | `FACTORY_DROID_OPENAI_LOG_LEVEL` | `info` | Bridge and Uvicorn log level |
 | `FACTORY_DROID_OPENAI_LOG_FORMAT` | `text` | Bridge log rendering: `text` or `json` |
@@ -1048,6 +1067,7 @@ surface.
 | `factory_droid_openai_payload_rejections_total` | Requests rejected with `413` |
 | `factory_droid_openai_forced_kills_total` | Droid processes that needed a kill |
 | `factory_droid_openai_model_discovery_failures_total` | Failed Droid model discovery attempts |
+| `factory_droid_openai_model_quarantines_total` | Models withheld after Droid refused them |
 | `factory_droid_openai_warm_sessions` | Warm Droid sessions ready now |
 | `factory_droid_openai_warm_session_hits_total` | Requests served from a warm session |
 | `factory_droid_openai_warm_session_retunes_total` | Warm sessions repointed at another model |
@@ -1118,7 +1138,7 @@ factory-droid-openai --log-level debug --no-access-log
 
 | Level | Content |
 |---|---|
-| `warning` | Rejections, failures, degraded model discovery, forced process kills |
+| `warning` | Rejections, failures, degraded model discovery, quarantined models, forced process kills |
 | `info` | One `chat.completed` summary per request with phase timings and token usage |
 | `debug` | Per-phase events: prompt built, admission, warm-session hit, retune or miss, Droid startup, session ready, first token, turn complete, cleanup |
 | `trace` | One line per Droid SDK event kind |
@@ -1282,6 +1302,16 @@ Not expected any more. `droid exec` exits cleanly in about a second, so raise
 a slower host; `FACTORY_DROID_OPENAI_CLEANUP_TIMEOUT_SECONDS` must stay above
 it. With detached cleanup the kill happens after the response, so it costs the
 client nothing either way.
+
+### Model not allowed by organization policy
+
+Droid lists the full catalog but refuses to start a session for models the
+account's organization policy blocks. The bridge answers `404 model_not_found`,
+logs `models.quarantined`, and withholds the model from `GET /v1/models` for
+`FACTORY_DROID_OPENAI_MODEL_QUARANTINE_SECONDS`, so a client that rebuilds its
+model list recovers on its own. Regenerate client configuration with
+`uv run python scripts/generate_vscode_models.py --all-models --verify` to drop
+blocked models up front.
 
 ## Development
 

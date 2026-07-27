@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
 from dataclasses import dataclass
@@ -53,6 +54,13 @@ _BASE_EXEC_ARGS = (
     "stream-jsonrpc",
     "--output-format",
     "stream-jsonrpc",
+)
+# Droid refuses a model an organization policy blocks with a JSON-RPC internal
+# error, so the wording is the only signal that the model, not the bridge, is
+# at fault.
+_MODEL_DENIED_PATTERN = re.compile(
+    r"model (?:is )?not (?:allowed|available|permitted|enabled)",
+    re.IGNORECASE,
 )
 
 
@@ -244,7 +252,7 @@ class DroidRunner:
         droid_path: str,
         workdir: Path,
         client_factory: ClientFactory | None = None,
-        process_grace_seconds: float = 1.0,
+        process_grace_seconds: float = 2.0,
         cleanup_timeout_seconds: float = 4.0,
         metrics: RunnerMetrics | None = None,
         worktree: str | None = None,
@@ -506,10 +514,8 @@ class DroidRunner:
                 error_type="session_not_found",
             ) from exc
         except DroidClientError as exc:
-            raise RunnerError(
-                f"Factory Droid SDK failed: {exc}",
-                error_type="factory_droid_sdk_error",
-            ) from exc
+            model_id = _resolve_model_id(request.model, request.model_alias)
+            raise sdk_error(exc, model=model_id) from exc
         finally:
             interrupt = initialized and not completed
             if self._reaper is not None:
@@ -790,6 +796,27 @@ def _build_exec_args(
 
 def _resolve_model_id(model: str, model_alias: str) -> str | None:
     return None if model == model_alias else model
+
+
+def sdk_error(exc: DroidClientError, *, model: str | None = None) -> RunnerError:
+    """Map a Droid SDK failure onto the closest OpenAI-compatible error.
+
+    Droid lists every model its CLI knows about and only refuses the ones an
+    organization policy blocks when a session is initialized, so that refusal
+    has to read as an unavailable model rather than a bridge failure.
+    """
+    message = str(exc)
+    if _MODEL_DENIED_PATTERN.search(message):
+        subject = f"Model '{model}'" if model else "The requested model"
+        return RunnerError(
+            f"{subject} is not available for this Factory account: {message}",
+            status_code=404,
+            error_type="model_not_found",
+        )
+    return RunnerError(
+        f"Factory Droid SDK failed: {message}",
+        error_type="factory_droid_sdk_error",
+    )
 
 
 def _resolve_reasoning_effort(value: str | None) -> ReasoningEffort | None:

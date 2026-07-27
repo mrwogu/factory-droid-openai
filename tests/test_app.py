@@ -255,6 +255,77 @@ async def test_health_and_models(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_chat_quarantines_a_model_droid_refuses(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [],
+        error=RunnerError(
+            "Model 'gpt-5.4' is not available for this Factory account: "
+            "Model not allowed by organization policy",
+            status_code=404,
+            error_type="model_not_found",
+        ),
+    )
+    app = _app(tmp_path, runner)
+
+    async with _client(app) as client:
+        first = await client.post("/v1/chat/completions", json=_payload(model="gpt-5.4"))
+        models = await client.get("/v1/models")
+        second = await client.post("/v1/chat/completions", json=_payload(model="gpt-5.4"))
+        metrics = await client.get("/metrics")
+
+    assert first.status_code == 404
+    assert first.json()["error"]["type"] == "model_not_found"
+    assert [model["id"] for model in models.json()["data"]] == ["factory-droid"]
+    assert models.headers["x-factory-droid-models-quarantined"] == "1"
+    assert second.status_code == 404
+    # The second request is refused before a Droid session is started.
+    assert len(runner.requests) == 1
+    assert "factory_droid_openai_model_quarantines_total 1" in metrics.text
+
+
+@pytest.mark.asyncio
+async def test_streamed_chat_quarantines_a_model_droid_refuses(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [],
+        error=RunnerError(
+            "Model 'gpt-5.4' is not available for this Factory account",
+            status_code=404,
+            error_type="model_not_found",
+        ),
+    )
+    app = _app(tmp_path, runner)
+
+    async with _client(app) as client:
+        payload = _payload(model="gpt-5.4", stream=True)
+        stream = await client.post("/v1/chat/completions", json=payload)
+        blocked = await client.post("/v1/chat/completions", json=payload)
+
+    assert "model_not_found" in stream.text
+    assert blocked.status_code == 404
+    assert len(runner.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_chat_keeps_serving_models_droid_did_not_refuse(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [],
+        error=RunnerError("Factory Droid SDK failed: boom", error_type="factory_droid_sdk_error"),
+    )
+    app = _app(tmp_path, runner)
+
+    async with _client(app) as client:
+        first = await client.post("/v1/chat/completions", json=_payload(model="gpt-5.4"))
+        second = await client.post("/v1/chat/completions", json=_payload(model="gpt-5.4"))
+        models = await client.get("/v1/models")
+
+    assert first.status_code == 502
+    assert second.status_code == 502
+    assert len(runner.requests) == 2
+    assert [model["id"] for model in models.json()["data"]] == ["factory-droid", "gpt-5.4"]
+    assert "x-factory-droid-models-quarantined" not in models.headers
+
+
+@pytest.mark.asyncio
 async def test_models_falls_back_to_alias_when_droid_is_unavailable(
     tmp_path: Path,
 ) -> None:

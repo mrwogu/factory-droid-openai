@@ -243,7 +243,16 @@ class WarmSessionPool:
             if self._metrics is not None:
                 self._metrics.increment_warm_failures()
             log_warning("pool.warm_failed", model=key.model_id, error=type(exc).__name__)
+            # Settings Droid rejects, such as a model an organization policy
+            # blocks, would otherwise be retried for as long as they stay in
+            # the wanted list. Traffic that still works re-adds the key.
+            self._forget(key)
             return None
+
+    def _forget(self, key: SessionKey) -> None:
+        if key in self._wanted:
+            self._wanted.remove(key)
+        self._drop(key)
 
     def _targets(self) -> dict[SessionKey, int]:
         """Split the pool size across the keys traffic is currently using."""

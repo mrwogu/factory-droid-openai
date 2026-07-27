@@ -22,6 +22,7 @@ class BridgeMetrics:
         self._payload_rejections = 0
         self._forced_kills = 0
         self._model_discovery_failures = 0
+        self._model_quarantines = 0
         self._warm_sessions = 0
         self._warm_hits = 0
         self._warm_retunes = 0
@@ -71,6 +72,10 @@ class BridgeMetrics:
         with self._lock:
             self._model_discovery_failures += 1
 
+    def increment_model_quarantines(self) -> None:
+        with self._lock:
+            self._model_quarantines += 1
+
     def set_warm_sessions(self, count: int) -> None:
         with self._lock:
             self._warm_sessions = count
@@ -113,6 +118,7 @@ class BridgeMetrics:
                 "payload_rejections": self._payload_rejections,
                 "forced_kills": self._forced_kills,
                 "model_discovery_failures": self._model_discovery_failures,
+                "model_quarantines": self._model_quarantines,
                 "warm_sessions": self._warm_sessions,
                 "warm_hits": self._warm_hits,
                 "warm_retunes": self._warm_retunes,
@@ -160,6 +166,8 @@ class BridgeMetrics:
                 "factory_droid_openai_model_discovery_failures_total "
                 f"{values['model_discovery_failures']}"
             ),
+            "# TYPE factory_droid_openai_model_quarantines_total counter",
+            f"factory_droid_openai_model_quarantines_total {values['model_quarantines']}",
             "# TYPE factory_droid_openai_warm_sessions gauge",
             f"factory_droid_openai_warm_sessions {values['warm_sessions']}",
             "# TYPE factory_droid_openai_warm_session_hits_total counter",

@@ -20,6 +20,7 @@ from jsonschema import ValidationError as JsonSchemaValidationError
 from jsonschema.exceptions import SchemaError
 from jsonschema.validators import validator_for
 
+from factory_droid_openai.availability import ModelQuarantine
 from factory_droid_openai.config import Settings
 from factory_droid_openai.droid_rpc import DroidRpcExtension
 from factory_droid_openai.logs import bind_request, current_timeline
@@ -591,6 +592,7 @@ def create_app(
     )
     bridge_created = int(time.time())
     sessions = SessionRegistry(resolved_settings.max_tracked_sessions)
+    quarantine = ModelQuarantine(ttl_seconds=resolved_settings.model_quarantine_seconds)
     admission = AdmissionController(
         max_concurrency=resolved_settings.max_concurrency,
         max_queue_size=resolved_settings.max_queue_size,
@@ -662,6 +664,7 @@ def create_app(
     application.state.sessions = sessions
     application.state.pool = pool
     application.state.reaper = reaper
+    application.state.quarantine = quarantine
 
     async def require_auth(credentials: BearerCredentials) -> None:
         expected = resolved_settings.api_key
@@ -746,6 +749,17 @@ def create_app(
         ),
     )
 
+    def note_runner_failure(model: str, exc: RunnerError) -> None:
+        if exc.error_type != "model_not_found":
+            return
+        if quarantine.record(model, str(exc)):
+            metrics.increment_model_quarantines()
+            log_warning(
+                "models.quarantined",
+                model=model,
+                ttl_seconds=resolved_settings.model_quarantine_seconds,
+            )
+
     def require_known_session(session_id: str) -> None:
         if not resolved_settings.session_continuity:
             raise BridgeHTTPError(
@@ -792,12 +806,19 @@ def create_app(
             metrics.increment_model_discovery_failures()
             log_warning("models.discovery_degraded", cached=len(discovered))
             response.headers["x-factory-droid-model-discovery"] = "degraded"
-        else:
-            log_debug("models.listed", discovered=len(discovered))
+        # The Droid catalog also lists models an organization policy blocks, so
+        # anything already known to be refused is withheld from clients that
+        # build their model picker from this response.
+        available = tuple(model for model in discovered if quarantine.allows(model.id))
+        withheld = len(discovered) - len(available)
+        if not degraded:
+            log_debug("models.listed", discovered=len(available), quarantined=withheld or None)
+        if withheld:
+            response.headers["x-factory-droid-models-quarantined"] = str(withheld)
         return ModelListResponse(
             data=_model_list(
                 resolved_settings.model_alias,
-                discovered,
+                available,
                 created=bridge_created,
             )
         )
@@ -1029,6 +1050,11 @@ def create_app(
             log_warning("chat.rejected", status=exc.status_code, phase="reasoning_effort")
             return _error_response(str(exc), exc.status_code, exc.error_type)
 
+        quarantined = quarantine.reason(payload.model)
+        if quarantined is not None:
+            log_warning("chat.rejected", status=404, phase="model", model=payload.model)
+            return _error_response(quarantined, 404, "model_not_found")
+
         created = int(time.time())
         run_request = RunRequest(
             prompt=plan.prompt,
@@ -1109,6 +1135,7 @@ def create_app(
                 session_callback=sessions.remember,
                 expose_session=resolved_settings.session_continuity,
                 structured=structured,
+                failure_callback=note_runner_failure,
             )
             return FinalizingStreamingResponse(
                 event_stream,
@@ -1177,6 +1204,7 @@ def create_app(
             return _error_response(str(exc), 502, "factory_protocol_error")
         except RunnerError as exc:
             log_warning("chat.failed", status=exc.status_code, error_type=exc.error_type)
+            note_runner_failure(payload.model, exc)
             return _error_response(str(exc), exc.status_code, exc.error_type)
 
         log_info(
@@ -1360,6 +1388,7 @@ async def _stream_completion(
     session_callback: Callable[[str], None] | None = None,
     expose_session: bool = False,
     structured: StructuredOutput | None = None,
+    failure_callback: Callable[[str, RunnerError], None] | None = None,
 ) -> AsyncIterator[str]:
     usage = Usage()
     completed = False
@@ -1525,6 +1554,8 @@ async def _stream_completion(
         except RunnerError as exc:
             outcome = "timeout" if exc.error_type == "factory_droid_timeout" else "error"
             log_warning("chat.failed", stream=True, error_type=exc.error_type)
+            if failure_callback is not None:
+                failure_callback(model, exc)
             yield _sse(_error_body(str(exc), exc.error_type))
         except asyncio.CancelledError:
             log_warning("chat.cancelled", stream=True)
