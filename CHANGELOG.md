@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.0](https://github.com/mrwogu/factory-droid-openai/compare/v1.0.0...v1.1.0) (2026-07-27)
+
+
+### Features
+
+* add container image, VS Code BYOK docs, and cross-platform CI ([#11](https://github.com/mrwogu/factory-droid-openai/issues/11)) ([508cb15](https://github.com/mrwogu/factory-droid-openai/commit/508cb15c1e5baae1aed6b94f918cef9479dea474))
+* add guarded Droid RPC integration ([#9](https://github.com/mrwogu/factory-droid-openai/issues/9)) ([92ec6c3](https://github.com/mrwogu/factory-droid-openai/commit/92ec6c35a444a2093a464cb72a1dee5cf4ed07db))
+
 ## 1.0.0 (2026-07-26)
 
 
