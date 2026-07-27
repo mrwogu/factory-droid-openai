@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.3](https://github.com/mrwogu/factory-droid-openai/compare/v1.3.2...v1.3.3) (2026-07-27)
+
+
+### Bug Fixes
+
+* **protocol:** repair malformed tool-call markers ([#21](https://github.com/mrwogu/factory-droid-openai/issues/21)) ([90e5bb2](https://github.com/mrwogu/factory-droid-openai/commit/90e5bb2cbe79dab86802c90cb5920d563e586ee7))
+
 ## [1.3.2](https://github.com/mrwogu/factory-droid-openai/compare/v1.3.1...v1.3.2) (2026-07-27)
 
 
