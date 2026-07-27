@@ -1200,7 +1200,12 @@ def create_app(
                     total_usage = _add_usage(total_usage, result.usage)
                     choices.append(_choice_dict(result, index))
         except ProtocolError as exc:
-            log_warning("chat.failed", status=502, error_type="factory_protocol_error")
+            log_warning(
+                "chat.failed",
+                status=502,
+                error_type="factory_protocol_error",
+                reason=str(exc),
+            )
             return _error_response(str(exc), 502, "factory_protocol_error")
         except RunnerError as exc:
             log_warning("chat.failed", status=exc.status_code, error_type=exc.error_type)
@@ -1513,6 +1518,20 @@ async def _stream_completion(
                 )
             if not stop_buffer.triggered:
                 for emission in parser.finish():
+                    if isinstance(emission, ToolCallEmission):
+                        saw_tool_call = True
+                        yield _sse(
+                            _chunk_for_emission(
+                                request_id,
+                                created,
+                                model,
+                                emission,
+                                include_usage=include_usage,
+                                tool_call_index=tool_call_index,
+                            )
+                        )
+                        tool_call_index += 1
+                        continue
                     text = stop_buffer.feed(emission.text)
                     if text:
                         chunk_payload = text_chunk(text)
@@ -1549,7 +1568,12 @@ async def _stream_completion(
                 yield _sse(_usage_chunk(request_id, created, model, usage))
         except ProtocolError as exc:
             outcome = "error"
-            log_warning("chat.failed", stream=True, error_type="factory_protocol_error")
+            log_warning(
+                "chat.failed",
+                stream=True,
+                error_type="factory_protocol_error",
+                reason=str(exc),
+            )
             yield _sse(_error_body(str(exc), "factory_protocol_error"))
         except RunnerError as exc:
             outcome = "timeout" if exc.error_type == "factory_droid_timeout" else "error"
