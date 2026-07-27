@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Any
 
 from factory_droid_openai.attachments import AttachmentSet, extract_attachments
 from factory_droid_openai.errors import ProtocolError, RequestTooLargeError
+from factory_droid_openai.logs import debug as log_debug
+from factory_droid_openai.logs import trace as log_trace
 
 if TYPE_CHECKING:
     from factory_droid_openai.models import ChatCompletionRequest, ToolDefinition
@@ -15,6 +17,12 @@ if TYPE_CHECKING:
 TOOL_CALL_OPEN = "<tool_call>"
 TOOL_CALL_CLOSE = "</tool_call>"
 _MAX_TOOL_PAYLOAD_BYTES = 1_000_000
+_ARG_KEY_OPEN = "<arg_key>"
+_ARG_KEY_CLOSE = "</arg_key>"
+_ARG_VALUE_OPEN = "<arg_value>"
+_ARG_VALUE_CLOSE = "</arg_value>"
+_ARGUMENT_KEYS = ("arguments", "parameters", "args", "input")
+_UNPARSED_HEAD_CHARS = 64
 
 __all__ = [
     "TOOL_CALL_CLOSE",
@@ -151,6 +159,9 @@ def build_prompt(
             f"{TOOL_CALL_OPEN}"
             '{"name":"allowed_tool_name","arguments":{"key":"value"}}'
             f"{TOOL_CALL_CLOSE}. "
+            "Between the markers emit exactly one JSON object with the keys "
+            '"name" and "arguments"; never emit <arg_key>/<arg_value> blocks, '
+            "a code fence, or two objects inside one marker pair. "
             f"Do not call Droid-native tools. {trailing_rule}"
         )
         if require_tool_call:
@@ -259,11 +270,14 @@ class ToolCallStreamParser:
             return self._consume_tool_payload(chunk)
         return self._consume_text(chunk)
 
-    def finish(self) -> list[TextEmission]:
-        """Flushes buffered text. A tool call can only complete inside ``feed``."""
+    def finish(self) -> list[ProtocolEmission]:
+        """Flushes buffered text and any tool call left without a close marker."""
+        emissions: list[ProtocolEmission] = []
         if self._capturing:
-            raise ProtocolError("incomplete tool-call marker")
-        emissions: list[TextEmission] = []
+            recovered = self._recover_unclosed_tool_call()
+            if recovered is None:
+                raise ProtocolError("incomplete tool-call marker")
+            emissions.extend(self._emit_tool_calls(recovered))
         if self._text_tail:
             # After a tool call only whitespace may separate further calls; any
             # residual non-whitespace is trailing output and must fail closed.
@@ -328,17 +342,15 @@ class ToolCallStreamParser:
         self._append_payload(payload, payload_bytes)
         trailing = value[close_index + len(TOOL_CALL_CLOSE) :]
         complete_payload = "".join(self._payload_chunks)
-        emission = self._parse_tool_payload(complete_payload)
+        payload_objects = self._tool_payload_objects(complete_payload)
         self._payload_chunks.clear()
         # The size limit is per payload, so the bounded call count is what caps
         # the total bytes a single turn can buffer.
         self._payload_bytes = 0
         self._close_tail = ""
         self._capturing = False
-        self._saw_tool_call = True
-        self._tool_call_count += 1
 
-        emissions: list[ProtocolEmission] = [emission]
+        emissions: list[ProtocolEmission] = list(self._emit_tool_calls(payload_objects))
         if self._tool_call_count >= self._max_tool_calls:
             self._done = True
             if trailing.strip():
@@ -346,6 +358,29 @@ class ToolCallStreamParser:
             return emissions
         if trailing:
             emissions.extend(self._consume_text(trailing))
+        return emissions
+
+    def _recover_unclosed_tool_call(self) -> list[dict[str, Any]] | None:
+        """Repairs a tool call whose closing marker never arrived."""
+        payload = "".join(self._payload_chunks) + self._close_tail
+        try:
+            objects = self._tool_payload_objects(payload)
+        except ProtocolError:
+            return None
+        self._payload_chunks.clear()
+        self._payload_bytes = 0
+        self._close_tail = ""
+        self._capturing = False
+        return objects
+
+    def _emit_tool_calls(self, payload_objects: list[dict[str, Any]]) -> list[ToolCallEmission]:
+        emissions: list[ToolCallEmission] = []
+        for value in payload_objects:
+            if self._tool_call_count >= self._max_tool_calls:
+                raise ProtocolError("more tool calls than the configured maximum")
+            emissions.append(self._tool_call_from_object(value))
+            self._saw_tool_call = True
+            self._tool_call_count += 1
         return emissions
 
     def _append_payload(self, value: str, value_bytes: int | None = None) -> None:
@@ -358,18 +393,45 @@ class ToolCallStreamParser:
             raise ProtocolError("tool-call payload is too large")
         self._payload_chunks.append(value)
 
-    def _parse_tool_payload(self, payload: str) -> ToolCallEmission:
+    def _tool_payload_objects(self, payload: str) -> list[dict[str, Any]]:
+        """Returns the tool-call objects a marker payload carries.
+
+        Strict JSON first. Models that ignore the single-object contract are
+        repaired into the same shape, because a fenced block, an ``<arg_key>``
+        list or two objects packed into one marker pair is a formatting slip,
+        not a request the bridge should drop. Names, argument types and
+        duplicate keys stay validated in :meth:`_tool_call_from_object`.
+        """
         if not self._allowed_tool_names:
             raise ProtocolError("the model requested a tool when none are available")
+        body = _strip_code_fence(payload.strip())
         try:
-            parsed = parse_strict_json(payload)
+            values = _decode_json_values(body)
         except (json.JSONDecodeError, ValueError) as exc:
-            raise ProtocolError(f"invalid tool-call JSON: {exc}") from exc
-        if not isinstance(parsed, dict):
-            raise ProtocolError("tool-call payload must be a JSON object")
+            repaired = _repair_tool_payload(body, self._allowed_tool_names)
+            if repaired is None:
+                log_trace(
+                    "tool_call.unparsed",
+                    head=body[:_UNPARSED_HEAD_CHARS],
+                    payload_bytes=len(body.encode("utf-8")),
+                )
+                raise ProtocolError(f"invalid tool-call JSON: {exc}") from exc
+            log_debug("tool_call.repaired", variant=repaired.variant)
+            values = [repaired.value]
+        if not values:
+            raise ProtocolError("invalid tool-call JSON: the payload is empty")
+        objects: list[dict[str, Any]] = []
+        for value in values:
+            if not isinstance(value, dict):
+                raise ProtocolError("tool-call payload must be a JSON object")
+            objects.append(value)
+        if len(objects) > 1:
+            log_debug("tool_call.repaired", variant="packed_objects")
+        return objects
 
+    def _tool_call_from_object(self, parsed: dict[str, Any]) -> ToolCallEmission:
         name = parsed.get("name")
-        arguments = parsed.get("arguments")
+        arguments = _tool_arguments(parsed)
         if not isinstance(name, str) or not name:
             raise ProtocolError("tool-call name must be a non-empty string")
         if name not in self._allowed_tool_names:
@@ -447,6 +509,120 @@ def parse_strict_json(text: str) -> Any:
         parse_constant=_reject_non_json_constant,
         parse_float=_parse_finite_float,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _RepairedPayload:
+    variant: str
+    value: dict[str, Any]
+
+
+def _decode_json_values(text: str) -> list[Any]:
+    """Decodes the JSON values a payload holds, back to back.
+
+    A model that packs several tool calls into one marker pair produces
+    ``{...}{...}``, which ``json.loads`` rejects as trailing data.
+    """
+    decoder = json.JSONDecoder(
+        object_pairs_hook=_reject_duplicate_keys,
+        parse_constant=_reject_non_json_constant,
+        parse_float=_parse_finite_float,
+    )
+    values: list[Any] = []
+    index = 0
+    while True:
+        while index < len(text) and text[index].isspace():
+            index += 1
+        if index >= len(text):
+            return values
+        value, index = decoder.raw_decode(text, index)
+        values.append(value)
+
+
+def _strip_code_fence(payload: str) -> str:
+    if not payload.startswith("```"):
+        return payload
+    newline = payload.find("\n")
+    if newline < 0:
+        return payload
+    body = payload[newline + 1 :]
+    closing = body.rfind("```")
+    return body[:closing].strip() if closing >= 0 else body.strip()
+
+
+def _repair_tool_payload(
+    body: str,
+    allowed_tool_names: frozenset[str],
+) -> _RepairedPayload | None:
+    if _ARG_KEY_OPEN in body:
+        repaired = _repair_arg_key_payload(body)
+        if repaired is not None:
+            return _RepairedPayload("arg_key_value", repaired)
+    repaired = _repair_named_payload(body, allowed_tool_names)
+    if repaired is not None:
+        return _RepairedPayload("bare_name", repaired)
+    return None
+
+
+def _repair_arg_key_payload(body: str) -> dict[str, Any] | None:
+    """Rebuilds GLM's ``name<arg_key>k</arg_key><arg_value>v</arg_value>`` form."""
+    index = body.find(_ARG_KEY_OPEN)
+    name = body[:index].strip()
+    if not name:
+        return None
+    arguments: dict[str, Any] = {}
+    while index >= 0:
+        key_end = body.find(_ARG_KEY_CLOSE, index)
+        if key_end < 0:
+            return None
+        key = body[index + len(_ARG_KEY_OPEN) : key_end].strip()
+        value_start = body.find(_ARG_VALUE_OPEN, key_end)
+        if not key or key in arguments or value_start < 0:
+            return None
+        value_end = body.find(_ARG_VALUE_CLOSE, value_start)
+        if value_end < 0:
+            # A truncated value would silently drop data, so fail closed.
+            return None
+        raw = body[value_start + len(_ARG_VALUE_OPEN) : value_end].strip()
+        arguments[key] = _coerce_arg_value(raw)
+        index = body.find(_ARG_KEY_OPEN, value_end)
+    return {"name": name, "arguments": arguments}
+
+
+def _coerce_arg_value(raw: str) -> Any:
+    try:
+        parsed = parse_strict_json(raw)
+    except (json.JSONDecodeError, ValueError):
+        return raw
+    return parsed
+
+
+def _repair_named_payload(
+    body: str,
+    allowed_tool_names: frozenset[str],
+) -> dict[str, Any] | None:
+    """Rebuilds a payload that names the tool outside the JSON object."""
+    head, _, tail = body.partition("\n")
+    name = head.strip()
+    if name not in allowed_tool_names:
+        return None
+    remainder = tail.strip()
+    if not remainder:
+        return {"name": name, "arguments": {}}
+    try:
+        arguments = parse_strict_json(remainder)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(arguments, dict):
+        return None
+    return {"name": name, "arguments": arguments}
+
+
+def _tool_arguments(parsed: dict[str, Any]) -> Any:
+    for key in _ARGUMENT_KEYS:
+        if key in parsed:
+            return parsed[key]
+    return None
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

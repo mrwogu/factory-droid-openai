@@ -545,6 +545,39 @@ async def test_non_streaming_tool_call(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_streaming_recovers_tool_call_without_close_marker(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [
+            TextDelta(f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Hel"}}}}'),
+            RunComplete(Usage()),
+        ]
+    )
+    payload = _payload(
+        stream=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ],
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    events = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and not line.endswith("[DONE]")
+    ]
+    tool_calls = [
+        call for event in events for call in event["choices"][0]["delta"].get("tool_calls", [])
+    ]
+    assert len(tool_calls) == 1
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {"city": "Hel"}
+    assert events[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+@pytest.mark.asyncio
 async def test_streaming_chat_completion_uses_openai_sse(tmp_path: Path) -> None:
     usage = Usage(8, 3, 1, 0)
     runner = FakeRunner(
