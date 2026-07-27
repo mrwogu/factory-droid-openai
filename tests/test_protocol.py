@@ -15,6 +15,7 @@ from factory_droid_openai.protocol import (
     ToolCallEmission,
     ToolCallStreamParser,
     build_prompt,
+    parse_strict_json,
 )
 
 
@@ -346,6 +347,36 @@ def test_stream_parser_rejects_duplicate_keys() -> None:
     with pytest.raises(ProtocolError, match="duplicate key"):
         parser.feed(
             f'{TOOL_CALL_OPEN}{{"name":"weather","name":"shell","arguments":{{}}}}{TOOL_CALL_CLOSE}'
+        )
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("1e999", "non-finite number"),
+        ("-1e999", "non-finite number"),
+        ("NaN", "non-JSON numeric constant"),
+        ("Infinity", "non-JSON numeric constant"),
+    ],
+)
+def test_strict_json_rejects_values_outside_the_json_grammar(
+    value: str,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        parse_strict_json(f'{{"amount":{value}}}')
+
+
+def test_strict_json_keeps_finite_numbers() -> None:
+    assert parse_strict_json('{"amount":1.5,"count":2}') == {"amount": 1.5, "count": 2}
+
+
+def test_stream_parser_rejects_non_finite_tool_arguments() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    with pytest.raises(ProtocolError, match="non-finite number"):
+        parser.feed(
+            f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"lat":1e999}}}}{TOOL_CALL_CLOSE}'
         )
 
 

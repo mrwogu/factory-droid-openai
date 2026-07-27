@@ -21,6 +21,7 @@ class BridgeMetrics:
         self._overload_rejections = 0
         self._payload_rejections = 0
         self._forced_kills = 0
+        self._model_discovery_failures = 0
 
     def record_request(self, outcome: str, status_code: int, seconds: float) -> None:
         with self._lock:
@@ -60,6 +61,10 @@ class BridgeMetrics:
         with self._lock:
             self._forced_kills += 1
 
+    def increment_model_discovery_failures(self) -> None:
+        with self._lock:
+            self._model_discovery_failures += 1
+
     def render(self) -> str:
         with self._lock:
             request_totals = sorted(self._request_totals.items())
@@ -77,6 +82,7 @@ class BridgeMetrics:
                 "overload_rejections": self._overload_rejections,
                 "payload_rejections": self._payload_rejections,
                 "forced_kills": self._forced_kills,
+                "model_discovery_failures": self._model_discovery_failures,
             }
 
         lines = [
@@ -113,5 +119,10 @@ class BridgeMetrics:
             (f"factory_droid_openai_payload_rejections_total {values['payload_rejections']}"),
             "# TYPE factory_droid_openai_forced_kills_total counter",
             f"factory_droid_openai_forced_kills_total {values['forced_kills']}",
+            "# TYPE factory_droid_openai_model_discovery_failures_total counter",
+            (
+                "factory_droid_openai_model_discovery_failures_total "
+                f"{values['model_discovery_failures']}"
+            ),
         ]
         return "\n".join(lines) + "\n"

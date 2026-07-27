@@ -1694,7 +1694,15 @@
                 }
               }
             },
-            "description": "Successful Response"
+            "description": "The bridge alias and the discovered Droid model catalog.",
+            "headers": {
+              "x-factory-droid-model-discovery": {
+                "description": "Set to 'degraded' when discovery failed and the bridge served the last known catalog, or the alias alone.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "429": {
             "content": {

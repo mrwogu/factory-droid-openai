@@ -24,7 +24,10 @@ _ENVIRONMENT_KEYS = (
     "FACTORY_DROID_OPENAI_MAX_TOOLS",
     "FACTORY_DROID_OPENAI_MAX_TRANSCRIPT_BYTES",
     "FACTORY_DROID_OPENAI_MAX_TOOL_SCHEMA_BYTES",
+    "FACTORY_DROID_OPENAI_MAX_STRUCTURED_OUTPUT_BYTES",
     "FACTORY_DROID_OPENAI_MAX_JSON_DEPTH",
+    "FACTORY_DROID_OPENAI_MCP_SETTLE_SECONDS",
+    "FACTORY_DROID_OPENAI_MODEL_CACHE_SECONDS",
     "FACTORY_DROID_OPENAI_RETRY_AFTER_SECONDS",
     "FACTORY_DROID_OPENAI_PROCESS_GRACE_SECONDS",
     "FACTORY_DROID_OPENAI_CLEANUP_TIMEOUT_SECONDS",
@@ -81,7 +84,10 @@ def test_settings_from_env_reads_all_overrides(
     monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_TOOLS", "16")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_TRANSCRIPT_BYTES", "2048")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_TOOL_SCHEMA_BYTES", "512")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_STRUCTURED_OUTPUT_BYTES", "4096")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_JSON_DEPTH", "8")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_MCP_SETTLE_SECONDS", "1.5")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_MODEL_CACHE_SECONDS", "0")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_RETRY_AFTER_SECONDS", "3")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_PROCESS_GRACE_SECONDS", "2.5")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_CLEANUP_TIMEOUT_SECONDS", "6.5")
@@ -106,7 +112,10 @@ def test_settings_from_env_reads_all_overrides(
         max_tools=16,
         max_transcript_bytes=2048,
         max_tool_schema_bytes=512,
+        max_structured_output_bytes=4096,
         max_json_depth=8,
+        mcp_settle_seconds=1.5,
+        model_cache_seconds=0.0,
         retry_after_seconds=3,
         process_grace_seconds=2.5,
         cleanup_timeout_seconds=6.5,
@@ -140,7 +149,15 @@ def test_settings_from_env_reads_all_overrides(
             "0",
             "must be greater than zero",
         ),
+        (
+            "FACTORY_DROID_OPENAI_MAX_STRUCTURED_OUTPUT_BYTES",
+            "0",
+            "must be greater than zero",
+        ),
         ("FACTORY_DROID_OPENAI_MAX_JSON_DEPTH", "0", "must be greater than zero"),
+        ("FACTORY_DROID_OPENAI_MCP_SETTLE_SECONDS", "invalid", "must be a number"),
+        ("FACTORY_DROID_OPENAI_MCP_SETTLE_SECONDS", "-1", "must be zero or greater"),
+        ("FACTORY_DROID_OPENAI_MODEL_CACHE_SECONDS", "inf", "must be zero or greater"),
         (
             "FACTORY_DROID_OPENAI_RETRY_AFTER_SECONDS",
             "0",

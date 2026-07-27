@@ -388,15 +388,17 @@ class DroidRunner:
         async def operation(
             client: DroidClient,
         ) -> tuple[ContextStats, ContextBreakdown]:
-            return (
-                await self._rpc.get_context_stats(client),
-                await self._rpc.get_context_breakdown(client),
+            stats, breakdown = await asyncio.gather(
+                self._rpc.get_context_stats(client),
+                self._rpc.get_context_breakdown(client),
             )
+            return stats, breakdown
 
         return await self._loaded_session_operation(
             session_id,
             operation,
             timeout_seconds=timeout_seconds,
+            disable_tools=False,
         )
 
     async def compact_session(
@@ -423,6 +425,7 @@ class DroidRunner:
             session_id,
             self._rpc.fork_session,
             timeout_seconds=timeout_seconds,
+            disable_tools=False,
         )
 
     async def rename_session(
@@ -439,6 +442,7 @@ class DroidRunner:
             session_id,
             operation,
             timeout_seconds=timeout_seconds,
+            disable_tools=False,
         )
 
     async def close_session(self, session_id: str, *, timeout_seconds: float) -> None:
@@ -449,6 +453,7 @@ class DroidRunner:
             session_id,
             operation,
             timeout_seconds=timeout_seconds,
+            disable_tools=False,
         )
 
     async def _loaded_session_operation(
@@ -457,10 +462,14 @@ class DroidRunner:
         operation: Callable[[DroidClient], Awaitable[OperationResult]],
         *,
         timeout_seconds: float,
+        disable_tools: bool = True,
     ) -> OperationResult:
         async def loaded(client: DroidClient) -> OperationResult:
             await client.load_session(session_id=session_id, mcp_servers=[])
-            await self._rpc.disable_native_tools(client)
+            # Metadata-only operations never run a model turn, so they neither
+            # need the tool guard nor should they rewrite session settings.
+            if disable_tools:
+                await self._rpc.disable_native_tools(client)
             return await operation(client)
 
         return await self._session_operation(

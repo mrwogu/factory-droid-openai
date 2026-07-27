@@ -276,7 +276,10 @@ then independently parses and validates the completed JSON. Invalid JSON,
 duplicate keys, non-finite numbers, schema violations, and trailing output
 fail closed. Remote JSON Schema references are rejected. `response_format`
 cannot be combined with bridge text tools or `stop`. Structured streaming
-buffers the JSON until it validates, then emits it in one content chunk.
+buffers the JSON until it validates, then emits it in one content chunk, so no
+content chunks arrive while the model is generating. Buffered output is capped
+by `FACTORY_DROID_OPENAI_MAX_STRUCTURED_OUTPUT_BYTES`, and a schema larger than
+`FACTORY_DROID_OPENAI_MAX_TOOL_SCHEMA_BYTES` is rejected with `413`.
 
 ### Streaming
 
@@ -546,9 +549,15 @@ client.chat.completions.create(
 
 Call `GET /v1/models` to list the bridge alias and the models currently
 available to the authenticated Droid CLI. Factory-specific metadata includes
-the display name, reasoning efforts, and image and PDF support. If discovery
-cannot start or authenticate Droid, the endpoint preserves compatibility by
-returning the bridge alias alone.
+the display name, reasoning efforts, and image and PDF support.
+
+Discovery starts a short-lived Droid session, so the catalog is cached for
+`FACTORY_DROID_OPENAI_MODEL_CACHE_SECONDS` and concurrent callers share a
+single discovery attempt. If discovery cannot start or authenticate Droid, the
+endpoint preserves compatibility by serving the last known catalog, or the
+bridge alias alone, and marks the response with the
+`x-factory-droid-model-discovery: degraded` header while incrementing
+`factory_droid_openai_model_discovery_failures_total`.
 
 ### Reasoning
 
@@ -649,7 +658,9 @@ curl -X DELETE \
 
 Compaction and fork return a new `session_id`, which the bridge registers for
 later continuation. Context responses contain aggregate token categories, not
-message or prompt content.
+message or prompt content. Context, fork, rename, and close run no model turn,
+so they leave the session's tool settings untouched; compaction runs a turn and
+therefore disables the tool catalog first.
 
 ### Droid status events
 
@@ -714,6 +725,7 @@ followed by `[DONE]`.
 | `FACTORY_DROID_OPENAI_MAX_TOOLS` | `128` | Tool schemas accepted per request |
 | `FACTORY_DROID_OPENAI_MAX_TRANSCRIPT_BYTES` | `4194304` | Serialized transcript size limit |
 | `FACTORY_DROID_OPENAI_MAX_TOOL_SCHEMA_BYTES` | `1048576` | Serialized tool schema size limit |
+| `FACTORY_DROID_OPENAI_MAX_STRUCTURED_OUTPUT_BYTES` | `1048576` | Buffered structured output size limit |
 | `FACTORY_DROID_OPENAI_MAX_JSON_DEPTH` | `32` | Request JSON nesting limit |
 | `FACTORY_DROID_OPENAI_PROCESS_GRACE_SECONDS` | `1` | Wait before killing a Droid process |
 | `FACTORY_DROID_OPENAI_CLEANUP_TIMEOUT_SECONDS` | `4` | Total budget for session cleanup |
@@ -729,6 +741,8 @@ followed by `[DONE]`.
 | `FACTORY_DROID_OPENAI_WORKTREE` | unset | Run Droid in a git worktree |
 | `FACTORY_DROID_OPENAI_APPEND_SYSTEM_PROMPT_FILE` | unset | File appended to the Droid system prompt |
 | `FACTORY_DROID_OPENAI_MODEL_ALIAS` | `factory-droid` | Alias using Droid default model |
+| `FACTORY_DROID_OPENAI_MODEL_CACHE_SECONDS` | `300` | `GET /v1/models` catalog cache lifetime |
+| `FACTORY_DROID_OPENAI_MCP_SETTLE_SECONDS` | `0` | MCP initialization window before tool discovery |
 
 Command-line options:
 
@@ -749,7 +763,9 @@ Every request passes two gates before a Droid process is involved.
 Size limits are enforced while the body is still arriving, so an oversized
 payload is rejected with `413` instead of being buffered in full. Body bytes,
 message count, tool count, serialized transcript size, tool schema size, and
-JSON nesting depth each have their own bound.
+JSON nesting depth each have their own bound. Body size, nesting depth, the
+body timeout, and request metrics cover every HTTP route, including
+`GET /v1/models` and the `/v1/factory/sessions` endpoints.
 
 Admission control then bounds how many requests reach Droid. Requests beyond
 `FACTORY_DROID_OPENAI_MAX_CONCURRENCY` wait in a queue of at most
@@ -772,6 +788,7 @@ surface.
 | `factory_droid_openai_overload_rejections_total` | Requests rejected with `429` |
 | `factory_droid_openai_payload_rejections_total` | Requests rejected with `413` |
 | `factory_droid_openai_forced_kills_total` | Droid processes that needed a kill |
+| `factory_droid_openai_model_discovery_failures_total` | Failed Droid model discovery attempts |
 
 `forced_kills_total` counts any process that did not exit within its grace
 period, so treat it as an upper bound on genuinely stuck processes.
@@ -807,12 +824,16 @@ The OpenAI client, not Factory Droid, owns tool execution.
 
 For every Droid session, the bridge:
 
-1. Selects normal interaction mode with autonomy `off`.
+1. Selects Droid's `auto` interaction mode with autonomy `off`.
 2. Requests no additional MCP servers from the SDK.
 3. Cancels permission requests and interactive questions.
-4. Gives configured MCP servers a bounded initialization window.
-5. Discovers the complete native and MCP tool catalog through `droid.list_tools`.
+4. Optionally waits `FACTORY_DROID_OPENAI_MCP_SETTLE_SECONDS` for configured MCP
+   servers, which only widens the verification snapshot and is off by default.
+5. Discovers the native and MCP tool catalog known at that moment through
+   `droid.list_tools`.
 6. Disables every discovered tool ID and verifies no unexpected tool remains.
+   Tools that appear after this point stay denied, because Droid defaults to
+   deny once a disabled set has been sent.
 7. Rejects any Factory-native tool event as a second line of defense.
 8. Validates generated tool names against the request schema.
 9. Requires tool arguments to be a JSON object with unique keys.

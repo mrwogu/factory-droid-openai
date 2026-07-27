@@ -22,6 +22,7 @@ class Settings:
     max_tools: int = 128
     max_transcript_bytes: int = 4_194_304
     max_tool_schema_bytes: int = 1_048_576
+    max_structured_output_bytes: int = 1_048_576
     max_json_depth: int = 32
     retry_after_seconds: int = 1
     process_grace_seconds: float = 1.0
@@ -35,6 +36,8 @@ class Settings:
     max_stop_sequences: int = 4
     session_continuity: bool = False
     max_tracked_sessions: int = 256
+    mcp_settle_seconds: float = 0.0
+    model_cache_seconds: float = 300.0
     worktree: str | None = None
     append_system_prompt_file: Path | None = None
     model_alias: str = "factory-droid"
@@ -79,6 +82,10 @@ class Settings:
         )
         max_tool_schema_bytes = _positive_int(
             "FACTORY_DROID_OPENAI_MAX_TOOL_SCHEMA_BYTES",
+            default=1_048_576,
+        )
+        max_structured_output_bytes = _positive_int(
+            "FACTORY_DROID_OPENAI_MAX_STRUCTURED_OUTPUT_BYTES",
             default=1_048_576,
         )
         max_json_depth = _positive_int(
@@ -140,6 +147,14 @@ class Settings:
             "FACTORY_DROID_OPENAI_MAX_TRACKED_SESSIONS",
             default=256,
         )
+        mcp_settle_seconds = _non_negative_float(
+            "FACTORY_DROID_OPENAI_MCP_SETTLE_SECONDS",
+            default=0.0,
+        )
+        model_cache_seconds = _non_negative_float(
+            "FACTORY_DROID_OPENAI_MODEL_CACHE_SECONDS",
+            default=300.0,
+        )
         worktree = os.getenv("FACTORY_DROID_OPENAI_WORKTREE") or None
         append_system_prompt_file = _optional_file(
             "FACTORY_DROID_OPENAI_APPEND_SYSTEM_PROMPT_FILE",
@@ -162,6 +177,7 @@ class Settings:
             max_tools=max_tools,
             max_transcript_bytes=max_transcript_bytes,
             max_tool_schema_bytes=max_tool_schema_bytes,
+            max_structured_output_bytes=max_structured_output_bytes,
             max_json_depth=max_json_depth,
             retry_after_seconds=retry_after_seconds,
             process_grace_seconds=process_grace_seconds,
@@ -175,6 +191,8 @@ class Settings:
             max_stop_sequences=max_stop_sequences,
             session_continuity=session_continuity,
             max_tracked_sessions=max_tracked_sessions,
+            mcp_settle_seconds=mcp_settle_seconds,
+            model_cache_seconds=model_cache_seconds,
             worktree=worktree,
             append_system_prompt_file=append_system_prompt_file,
             model_alias=os.getenv("FACTORY_DROID_OPENAI_MODEL_ALIAS", "factory-droid"),
@@ -189,6 +207,17 @@ def _positive_float(name: str, *, default: float) -> float:
         raise ValueError(f"{name} must be a number") from exc
     if not math.isfinite(value) or value <= 0:
         raise ValueError(f"{name} must be greater than zero and finite")
+    return value
+
+
+def _non_negative_float(name: str, *, default: float) -> float:
+    raw = os.getenv(name)
+    try:
+        value = float(raw) if raw is not None else default
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be zero or greater and finite")
     return value
 
 

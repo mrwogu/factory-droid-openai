@@ -5,13 +5,19 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from droid_sdk.errors import DroidClientError
+from droid_sdk.schemas.enums import (
+    AutonomyLevel,
+    DroidInteractionMode,
+    DroidServerMethod,
+)
 
 if TYPE_CHECKING:
     from droid_sdk import DroidClient
 
 _RPC_TIMEOUT_SECONDS = 30.0
+# Compaction runs a full model turn, so it needs a far larger budget than the
+# metadata RPCs. The caller's own timeout still bounds the operation.
 _COMPACTION_TIMEOUT_SECONDS = 300.0
-_MCP_SETTLE_SECONDS = 3.0
 _MCP_POLL_SECONDS = 0.1
 _UNAVOIDABLE_TOOL_IDS = frozenset({"exit-spec-mode"})
 
@@ -61,6 +67,9 @@ class CompactionResult:
 class DroidRpcExtension:
     """Compatibility shim for RPCs not yet exposed by droid-sdk-python."""
 
+    def __init__(self, *, mcp_settle_seconds: float = 0.0) -> None:
+        self._mcp_settle_seconds = max(0.0, mcp_settle_seconds)
+
     async def add_user_message(
         self,
         client: DroidClient,
@@ -77,7 +86,7 @@ class DroidRpcExtension:
             params["files"] = files
         if output_format is not None:
             params["outputFormat"] = output_format
-        await self._request(client, "droid.add_user_message", params)
+        await self._request(client, DroidServerMethod.ADD_USER_MESSAGE.value, params)
 
     async def disable_native_tools(self, client: DroidClient) -> None:
         await self._wait_for_mcp_catalog(client)
@@ -87,10 +96,10 @@ class DroidRpcExtension:
         tool_ids = sorted({_required_str(tool, "id") for tool in tools})
         await self._request(
             client,
-            "droid.update_session_settings",
+            DroidServerMethod.UPDATE_SESSION_SETTINGS.value,
             {
-                "interactionMode": "auto",
-                "autonomyLevel": "off",
+                "interactionMode": DroidInteractionMode.Auto.value,
+                "autonomyLevel": AutonomyLevel.Off.value,
                 "enabledToolIds": [],
                 "disabledToolIds": tool_ids,
             },
@@ -106,13 +115,20 @@ class DroidRpcExtension:
             raise DroidClientError(f"Failed to disable native Droid tools: {rendered}")
 
     async def _wait_for_mcp_catalog(self, client: DroidClient) -> None:
-        deadline = asyncio.get_running_loop().time() + _MCP_SETTLE_SECONDS
+        # Off by default: MCP servers that never leave "connecting" would
+        # otherwise burn the whole window on every turn, and the catalog can
+        # still grow afterwards. Droid registers tools disallowed by default,
+        # so waiting buys a larger verification snapshot, not the guarantee.
+        if self._mcp_settle_seconds <= 0:
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._mcp_settle_seconds
         while True:
-            result = await self._request(client, "droid.list_mcp_servers", {})
+            result = await self._request(client, DroidServerMethod.LIST_MCP_SERVERS.value, {})
             servers = _required_list(result, "servers")
-            if not any(_required_str(server, "status") == "connecting" for server in servers):
+            if not any(server.get("status") == "connecting" for server in servers):
                 return
-            if asyncio.get_running_loop().time() >= deadline:
+            if loop.time() >= deadline:
                 return
             await asyncio.sleep(_MCP_POLL_SECONDS)
 

@@ -959,3 +959,74 @@ async def test_runner_exposes_guarded_session_rpc_operations(tmp_path: Path) -> 
     assert client.loaded_session_id == "session"
     assert any(method == "droid.rename_session" for method, _, _ in client.rpc_requests)
     assert any(method == "droid.close_session" for method, _, _ in client.rpc_requests)
+    # Metadata operations run no model turn, so they must not touch the tool
+    # catalog or rewrite session settings. Compaction does run a turn.
+    assert [method for method, _, _ in client.rpc_requests].count(
+        "droid.update_session_settings"
+    ) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "status_code", "error_type"),
+    [
+        (SessionNotFoundError("session"), 404, "session_not_found"),
+        (FileNotFoundError("droid"), 503, "factory_droid_unavailable"),
+        (DroidClientError("broken"), 502, "factory_droid_sdk_error"),
+        (DroidTimeoutError("slow"), 504, "factory_droid_timeout"),
+    ],
+)
+async def test_session_operations_map_sdk_failures(
+    tmp_path: Path,
+    failure: Exception,
+    status_code: int,
+    error_type: str,
+) -> None:
+    class FailingClient(FakeClient):
+        async def load_session(
+            self,
+            *,
+            session_id: str,
+            mcp_servers: list[dict[str, Any]] | None = None,
+        ) -> None:
+            del session_id, mcp_servers
+            raise failure
+
+    client = FailingClient([])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    with pytest.raises(RunnerError) as excinfo:
+        await runner.rename_session("session", title="Title", timeout_seconds=1)
+
+    assert excinfo.value.status_code == status_code
+    assert excinfo.value.error_type == error_type
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_session_operations_time_out_on_a_slow_droid(tmp_path: Path) -> None:
+    class SlowClient(FakeClient):
+        async def load_session(
+            self,
+            *,
+            session_id: str,
+            mcp_servers: list[dict[str, Any]] | None = None,
+        ) -> None:
+            del session_id, mcp_servers
+            await asyncio.sleep(1)
+
+    client = SlowClient([])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    with pytest.raises(RunnerError, match="timed out"):
+        await runner.close_session("session", timeout_seconds=0.01)
+
+    assert client.closed is True

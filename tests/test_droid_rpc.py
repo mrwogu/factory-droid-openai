@@ -106,12 +106,13 @@ async def test_disable_native_tools_verifies_exec_and_mcp_catalogs() -> None:
     ("tools", "message"),
     [
         ([], "empty native tool catalog"),
+        ("not-a-list", "'tools' is malformed"),
         ([{"id": 3, "currentlyAllowed": True}], "'id' is malformed"),
         ([{"id": "read-cli", "currentlyAllowed": "yes"}], "'currentlyAllowed' is malformed"),
     ],
 )
 async def test_disable_native_tools_rejects_malformed_catalogs(
-    tools: list[dict[str, object]],
+    tools: object,
     message: str,
 ) -> None:
     def handler(method: str, _params: dict[str, Any]) -> dict[str, Any]:
@@ -128,18 +129,50 @@ async def test_disable_native_tools_rejects_malformed_catalogs(
 
 
 @pytest.mark.asyncio
-async def test_disable_native_tools_bounds_mcp_catalog_wait(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from factory_droid_openai import droid_rpc
+async def test_disable_native_tools_skips_the_mcp_probe_by_default() -> None:
+    protocol = FakeProtocol(_settle_handler())
 
-    monkeypatch.setattr(droid_rpc, "_MCP_SETTLE_SECONDS", 0.0)
+    await DroidRpcExtension().disable_native_tools(_client(protocol))
+
+    assert [method for method, _, _ in protocol.calls] == [
+        "droid.list_tools",
+        "droid.update_session_settings",
+        "droid.list_tools",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_disable_native_tools_bounds_mcp_catalog_wait() -> None:
+    protocol = FakeProtocol(_settle_handler())
+
+    await DroidRpcExtension(mcp_settle_seconds=0.15).disable_native_tools(_client(protocol))
+
+    probes = [method for method, _, _ in protocol.calls if method == "droid.list_mcp_servers"]
+    assert len(probes) > 1
+    assert any(method == "droid.update_session_settings" for method, _, _ in protocol.calls)
+
+
+@pytest.mark.asyncio
+async def test_disable_native_tools_tolerates_mcp_servers_without_status() -> None:
+    handler = _settle_handler(servers=[{"name": "local"}])
+    protocol = FakeProtocol(handler)
+
+    await DroidRpcExtension(mcp_settle_seconds=5.0).disable_native_tools(_client(protocol))
+
+    probes = [method for method, _, _ in protocol.calls if method == "droid.list_mcp_servers"]
+    assert probes == ["droid.list_mcp_servers"]
+
+
+def _settle_handler(
+    servers: list[dict[str, Any]] | None = None,
+) -> Callable[[str, dict[str, Any]], dict[str, Any]]:
+    resolved_servers = [{"status": "connecting"}] if servers is None else servers
     disabled = False
 
     def handler(method: str, params: dict[str, Any]) -> dict[str, Any]:
         nonlocal disabled
         if method == "droid.list_mcp_servers":
-            return {"result": {"servers": [{"status": "connecting"}]}}
+            return {"result": {"servers": resolved_servers}}
         if method == "droid.list_tools":
             return {
                 "result": {
@@ -153,9 +186,7 @@ async def test_disable_native_tools_bounds_mcp_catalog_wait(
             return {"result": {}}
         raise AssertionError(method)
 
-    await DroidRpcExtension().disable_native_tools(_client(FakeProtocol(handler)))
-
-    assert disabled is True
+    return handler
 
 
 @pytest.mark.asyncio
