@@ -29,11 +29,10 @@ services:
       # FACTORY_DROID_OPENAI_MAX_CONCURRENCY: "2"
       # FACTORY_DROID_OPENAI_TIMEOUT_SECONDS: "600"
       # FACTORY_DROID_OPENAI_MODEL_CACHE_SECONDS: "300"
-    volumes:
-      # Optional: expose your project to Droid as /work. Read-only is safe
-      # because Factory-native tools are disabled. Remove this block to run
-      # without a workdir.
-      - ./:/work:ro
+    # Optional: expose your project to Droid as /work. Read-only is safe
+    # because Factory-native tools are disabled. Uncomment to mount a workdir.
+    # volumes:
+    #   - ./:/work:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/health"]

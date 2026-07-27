@@ -266,7 +266,7 @@ uv run factory-droid-openai
 
 ### Docker
 
-A prebuilt multi-arch image is published to GitHub Container Registry for
+A prebuilt image is published to GitHub Container Registry for
 each release:
 
 ```bash
@@ -300,10 +300,16 @@ export FACTORY_DROID_OPENAI_API_KEY="$(python -c 'import secrets; print(secrets.
 docker compose up -d
 ```
 
+Podman works as a drop-in replacement. Use `podman-compose` or replace
+`docker` with `podman` in the commands above. The compose file uses
+`${VAR:?error}` syntax to require environment variables; set both keys in
+your shell or in a `.env` file before starting the container.
+
 The `/work` volume is optional. The bridge disables all Factory-native
 tools, so Droid never writes to the working directory; a read-only mount
 is safe and sufficient when you want Droid to see project context. Remove
-the `-v` flag or the `volumes` block to run without a workdir.
+the `-v` flag when using `docker run`, or comment out the `volumes` block
+in `docker-compose.yml` when using Compose, to run without a workdir.
 
 To build the image locally instead of pulling it:
 

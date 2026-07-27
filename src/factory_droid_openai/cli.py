@@ -44,6 +44,19 @@ def main(argv: Sequence[str] | None = None) -> None:
         default="info",
     )
     args = parser.parse_args(argv)
+
+    if not settings.api_key:
+        import sys
+
+        print(
+            "  WARNING  FACTORY_DROID_OPENAI_API_KEY is not set.\n"
+            "           The bridge accepts unauthenticated requests.\n"
+            "           Generate a token and export it to secure the bridge:\n"
+            '             export FACTORY_DROID_OPENAI_API_KEY="$(python -c \\\n'
+            "               'import secrets; print(secrets.token_urlsafe(32))')\"\n",
+            file=sys.stderr,
+        )
+
     uvicorn.run(
         "factory_droid_openai.app:app",
         host=args.host,
