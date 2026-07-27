@@ -9,22 +9,40 @@ Unofficial, local-first OpenAI-compatible HTTP bridge for
 [Factory Droid](https://www.factory.ai/) using
 [`droid-sdk-python`](https://github.com/Factory-AI/droid-sdk-python).
 
-Connect OpenAI-compatible clients, frameworks, and agents to a locally
-authenticated Factory Droid CLI through `/v1/chat/completions`.
+The bridge exposes `/v1/chat/completions`, so you can drive any client that
+speaks the OpenAI Chat Completions protocol with your Factory Droid account
+instead of an OpenAI API key. Examples include the GitHub Copilot chat
+experience in VS Code through its Bring Your Own Key Custom Endpoint, plus
+Continue, Cursor, Aider, Zed, Cline, Roo Code, Open WebUI, LLM CLI,
+LangChain and LlamaIndex agents, Hermes, OpenClaw, and any framework that lets
+you set a custom `base_url`. The OpenAI transcript and external tool schemas
+are serialized into one strict prompt per request, and the client keeps
+ownership of tool execution.
 
 This project is not affiliated with, endorsed by, or maintained by Factory.
 
 ## Quick start
 
 Requires Python 3.11+, an installed `droid` CLI, and an authenticated Factory
-session.
+session. Verify the CLI once with `droid --version`.
+
+Install the bridge as a tool, then run it from the project directory Droid
+should operate in. The working directory defaults to the current directory, so
+no environment variable is required for local use.
 
 ```bash
-git clone https://github.com/mrwogu/factory-droid-openai.git
-cd factory-droid-openai
-uv sync
-FACTORY_DROID_OPENAI_WORKDIR="/path/to/your/project" \
-  uv run factory-droid-openai
+uv tool install factory-droid-openai
+cd /path/to/your/project
+factory-droid-openai
+```
+
+`pipx install factory-droid-openai` works the same way if you prefer pipx.
+
+To point Droid at a different directory than the one you launched from, set
+`FACTORY_DROID_OPENAI_WORKDIR` as an override:
+
+```bash
+FACTORY_DROID_OPENAI_WORKDIR="/path/to/your/project" factory-droid-openai
 ```
 
 From another terminal, send an explicit Droid model ID:
@@ -159,6 +177,36 @@ Run Droid normally once if authentication or first-time setup is required.
 For service-account execution, export `FACTORY_API_KEY`; the Droid subprocess
 inherits it directly. The bridge does not rename or copy that credential.
 
+### Python
+
+[Python](https://www.python.org/downloads/) 3.11 or newer (3.12, 3.13, and
+3.14 are also tested). On Windows, the
+[official installer](https://www.python.org/downloads/windows/) works; ensure
+Python is on `PATH` or invoke it via `py -3`.
+
+### Factory Droid CLI
+
+Install the [Factory `droid` CLI](https://docs.factory.ai/reference/cli-reference#installation):
+
+| OS | Command |
+|---|---|
+| macOS / Linux | `curl -fsSL https://app.factory.ai/cli \| sh` |
+| Windows (PowerShell) | `irm https://app.factory.ai/cli/windows \| iex` |
+| Any (npm) | `npm install -g droid` |
+
+Authenticate interactively once, or set a `FACTORY_API_KEY` service-account
+key generated at
+[app.factory.ai/settings/api-keys](https://app.factory.ai/settings/api-keys).
+
+### Docker (optional)
+
+[Docker](https://docs.docker.com/get-docker/) or
+[Docker Desktop](https://docs.docker.com/desktop/) is optional and only needed
+to run the bridge as a long-lived container from the prebuilt image on
+[GHCR](https://github.com/mrwogu/factory-droid-openai/pkgs/container/factory-droid-openai).
+See the [Docker](#docker) section. The bridge itself has no Docker runtime
+dependency.
+
 ## Installation
 
 Released versions are published to
@@ -194,6 +242,65 @@ cd factory-droid-openai
 uv sync
 uv run factory-droid-openai
 ```
+
+### Docker
+
+A prebuilt multi-arch image is published to GitHub Container Registry for
+each release:
+
+```bash
+docker pull ghcr.io/mrwogu/factory-droid-openai:latest
+```
+
+The image bundles a pinned Droid CLI with auto-updates disabled, so the
+bridge and CLI versions are reproducible. Droid runs as a non-root user
+(`uid 1000`) and the bridge listens on `0.0.0.0:8787` inside the container.
+
+Run it with a Factory service-account key and a bridge bearer token. Bind
+the port to loopback on the host so the bridge is not exposed to the
+network:
+
+```bash
+docker run -d --name droid-bridge \
+  -p 127.0.0.1:8787:8787 \
+  -e FACTORY_API_KEY="$FACTORY_API_KEY" \
+  -e FACTORY_DROID_OPENAI_API_KEY="$FACTORY_DROID_OPENAI_API_KEY" \
+  -v "$PWD":/work:ro \
+  ghcr.io/mrwogu/factory-droid-openai:latest
+```
+
+`docker compose up -d` with the included `docker-compose.yml` does the same.
+Copy the compose file, set `FACTORY_API_KEY` and
+`FACTORY_DROID_OPENAI_API_KEY` in your environment or a `.env` file, and run:
+
+```bash
+export FACTORY_API_KEY=fk-...
+export FACTORY_DROID_OPENAI_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+docker compose up -d
+```
+
+The `/work` volume is optional. The bridge disables all Factory-native
+tools, so Droid never writes to the working directory; a read-only mount
+is safe and sufficient when you want Droid to see project context. Remove
+the `-v` flag or the `volumes` block to run without a workdir.
+
+To build the image locally instead of pulling it:
+
+```bash
+docker build -t factory-droid-openai .
+# or, pinning the Droid CLI version:
+docker build --build-arg DROID_VERSION=0.174.0 -t factory-droid-openai .
+```
+
+Authentication inside a container uses `FACTORY_API_KEY` only. Interactive
+`droid` login does not work in a container, so generate a key at
+[app.factory.ai/settings/api-keys](https://app.factory.ai/settings/api-keys)
+and pass it as an environment variable. The bridge never reads or copies
+that credential; the Droid subprocess inherits it directly.
+
+Never publish the bridge port to a non-loopback interface without a
+configured `FACTORY_DROID_OPENAI_API_KEY`. See
+[SECURITY.md](SECURITY.md) before any remote deployment.
 
 The default address is `http://127.0.0.1:8787`.
 
@@ -453,6 +560,91 @@ OpenClaw retains ownership of tool execution. Tool calling, tool-result
 continuation, streaming usage, developer messages, and reasoning effort are
 enabled explicitly. Strict tool schemas, temperature control, multimodal SDK
 attachments, and parallel tool calls remain unsupported by this bridge.
+
+## VS Code
+
+VS Code's
+[Bring Your Own Key](https://code.visualstudio.com/docs/agent-customization/language-models#_bring-your-own-language-model-key)
+Custom Endpoint provider speaks Chat Completions, so it can drive the bridge
+without a Copilot plan or a GitHub sign-in.
+
+Open the model picker, select **Manage Language Models**, then **Add Models**
+and **Custom Endpoint**. Pick **Chat Completions** as the API type. VS Code
+opens `chatLanguageModels.json`; add this provider entry:
+
+```json
+[
+  {
+    "name": "Factory Droid",
+    "vendor": "customendpoint",
+    "apiKey": "none",
+    "apiType": "chat-completions",
+    "models": [
+      {
+        "id": "gpt-5.4",
+        "name": "GPT-5.4 via Factory Droid",
+        "url": "http://127.0.0.1:8787/v1/chat/completions",
+        "toolCalling": true,
+        "thinking": true,
+        "streaming": true,
+        "supportsReasoningEffort": ["minimal", "low", "medium", "high"],
+        "maxInputTokens": 180000,
+        "maxOutputTokens": 20000
+      }
+    ]
+  }
+]
+```
+
+`id` is the explicit Droid model ID. Replace it with another ID from
+`GET /v1/models` or `droid exec --help`, such as `gemini-3.1-pro-preview` or
+the `factory-droid` alias. Each ID needs its own entry in `models`.
+
+When bearer authentication is enabled, set the same token as `apiKey`. The
+placeholder `none` works only on a loopback bridge without a configured token.
+
+`toolCalling: true` is required for the model to appear in agent sessions.
+`thinking` and `supportsReasoningEffort` surface the reasoning effort picker;
+the bridge maps those levels to Droid reasoning effort.
+
+VS Code retains ownership of tool execution. The bridge converts Droid's
+strict tool protocol into OpenAI `tool_calls`, and VS Code returns tool
+results in the next serialized transcript.
+
+BYOK covers chat and utility tasks only. Inline suggestions (code
+completions), semantic search, and embedding-dependent features still require
+a Copilot plan and a GitHub account. Without a GitHub sign-in, set
+`chat.utilityModel` and `chat.utilitySmallModel` to a configured model so
+title generation, commit messages, and intent detection keep working.
+
+The bridge defaults to one concurrent Droid subprocess
+(`FACTORY_DROID_OPENAI_MAX_CONCURRENCY=1`), so a chat turn blocks utility
+tasks until it finishes. Raise that limit, or point utility tasks at a
+separate lightweight model, to avoid serial stalls.
+
+### Coverage with VS Code BYOK
+
+What works through the Custom Endpoint provider:
+
+- Chat and agent sessions, including tool calling
+- Streaming responses
+- Reasoning effort picker (`thinking`, `supportsReasoningEffort`)
+- Structured output via `response_format`
+- Inline image and PDF attachments sent as `data:` URIs
+
+What VS Code BYOK does not cover, regardless of the bridge:
+
+- Inline suggestions (code completions)
+- Semantic search and embedding-dependent features
+- Any feature that requires a Copilot plan or GitHub sign-in
+
+What the bridge accepts but ignores when VS Code sends it:
+`temperature`, `top_p`, `seed`, `max_tokens`, `max_completion_tokens`,
+`logprobs`, and `top_logprobs`. These are documented in the
+[API compatibility](#api-compatibility) table. Remote `http(s)` image URLs are
+rejected with `400`; send vision inputs as base64 `data:` URIs instead.
+VSCode does not auto-discover models from a Custom Endpoint, so every Droid
+model ID you want in the picker needs its own entry in `chatLanguageModels.json`.
 
 ## API reference
 

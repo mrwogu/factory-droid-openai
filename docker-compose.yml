@@ -1,0 +1,43 @@
+# Run the Factory Droid OpenAI Bridge as a container.
+#
+# Required environment (set in .env or your shell):
+#   FACTORY_API_KEY                 Factory service-account key (fk-...).
+#   FACTORY_DROID_OPENAI_API_KEY    Bridge bearer token clients must send.
+#
+# Optional:
+#   Mount your project at /work so Droid sees it as the working directory.
+#   The bridge disables all Factory-native tools, so the mount can be
+#   read-only. Remove the volumes block below if you do not need a workdir.
+#
+# Usage:
+#   export FACTORY_API_KEY=fk-...
+#   export FACTORY_DROID_OPENAI_API_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')
+#   docker compose up -d
+#   curl -fsS http://127.0.0.1:8787/health
+
+services:
+  droid-bridge:
+    image: ghcr.io/mrwogu/factory-droid-openai:latest
+    # Build locally instead of pulling the published image:
+    # build: .
+    ports:
+      - "127.0.0.1:8787:8787"
+    environment:
+      FACTORY_API_KEY: ${FACTORY_API_KEY:?FACTORY_API_KEY must be set}
+      FACTORY_DROID_OPENAI_API_KEY: ${FACTORY_DROID_OPENAI_API_KEY:?FACTORY_DROID_OPENAI_API_KEY must be set}
+      # Optional overrides:
+      # FACTORY_DROID_OPENAI_MAX_CONCURRENCY: "2"
+      # FACTORY_DROID_OPENAI_TIMEOUT_SECONDS: "600"
+      # FACTORY_DROID_OPENAI_MODEL_CACHE_SECONDS: "300"
+    volumes:
+      # Optional: expose your project to Droid as /work. Read-only is safe
+      # because Factory-native tools are disabled. Remove this block to run
+      # without a workdir.
+      - ./:/work:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
