@@ -632,7 +632,7 @@ def create_app(
             "An unofficial compatibility bridge for OpenAI Chat Completions clients. "
             "The bridge runs one isolated Factory Droid session per request."
         ),
-        version="1.3.1",  # x-release-please-version
+        version="1.3.2",  # x-release-please-version
         license_info={
             "name": "Apache License 2.0",
             "identifier": "Apache-2.0",
