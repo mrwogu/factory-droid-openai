@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.3.1](https://github.com/mrwogu/factory-droid-openai/compare/v1.3.0...v1.3.1) (2026-07-27)
+
+
+### Bug Fixes
+
+* **models:** withhold models an organization policy blocks ([#17](https://github.com/mrwogu/factory-droid-openai/issues/17)) ([b5e5100](https://github.com/mrwogu/factory-droid-openai/commit/b5e5100e7b29f3957294ea27c564abd296bb504c))
+
+
+### Performance Improvements
+
+* **pool:** retune warm sessions instead of cold starts ([#16](https://github.com/mrwogu/factory-droid-openai/issues/16)) ([3715616](https://github.com/mrwogu/factory-droid-openai/commit/37156164e80cff998231d94340ebcc875766dc54))
+
 ## [1.3.0](https://github.com/mrwogu/factory-droid-openai/compare/v1.2.1...v1.3.0) (2026-07-27)
 
 
