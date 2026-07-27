@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.2.0](https://github.com/mrwogu/factory-droid-openai/compare/v1.1.0...v1.2.0) (2026-07-27)
+
+
+### Features
+
+* multi-arch Docker, Podman docs, unauthenticated warning ([6655828](https://github.com/mrwogu/factory-droid-openai/commit/6655828b6b1b84a708716c015127c021be7cd775))
+
+
+### Bug Fixes
+
+* handle unset DROID_VERSION in Docker build ([278c1e0](https://github.com/mrwogu/factory-droid-openai/commit/278c1e002f73565522a9b9fe635ea59f91788dc8))
+
 ## [1.1.0](https://github.com/mrwogu/factory-droid-openai/compare/v1.0.0...v1.1.0) (2026-07-27)
 
 
