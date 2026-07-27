@@ -24,6 +24,7 @@ class BridgeMetrics:
         self._model_discovery_failures = 0
         self._warm_sessions = 0
         self._warm_hits = 0
+        self._warm_retunes = 0
         self._warm_misses = 0
         self._warm_failures = 0
         self._pending_reaps = 0
@@ -78,6 +79,10 @@ class BridgeMetrics:
         with self._lock:
             self._warm_hits += 1
 
+    def increment_warm_retunes(self) -> None:
+        with self._lock:
+            self._warm_retunes += 1
+
     def increment_warm_misses(self) -> None:
         with self._lock:
             self._warm_misses += 1
@@ -110,6 +115,7 @@ class BridgeMetrics:
                 "model_discovery_failures": self._model_discovery_failures,
                 "warm_sessions": self._warm_sessions,
                 "warm_hits": self._warm_hits,
+                "warm_retunes": self._warm_retunes,
                 "warm_misses": self._warm_misses,
                 "warm_failures": self._warm_failures,
                 "pending_reaps": self._pending_reaps,
@@ -158,6 +164,8 @@ class BridgeMetrics:
             f"factory_droid_openai_warm_sessions {values['warm_sessions']}",
             "# TYPE factory_droid_openai_warm_session_hits_total counter",
             f"factory_droid_openai_warm_session_hits_total {values['warm_hits']}",
+            "# TYPE factory_droid_openai_warm_session_retunes_total counter",
+            f"factory_droid_openai_warm_session_retunes_total {values['warm_retunes']}",
             "# TYPE factory_droid_openai_warm_session_misses_total counter",
             f"factory_droid_openai_warm_session_misses_total {values['warm_misses']}",
             "# TYPE factory_droid_openai_warm_session_failures_total counter",

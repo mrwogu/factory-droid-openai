@@ -114,10 +114,10 @@ def test_warm_session_count_tracks_max_concurrency_unless_set(
 
     tracking = Settings.from_env()
     assert tracking.warm_sessions == -1
-    assert tracking.warm_session_count() == 3
+    assert tracking.warm_session_count() == 4
 
     monkeypatch.setenv("FACTORY_DROID_OPENAI_WARM_SESSIONS", " ")
-    assert Settings.from_env().warm_session_count() == 3
+    assert Settings.from_env().warm_session_count() == 4
 
     monkeypatch.setenv("FACTORY_DROID_OPENAI_WARM_SESSIONS", "0")
     disabled = Settings.from_env()

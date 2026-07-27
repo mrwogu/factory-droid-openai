@@ -27,7 +27,7 @@ class Settings:
     max_structured_output_bytes: int = 1_048_576
     max_json_depth: int = 32
     retry_after_seconds: int = 1
-    process_grace_seconds: float = 1.0
+    process_grace_seconds: float = 2.0
     cleanup_timeout_seconds: float = 4.0
     server_limit_concurrency: int = 64
     server_backlog: int = 128
@@ -50,9 +50,13 @@ class Settings:
     detached_cleanup: bool = True
 
     def warm_session_count(self) -> int:
-        """Warm sessions to keep ready; ``-1`` tracks ``max_concurrency``."""
+        """Warm sessions to keep ready; ``-1`` keeps one spare per concurrency slot.
+
+        A session serves a single turn, and refilling one costs seconds, so the
+        spare covers back-to-back requests while the pool refills.
+        """
         if self.warm_sessions < 0:
-            return self.max_concurrency
+            return self.max_concurrency + 1
         return self.warm_sessions
 
     @classmethod
@@ -120,7 +124,9 @@ class Settings:
         )
         process_grace_seconds = _positive_float(
             "FACTORY_DROID_OPENAI_PROCESS_GRACE_SECONDS",
-            default=1.0,
+            # droid shuts down cleanly in about a second, so a shorter grace
+            # period turns every teardown into a SIGKILL.
+            default=2.0,
         )
         cleanup_timeout_seconds = _positive_float(
             "FACTORY_DROID_OPENAI_CLEANUP_TIMEOUT_SECONDS",

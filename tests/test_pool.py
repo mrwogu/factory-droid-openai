@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 KEY = SessionKey(model_id="model-a", reasoning_effort="high")
 OTHER_KEY = SessionKey(model_id="model-b", reasoning_effort=None)
+RETUNE_KEY = SessionKey(model_id="model-b", reasoning_effort="high")
 
 
 class FakeTransport:
@@ -330,6 +331,75 @@ async def test_pool_moves_capacity_to_the_key_traffic_switched_to() -> None:
     assert sorted(log) == ["discard:model-a", "warm:model-a", "warm:model-b"]
     session = pool.acquire(OTHER_KEY)
     assert session is not None
+    await pool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_pool_hands_over_a_session_the_runner_can_retune() -> None:
+    metrics = BridgeMetrics()
+    pool = _pool(FakeRunner(), size=2, metrics=metrics)
+    pool.note(KEY)
+    pool.offer(_session(created_at=asyncio.get_running_loop().time()))
+
+    session = pool.acquire(RETUNE_KEY)
+
+    assert session is not None
+    assert session.key == KEY
+    rendered = metrics.render()
+    assert "factory_droid_openai_warm_session_retunes_total 1" in rendered
+    assert "factory_droid_openai_warm_session_hits_total 1" in rendered
+    assert "factory_droid_openai_warm_session_misses_total 0" in rendered
+
+
+@pytest.mark.asyncio
+async def test_pool_hands_over_a_retunable_session_without_metrics() -> None:
+    pool = _pool(FakeRunner(), size=2)
+    pool.note(KEY)
+    pool.offer(_session(created_at=asyncio.get_running_loop().time()))
+
+    assert pool.acquire(RETUNE_KEY) is not None
+
+
+@pytest.mark.asyncio
+async def test_pool_does_not_hand_over_dead_sessions_for_retuning() -> None:
+    log: list[str] = []
+    metrics = BridgeMetrics()
+    pool = _pool(FakeRunner(log=log), size=2, metrics=metrics)
+    pool.note(KEY)
+    pool.offer(_session(reaped=True))
+
+    assert pool.acquire(RETUNE_KEY) is None
+    await asyncio.sleep(0)
+
+    assert log == ["discard:model-a"]
+    assert "factory_droid_openai_warm_session_misses_total 1" in metrics.render()
+
+
+@pytest.mark.asyncio
+async def test_pool_refills_every_missing_session_in_one_pass() -> None:
+    class SlowRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.concurrent = 0
+            self.peak = 0
+
+        async def warm(self, key: SessionKey, *, timeout_seconds: float) -> WarmSession:
+            self.concurrent += 1
+            self.peak = max(self.peak, self.concurrent)
+            try:
+                await asyncio.sleep(0.02)
+                return await super().warm(key, timeout_seconds=timeout_seconds)
+            finally:
+                self.concurrent -= 1
+
+    runner = SlowRunner()
+    pool = _pool(runner, size=3)
+
+    pool.start(initial_key=KEY)
+    await asyncio.sleep(0.05)
+
+    assert runner.warmed == 3
+    assert runner.peak == 3
     await pool.aclose()
 
 
