@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.3.0](https://github.com/mrwogu/factory-droid-openai/compare/v1.2.1...v1.3.0) (2026-07-27)
+
+
+### Features
+
+* **logs:** add structured verbose logging with phase timings ([b442435](https://github.com/mrwogu/factory-droid-openai/commit/b4424359c7717b984b5acc059e47eb8a480b74a3))
+* **perf:** serve requests from a warm Droid session pool ([0178b7e](https://github.com/mrwogu/factory-droid-openai/commit/0178b7ebce58ecead264812f0b81957d5919552e))
+
+
+### Bug Fixes
+
+* **ci:** build docker images without blocked third-party actions ([#15](https://github.com/mrwogu/factory-droid-openai/issues/15)) ([d75790f](https://github.com/mrwogu/factory-droid-openai/commit/d75790f87773b6d16c73327d7bf5d6f5d670059f))
+
 ## [1.2.1](https://github.com/mrwogu/factory-droid-openai/compare/v1.2.0...v1.2.1) (2026-07-27)
 
 
