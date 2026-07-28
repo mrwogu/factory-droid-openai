@@ -243,6 +243,29 @@ The bridge validates the tool name and JSON arguments, then returns a standard
 OpenAI `tool_calls` object. The OpenAI client executes the tool and sends its
 result in the next request.
 
+A model sometimes answers in the chat template it was trained on instead of
+that contract. The bridge translates those forms into the same `tool_calls`
+object rather than failing the turn or leaking template tokens as assistant
+text. Every accepted form lives in one table in
+`src/factory_droid_openai/dialects.py`.
+
+| Accepted form | Observed on |
+|---|---|
+| `<tool_call>{"name":...,"arguments":...}</tool_call>` | this bridge's contract, Hermes-style output |
+| `<tool_call><function=name><parameter=key>value</parameter></function></tool_call>` | Qwen3 Coder XML |
+| `<\|tool_calls_section_begin\|>` … `<\|tool_calls_section_end\|>` | Kimi K2 |
+| `<\|open\|>tools<\|sep\|>` … `<\|close\|>tools` | Kimi K3 |
+| `<\|channel\|>commentary to=functions.name` … `<\|call\|>` | gpt-oss Harmony |
+| `<｜tool▁calls▁begin｜>` … `<｜tool▁calls▁end｜>` | DeepSeek V3 and V3.1 |
+| `<\|action_start\|><\|plugin\|>{"name":...}<\|action_end\|>` | InternLM2 |
+| `name<arg_key>key</arg_key><arg_value>value</arg_value>` | GLM |
+| a JSON array of calls inside one marker pair | Mistral, Jamba, Granite and xLAM style output |
+
+Translation never widens validation. An unknown tool name, a truncated payload,
+a duplicate argument key, or prose after a call still fails the turn. Qwen3's
+XML form declares no argument types, so a scalar value stays the string the
+model wrote unless it wrote a JSON object or array.
+
 ## Requirements
 
 - Python 3.11 or newer
@@ -795,7 +818,9 @@ ID from `GET /v1/models`.
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/health` | Process health check |
+| `GET` | `/version` | Bridge version, unauthenticated like `/health` |
 | `GET` | `/v1/models` | Bridge alias and dynamically discovered Droid models |
+| `GET` | `/v1/models/{model_id}` | One model, or `404 model_not_found` |
 | `POST` | `/v1/chat/completions` | Chat completions and streaming |
 | `GET` | `/v1/factory/sessions/{id}/context` | Context statistics and breakdown |
 | `POST` | `/v1/factory/sessions/{id}/compact` | Compact history into a new session |
