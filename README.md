@@ -655,9 +655,23 @@ VS Code's
 Custom Endpoint provider speaks Chat Completions, so it can drive the bridge
 without a Copilot plan or a GitHub sign-in.
 
-Open the model picker, select **Manage Language Models**, then **Add Models**
-and **Custom Endpoint**. Pick **Chat Completions** as the API type. VS Code
-opens `chatLanguageModels.json`; add this provider entry:
+Setup walks through several prompts in order:
+
+1. Open the model picker, select **Manage Language Models**, then **Add
+   Models** and **Custom Endpoint**.
+2. VS Code asks for the provider name. Enter `Factory Droid`.
+3. VS Code asks for an API key. Enter the same token you set in the
+   `FACTORY_DROID_OPENAI_API_KEY` environment variable when bearer
+   authentication is enabled on the bridge. This is optional: leave it empty
+   (or enter `none`) for a loopback bridge without a configured token. Do not
+   confuse it with your Factory Droid API key - the bridge never accepts
+   Factory credentials here, only its own bearer token.
+4. VS Code asks for the API type. Pick **Chat Completions**.
+5. VS Code opens `chatLanguageModels.json`. Paste the provider entry below,
+   or generate one against a running bridge with
+   `scripts/generate_vscode_models.py` (described further down).
+
+Provider entry:
 
 ```json
 [
