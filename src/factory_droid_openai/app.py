@@ -44,6 +44,7 @@ from factory_droid_openai.models import (
     RenameSessionRequest,
     SessionContextResponse,
     SessionOperationResponse,
+    VersionResponse,
 )
 from factory_droid_openai.pool import BackgroundReaper, WarmSessionPool
 from factory_droid_openai.protocol import (
@@ -167,6 +168,22 @@ MODEL_LIST_RESPONSES: dict[int | str, dict[str, Any]] = {
         status: response
         for status, response in FACTORY_OPERATION_RESPONSES.items()
         if status != 404
+    },
+}
+MODEL_RETRIEVE_RESPONSES: dict[int | str, dict[str, Any]] = {
+    200: {
+        "model": ModelInfo,
+        "description": "The bridge alias or one discovered Droid model.",
+        "headers": MODEL_LIST_RESPONSES[200]["headers"],
+    },
+    **{
+        status: response
+        for status, response in FACTORY_OPERATION_RESPONSES.items()
+        if status != 404
+    },
+    404: {
+        "model": ErrorResponse,
+        "description": "The requested model is unknown to this bridge.",
     },
 }
 
@@ -784,6 +801,15 @@ def create_app(
     async def health() -> HealthResponse:
         return HealthResponse(status="ok")
 
+    @application.get(
+        "/version",
+        response_model=VersionResponse,
+        tags=["Service"],
+        summary="Read the bridge version",
+    )
+    async def version() -> VersionResponse:
+        return VersionResponse(version=application.version)
+
     @application.get("/metrics", include_in_schema=False)
     async def service_metrics() -> PlainTextResponse:
         return PlainTextResponse(
@@ -821,6 +847,36 @@ def create_app(
                 available,
                 created=bridge_created,
             )
+        )
+
+    @application.get(
+        "/v1/models/{model_id}",
+        response_model=ModelInfo,
+        response_model_exclude_none=True,
+        dependencies=[Depends(require_auth)],
+        responses=MODEL_RETRIEVE_RESPONSES,
+        tags=["OpenAI compatibility"],
+        summary="Retrieve one available Factory Droid model",
+    )
+    async def retrieve_model(model_id: str, response: Response) -> ModelInfo:
+        discovered, degraded = await model_catalog.get()
+        if degraded:
+            metrics.increment_model_discovery_failures()
+            log_warning("models.discovery_degraded", cached=len(discovered))
+            response.headers["x-factory-droid-model-discovery"] = "degraded"
+        available = tuple(model for model in discovered if quarantine.allows(model.id))
+        catalog = _model_list(
+            resolved_settings.model_alias,
+            available,
+            created=bridge_created,
+        )
+        for model in catalog:
+            if model.id == model_id:
+                return model
+        raise BridgeHTTPError(
+            f"Model '{model_id}' is not available on this bridge.",
+            status_code=404,
+            error_type="model_not_found",
         )
 
     @application.get(

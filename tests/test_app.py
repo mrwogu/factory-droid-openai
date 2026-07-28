@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
 import json
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
@@ -252,6 +253,74 @@ async def test_health_and_models(tmp_path: Path) -> None:
         "factory_droid_supports_images": True,
         "factory_droid_supports_pdfs": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_version_reports_the_bridge_package_version(tmp_path: Path) -> None:
+    runner = FakeRunner([])
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.get("/version")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "version": importlib.metadata.version("factory-droid-openai"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_retrieve_model_matches_the_list_entry(tmp_path: Path) -> None:
+    runner = FakeRunner([])
+    async with _client(_app(tmp_path, runner)) as client:
+        listed = await client.get("/v1/models")
+        alias = await client.get("/v1/models/factory-droid")
+        discovered = await client.get("/v1/models/gpt-5.4")
+
+    entries = {model["id"]: model for model in listed.json()["data"]}
+    assert alias.status_code == 200
+    assert alias.json() == entries["factory-droid"]
+    assert discovered.status_code == 200
+    assert discovered.json() == entries["gpt-5.4"]
+
+
+@pytest.mark.asyncio
+async def test_retrieve_model_rejects_an_unknown_model(tmp_path: Path) -> None:
+    runner = FakeRunner([])
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.get("/v1/models/kimi-k3")
+
+    assert response.status_code == 404
+    assert response.json() == {
+        "error": {
+            "message": "Model 'kimi-k3' is not available on this bridge.",
+            "type": "model_not_found",
+            "param": None,
+            "code": None,
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_retrieve_model_serves_the_alias_when_droid_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    class UnavailableRunner(FakeRunner):
+        async def list_models(self, *, timeout_seconds: float) -> tuple[DroidModel, ...]:
+            del timeout_seconds
+            raise RunnerError(
+                "Droid missing",
+                status_code=503,
+                error_type="factory_droid_unavailable",
+            )
+
+    runner = UnavailableRunner([])
+    async with _client(_app(tmp_path, runner)) as client:
+        alias = await client.get("/v1/models/factory-droid")
+        missing = await client.get("/v1/models/gpt-5.4")
+
+    assert alias.status_code == 200
+    assert alias.json()["id"] == "factory-droid"
+    assert alias.headers["x-factory-droid-model-discovery"] == "degraded"
+    assert missing.status_code == 404
 
 
 @pytest.mark.asyncio

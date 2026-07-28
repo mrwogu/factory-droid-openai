@@ -25,7 +25,9 @@ def test_openapi_contract_documents_compatibility_surface(tmp_path: Path) -> Non
 
     assert set(paths) == {
         "/health",
+        "/version",
         "/v1/models",
+        "/v1/models/{model_id}",
         "/v1/chat/completions",
         "/v1/factory/sessions/{session_id}",
         "/v1/factory/sessions/{session_id}/compact",
@@ -33,7 +35,9 @@ def test_openapi_contract_documents_compatibility_surface(tmp_path: Path) -> Non
         "/v1/factory/sessions/{session_id}/fork",
     }
     assert "security" not in paths["/health"]["get"]
+    assert "security" not in paths["/version"]["get"]
     assert paths["/v1/models"]["get"]["security"] == [{"HTTPBearer": []}]
+    assert paths["/v1/models/{model_id}"]["get"]["security"] == [{"HTTPBearer": []}]
 
     chat = paths["/v1/chat/completions"]["post"]
     assert chat["security"] == [{"HTTPBearer": []}]
