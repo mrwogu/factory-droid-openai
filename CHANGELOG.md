@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.4](https://github.com/mrwogu/factory-droid-openai/compare/v1.3.3...v1.3.4) (2026-07-28)
+
+
+### Bug Fixes
+
+* **attachments:** remove ReDoS in data URI parameter parsing ([#23](https://github.com/mrwogu/factory-droid-openai/issues/23)) ([60c0f94](https://github.com/mrwogu/factory-droid-openai/commit/60c0f949e7d3c2f3e09d12c50a4d09d2245b893e))
+
 ## [1.3.3](https://github.com/mrwogu/factory-droid-openai/compare/v1.3.2...v1.3.3) (2026-07-27)
 
 
