@@ -266,6 +266,15 @@ a duplicate argument key, or prose after a call still fails the turn. Qwen3's
 XML form declares no argument types, so a scalar value stays the string the
 model wrote unless it wrote a JSON object or array.
 
+Two forms are not supported:
+
+| Unsupported form | Reason |
+|---|---|
+| `[TOOL_CALLS] [{"name":...}]` (Mistral) | The tag opens a block that no token closes, which the stream parser does not frame. A Mistral-style JSON array is accepted inside a marker pair, the bare tag is not. |
+| `[get_weather(city="Gdansk")]` (pythonic, Llama 4 and some Qwen builds) | Needs Python literal parsing, and a bracketed line in prose would be misread as a call. |
+
+Both stay out until a captured sample justifies the added parsing surface.
+
 ## Requirements
 
 - Python 3.11 or newer
