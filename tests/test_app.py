@@ -324,6 +324,27 @@ async def test_retrieve_model_serves_the_alias_when_droid_is_unavailable(
 
 
 @pytest.mark.asyncio
+async def test_retrieve_model_withholds_a_quarantined_model(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [],
+        error=RunnerError(
+            "Model 'gpt-5.4' is not available for this Factory account",
+            status_code=404,
+            error_type="model_not_found",
+        ),
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        rejected = await client.post("/v1/chat/completions", json=_payload(model="gpt-5.4"))
+        retrieved = await client.get("/v1/models/gpt-5.4")
+        alias = await client.get("/v1/models/factory-droid")
+
+    assert rejected.status_code == 404
+    assert retrieved.status_code == 404
+    assert retrieved.json()["error"]["type"] == "model_not_found"
+    assert alias.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_chat_quarantines_a_model_droid_refuses(tmp_path: Path) -> None:
     runner = FakeRunner(
         [],
@@ -733,10 +754,24 @@ async def test_optional_bearer_auth(tmp_path: Path) -> None:
             "/v1/models",
             headers={"Authorization": "Bearer secret"},
         )
+        retrieve_missing = await client.get("/v1/models/factory-droid")
+        retrieve_invalid = await client.get(
+            "/v1/models/factory-droid",
+            headers={"Authorization": "Bearer wrong"},
+        )
+        retrieve_valid = await client.get(
+            "/v1/models/factory-droid",
+            headers={"Authorization": "Bearer secret"},
+        )
+        version = await client.get("/version")
 
     assert missing.status_code == 401
     assert invalid.status_code == 401
     assert valid.status_code == 200
+    assert retrieve_missing.status_code == 401
+    assert retrieve_invalid.status_code == 401
+    assert retrieve_valid.status_code == 200
+    assert version.status_code == 200
 
 
 @pytest.mark.asyncio

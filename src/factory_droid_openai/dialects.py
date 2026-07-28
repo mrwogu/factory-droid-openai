@@ -20,6 +20,7 @@ fails closed once every decoder declines.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -39,6 +40,7 @@ _ARG_VALUE_CLOSE = "</arg_value>"
 _PIPE_TAG_TOOLS_OPEN = "<|open|>tools<|sep|>"
 _PIPE_TAG_TOOLS_CLOSE = "<|close|>tools"
 _PIPE_TAG_CALL_OPEN = "<|open|>call "
+_PIPE_TAG_CALL_CLOSE = "<|close|>call"
 _PIPE_TAG_ARG_OPEN = "<|open|>argument "
 _PIPE_TAG_ARG_CLOSE = "<|close|>argument"
 _PIPE_TAG_SEP = "<|sep|>"
@@ -47,7 +49,7 @@ _PIPE_TAG_SEP = "<|sep|>"
 # has already been emitted in this dialect, so prose still fails closed.
 _PIPE_TAG_CONTROL_TOKENS = (
     _PIPE_TAG_TOOLS_CLOSE,
-    "<|close|>call",
+    _PIPE_TAG_CALL_CLOSE,
     _PIPE_TAG_ARG_CLOSE,
     "<|close|>",
     _PIPE_TAG_SEP,
@@ -96,6 +98,7 @@ _QWEN_FUNCTION_OPEN = "<function="
 _QWEN_FUNCTION_CLOSE = "</function>"
 _QWEN_PARAMETER_OPEN = "<parameter="
 _QWEN_PARAMETER_CLOSE = "</parameter>"
+_QWEN_PARAMETER_TOKEN = re.compile(r"</parameter>|<parameter=")
 
 _HARMONY_COMMENTARY_OPEN = "<|channel|>commentary to="
 _HARMONY_CALL_CLOSE = "<|call|>"
@@ -222,17 +225,27 @@ def _decode_pipe_tag_tokens(
         return None
     calls: list[dict[str, Any]] = []
     index = body.find(_PIPE_TAG_CALL_OPEN)
+    if body[:index].strip():
+        return None
     while index >= 0:
         header_end = body.find(_PIPE_TAG_SEP, index)
         if header_end < 0:
             return None
-        name = _pipe_tag_attribute(body[index + len(_PIPE_TAG_CALL_OPEN) : header_end], "tool")
+        attributes = _pipe_tag_attributes(
+            body[index + len(_PIPE_TAG_CALL_OPEN) : header_end],
+            frozenset({"tool", "index"}),
+        )
+        name = attributes.get("tool") if attributes is not None else None
         if name is None:
             return None
-        next_index = body.find(_PIPE_TAG_CALL_OPEN, header_end)
+        call_end = body.find(_PIPE_TAG_CALL_CLOSE, header_end)
+        if call_end < 0:
+            return None
+        next_index = body.find(_PIPE_TAG_CALL_OPEN, call_end + len(_PIPE_TAG_CALL_CLOSE))
         block_end = next_index if next_index >= 0 else len(body)
-        arguments = _pipe_tag_arguments(body[header_end:block_end])
-        if arguments is None:
+        arguments = _pipe_tag_arguments(body[header_end:call_end])
+        trailing = body[call_end + len(_PIPE_TAG_CALL_CLOSE) : block_end]
+        if arguments is None or not _pipe_tag_noise_only(trailing):
             return None
         calls.append({"name": name, "arguments": arguments})
         index = next_index
@@ -242,39 +255,60 @@ def _decode_pipe_tag_tokens(
 def _pipe_tag_arguments(block: str) -> dict[str, Any] | None:
     arguments: dict[str, Any] = {}
     index = block.find(_PIPE_TAG_ARG_OPEN)
+    if index < 0:
+        return arguments if _pipe_tag_noise_only(block) else None
+    if not _pipe_tag_noise_only(block[:index]):
+        return None
     while index >= 0:
         header_end = block.find(_PIPE_TAG_SEP, index)
         if header_end < 0:
             return None
         header = block[index + len(_PIPE_TAG_ARG_OPEN) : header_end]
-        key = _pipe_tag_attribute(header, "key")
+        attributes = _pipe_tag_attributes(header, frozenset({"key", "type"}))
+        if attributes is None:
+            return None
+        key = attributes.get("key")
         value_end = block.find(_PIPE_TAG_ARG_CLOSE, header_end)
         if key is None or key in arguments or value_end < 0:
             # A truncated value would silently drop data, so fail closed.
             return None
         raw = block[header_end + len(_PIPE_TAG_SEP) : value_end]
-        arguments[key] = _coerce_pipe_tag_value(raw, _pipe_tag_attribute(header, "type"))
-        index = block.find(_PIPE_TAG_ARG_OPEN, value_end)
+        arguments[key] = _coerce_pipe_tag_value(raw, attributes.get("type"))
+        next_index = block.find(_PIPE_TAG_ARG_OPEN, value_end + len(_PIPE_TAG_ARG_CLOSE))
+        trailing_end = next_index if next_index >= 0 else len(block)
+        if not _pipe_tag_noise_only(block[value_end + len(_PIPE_TAG_ARG_CLOSE) : trailing_end]):
+            return None
+        index = next_index
     return arguments
 
 
-def _pipe_tag_attribute(header: str, name: str) -> str | None:
-    prefix = f'{name}="'
-    start = header.find(prefix)
-    if start < 0:
-        return None
-    start += len(prefix)
-    end = header.find('"', start)
-    if end < 0:
-        return None
-    return header[start:end].strip() or None
+def _pipe_tag_noise_only(value: str) -> bool:
+    return not value.replace(_PIPE_TAG_SEP, "").strip()
+
+
+def _pipe_tag_attributes(
+    header: str,
+    allowed: frozenset[str],
+) -> dict[str, str] | None:
+    attributes: dict[str, str] = {}
+    cursor = 0
+    for match in re.finditer(r'([A-Za-z_][A-Za-z0-9_]*)="([^"]*)"', header):
+        name, raw = match.groups()
+        value = raw.strip()
+        if header[cursor : match.start()].strip():
+            return None
+        if name not in allowed or name in attributes or not value:
+            return None
+        attributes[name] = value
+        cursor = match.end()
+    return attributes if not header[cursor:].strip() else None
 
 
 def _coerce_pipe_tag_value(raw: str, kind: str | None) -> Any:
     # A declared string type is authoritative: coercing "1" to a number there
     # would change the argument the client receives.
     if kind == "string":
-        return raw.strip()
+        return raw
     return _coerce_arg_value(raw.strip())
 
 
@@ -291,6 +325,8 @@ def _decode_kimi_sections(
         return None
     calls: list[dict[str, Any]] = []
     index = body.find(_KIMI_CALL_OPEN)
+    if body[:index].strip():
+        return None
     while index >= 0:
         arguments_start = body.find(_KIMI_ARG_OPEN, index)
         if arguments_start < 0:
@@ -305,7 +341,12 @@ def _decode_kimi_sections(
         if arguments is None:
             return None
         calls.append({"name": name, "arguments": arguments})
-        index = body.find(_KIMI_CALL_OPEN, call_end)
+        call_end += len(_KIMI_CALL_CLOSE)
+        next_index = body.find(_KIMI_CALL_OPEN, call_end)
+        trailing_end = next_index if next_index >= 0 else len(body)
+        if body[call_end:trailing_end].strip():
+            return None
+        index = next_index
     return calls
 
 
@@ -349,6 +390,8 @@ def _decode_deepseek_calls(
         return None
     calls: list[dict[str, Any]] = []
     index = body.find(_DEEPSEEK_CALL_OPEN)
+    if body[:index].strip():
+        return None
     while index >= 0:
         start = index + len(_DEEPSEEK_CALL_OPEN)
         call_end = body.find(_DEEPSEEK_CALL_CLOSE, start)
@@ -365,7 +408,12 @@ def _decode_deepseek_calls(
         if name is None or arguments is None:
             return None
         calls.append({"name": name, "arguments": arguments})
-        index = body.find(_DEEPSEEK_CALL_OPEN, call_end)
+        call_end += len(_DEEPSEEK_CALL_CLOSE)
+        next_index = body.find(_DEEPSEEK_CALL_OPEN, call_end)
+        trailing_end = next_index if next_index >= 0 else len(body)
+        if body[call_end:trailing_end].strip():
+            return None
+        index = next_index
     return calls
 
 
@@ -395,55 +443,51 @@ def _decode_function_parameter_tags(
         return None
     calls: list[dict[str, Any]] = []
     index = body.find(_QWEN_FUNCTION_OPEN)
+    if body[:index].strip():
+        return None
     while index >= 0:
         name_end = body.find(">", index)
         if name_end < 0:
             return None
+        parsed = _qwen_call(body, name_end)
+        if parsed is None:
+            return None
+        close, arguments = parsed
         name = body[index + len(_QWEN_FUNCTION_OPEN) : name_end].strip()
-        next_index = body.find(_QWEN_FUNCTION_OPEN, name_end)
-        arguments = _qwen_parameters(
-            body[name_end : _qwen_block_end(body, name_end, next_index)],
-        )
-        if not name or arguments is None:
+        next_index = body.find(_QWEN_FUNCTION_OPEN, close + len(_QWEN_FUNCTION_CLOSE))
+        trailing_end = next_index if next_index >= 0 else len(body)
+        if not name:
+            return None
+        if body[close + len(_QWEN_FUNCTION_CLOSE) : trailing_end].strip():
             return None
         calls.append({"name": name, "arguments": arguments})
         index = next_index
     return calls
 
 
-def _qwen_block_end(body: str, name_end: int, next_index: int) -> int:
-    close = body.find(_QWEN_FUNCTION_CLOSE, name_end)
-    candidates = [value for value in (close, next_index) if value >= 0]
-    return min(candidates) if candidates else len(body)
-
-
-def _qwen_parameters(block: str) -> dict[str, Any] | None:
+def _qwen_call(body: str, name_end: int) -> tuple[int, dict[str, Any]] | None:
     arguments: dict[str, Any] = {}
-    index = block.find(_QWEN_PARAMETER_OPEN)
-    while index >= 0:
-        key_end = block.find(">", index)
+    cursor = name_end + 1
+    while True:
+        close = body.find(_QWEN_FUNCTION_CLOSE, cursor)
+        parameter_index = body.find(_QWEN_PARAMETER_OPEN, cursor)
+        if close >= 0 and (parameter_index < 0 or close < parameter_index):
+            return (close, arguments) if not body[cursor:close].strip() else None
+        if parameter_index < 0 or body[cursor:parameter_index].strip():
+            return None
+        key_end = body.find(">", parameter_index)
         if key_end < 0:
             return None
-        key = block[index + len(_QWEN_PARAMETER_OPEN) : key_end].strip()
-        next_index = block.find(_QWEN_PARAMETER_OPEN, key_end)
-        value_end = _qwen_value_end(block, key_end, next_index)
-        if not key or key in arguments or value_end < 0:
+        key = body[parameter_index + len(_QWEN_PARAMETER_OPEN) : key_end].strip()
+        parameter_token = _QWEN_PARAMETER_TOKEN.search(body, key_end + 1)
+        if parameter_token is None or not key or key in arguments:
             return None
-        arguments[key] = _qwen_value(block[key_end + 1 : value_end])
-        index = next_index
-    return arguments
-
-
-def _qwen_value_end(block: str, key_end: int, next_index: int) -> int:
-    """Returns where a parameter value ends, or ``-1`` when it is truncated.
-
-    A model that drops ``</parameter>`` still delimits the value with the next
-    parameter tag, but a value with no delimiter at all was cut off.
-    """
-    close = block.find(_QWEN_PARAMETER_CLOSE, key_end)
-    if close >= 0 and (next_index < 0 or close < next_index):
-        return close
-    return next_index
+        arguments[key] = _qwen_value(body[key_end + 1 : parameter_token.start()])
+        cursor = (
+            parameter_token.end()
+            if parameter_token.group() == _QWEN_PARAMETER_CLOSE
+            else parameter_token.start()
+        )
 
 
 def _qwen_value(raw: str) -> Any:

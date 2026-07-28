@@ -713,8 +713,12 @@ Setup walks through several prompts in order:
      /v1/models`:
 
 ```bash
-uv run python scripts/generate_vscode_models.py --all-models --verify
+CONFIG=/absolute/path/to/chatLanguageModels.json
+uv run python scripts/generate_vscode_models.py --all-models --verify --output "$CONFIG"
 ```
+
+Set `CONFIG` to the file VS Code opened. Without `--output`, the generator
+updates the repository's ready example instead.
 
 `--all-models` includes every model the bridge exposes; `--verify` starts a
 Droid session for each one, drops the models Droid refuses (typically ones an
@@ -724,9 +728,9 @@ spawns Droid directly and takes roughly a minute for a full catalog. Narrower
 selections are possible:
 
 ```bash
-uv run python scripts/generate_vscode_models.py
-uv run python scripts/generate_vscode_models.py --all-models
-uv run python scripts/generate_vscode_models.py --model gpt-5.4 --model claude-opus-5
+uv run python scripts/generate_vscode_models.py --output "$CONFIG"
+uv run python scripts/generate_vscode_models.py --all-models --output "$CONFIG"
+uv run python scripts/generate_vscode_models.py --model gpt-5.4 --model claude-opus-5 --output "$CONFIG"
 ```
 
 `id` is the explicit Droid model ID. Replace it with another ID from

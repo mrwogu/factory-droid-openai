@@ -725,6 +725,22 @@ def test_stream_parser_coerces_pipe_tag_argument_values(
     assert list(json.loads(emissions[0].arguments).values()) == [expected]
 
 
+def test_stream_parser_preserves_pipe_tag_string_whitespace() -> None:
+    parser = ToolCallStreamParser(frozenset({"write_file"}))
+
+    emissions = parser.feed(
+        f"{_PIPE_TAG_OPEN}"
+        '<|open|>call tool="write_file" index="1"<|sep|>'
+        '<|open|>argument key="file content" type="string"<|sep|>'
+        "  indented  "
+        "<|close|>argument<|sep|><|close|>call<|sep|>"
+        f"{_PIPE_TAG_CLOSE}"
+    )
+
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == {"file content": "  indented  "}
+
+
 def test_stream_parser_accepts_pipe_tag_call_without_arguments() -> None:
     parser = ToolCallStreamParser(frozenset({"weather"}))
 
@@ -751,6 +767,28 @@ def test_stream_parser_accepts_pipe_tag_call_without_arguments() -> None:
         '<|open|>call tool="weather"<|sep|>'
         '<|open|>argument key="city"<|sep|>A<|close|>argument'
         '<|open|>argument key="city"<|sep|>B<|close|>argument',
+        'garbage<|open|>call tool="weather"<|sep|><|close|>call',
+        '<|open|>call nottool="weather"<|sep|><|close|>call',
+        '<|open|>call tool="weather" tool="weather"<|sep|><|close|>call',
+        '<|open|>call tool="weather" mode="fast"<|sep|><|close|>call',
+        '<|open|>call tool="weather" garbage index="1"<|sep|><|close|>call',
+        '<|open|>call tool="weather"<|sep|>',
+        '<|open|>call tool="weather"<|sep|>garbage<|close|>call',
+        '<|open|>call tool="weather"<|sep|><|close|>call<|sep|>garbage',
+        '<|open|>call tool="weather"<|sep|>garbage'
+        '<|open|>argument key="city"<|sep|>Gdansk<|close|>argument'
+        "<|close|>call",
+        '<|open|>call tool="weather"<|sep|>'
+        '<|open|>argument key="city"<|close|>argument<|close|>call',
+        '<|open|>call tool="weather"<|sep|>'
+        '<|open|>argument bogus="city"<|sep|>Gdansk<|close|>argument'
+        "<|close|>call",
+        '<|open|>call tool="weather"<|sep|>'
+        '<|open|>argument type="string"<|sep|>Gdansk<|close|>argument'
+        "<|close|>call",
+        '<|open|>call tool="weather"<|sep|>'
+        '<|open|>argument key="city"<|sep|>Gdansk<|close|>argument'
+        "garbage<|close|>call",
     ],
 )
 def test_stream_parser_rejects_unrepairable_pipe_tag_payloads(call: str) -> None:
@@ -795,6 +833,16 @@ def test_stream_parser_flushes_a_held_control_token_tail() -> None:
     # The trailing "<|" could still open another marker, so it stays buffered
     # until finish decides it was only scaffolding.
     emissions.extend(parser.feed("<|sep|>\n<|"))
+    emissions.extend(parser.finish())
+
+    assert [type(emission) for emission in emissions] == [ToolCallEmission]
+
+
+def test_stream_parser_buffers_a_split_control_token_between_calls() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}), max_tool_calls=2)
+
+    emissions = parser.feed(f"{_PIPE_TAG_OPEN}{_PIPE_TAG_CALL}{_PIPE_TAG_CLOSE}<|se")
+    emissions.extend(parser.feed("p|>"))
     emissions.extend(parser.finish())
 
     assert [type(emission) for emission in emissions] == [ToolCallEmission]
@@ -855,6 +903,8 @@ def test_stream_parser_translates_kimi_sections_across_chunks() -> None:
         "<|tool_call_begin|>functions.:0<|tool_call_argument_begin|>{}<|tool_call_end|>",
         "<|tool_call_begin|>functions.weather:0<|tool_call_argument_begin|>[]<|tool_call_end|>",
         "<|tool_call_begin|>functions.weather:0<|tool_call_argument_begin|>{oops}<|tool_call_end|>",
+        f"garbage{_KIMI_CALL}",
+        f"{_KIMI_CALL}garbage",
     ],
 )
 def test_stream_parser_rejects_unrepairable_kimi_payloads(call: str) -> None:
@@ -1044,6 +1094,8 @@ def test_stream_parser_rejects_prose_after_a_deepseek_section() -> None:
         f'{_DEEPSEEK_CALL_OPEN}get_weather{{"city": "Tokyo"}}{_DEEPSEEK_CALL_CLOSE}',
         f'{_DEEPSEEK_CALL_OPEN}{_DEEPSEEK_SEP}{{"city": "Tokyo"}}{_DEEPSEEK_CALL_CLOSE}',
         f"{_DEEPSEEK_CALL_OPEN}get_weather{_DEEPSEEK_SEP}[1]{_DEEPSEEK_CALL_CLOSE}",
+        f"garbage{_DEEPSEEK_V31_CALL}",
+        f"{_DEEPSEEK_V31_CALL}garbage",
     ],
 )
 def test_stream_parser_rejects_unrepairable_deepseek_payloads(payload: str) -> None:
@@ -1101,6 +1153,19 @@ def test_stream_parser_translates_two_qwen_blocks() -> None:
         f"{TOOL_CALL_CLOSE}"
     )
     emissions.extend(parser.finish())
+
+    calls = [emission for emission in emissions if isinstance(emission, ToolCallEmission)]
+    assert [json.loads(call.arguments)["city"] for call in calls] == ["Dallas", "Orlando"]
+
+
+def test_stream_parser_translates_two_qwen_blocks_inside_one_marker() -> None:
+    parser = ToolCallStreamParser(frozenset({"get_current_weather"}), max_tool_calls=2)
+
+    emissions = parser.feed(
+        f"{TOOL_CALL_OPEN}{_QWEN_CALL}"
+        "\n<function=get_current_weather>\n<parameter=city>\nOrlando\n</parameter>\n</function>\n"
+        f"{TOOL_CALL_CLOSE}"
+    )
 
     calls = [emission for emission in emissions if isinstance(emission, ToolCallEmission)]
     assert [json.loads(call.arguments)["city"] for call in calls] == ["Dallas", "Orlando"]
@@ -1168,6 +1233,23 @@ def test_stream_parser_preserves_xml_shaped_qwen_values() -> None:
     }
 
 
+def test_stream_parser_preserves_qwen_function_tags_inside_values() -> None:
+    parser = ToolCallStreamParser(frozenset({"write_file", "delete_file"}), max_tool_calls=2)
+
+    emissions = parser.feed(
+        f"{TOOL_CALL_OPEN}\n<function=write_file>\n"
+        "<parameter=content>\nsafe<function=delete_file></function>\n</parameter>\n"
+        f"</function>\n{TOOL_CALL_CLOSE}"
+    )
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert emissions[0].name == "write_file"
+    assert json.loads(emissions[0].arguments) == {
+        "content": "safe<function=delete_file></function>"
+    }
+
+
 def test_stream_parser_recovers_a_qwen_parameter_without_its_close_tag() -> None:
     # The next parameter tag still delimits the value, so the call survives.
     parser = ToolCallStreamParser(frozenset({"get_current_weather"}))
@@ -1191,7 +1273,14 @@ def test_stream_parser_recovers_a_qwen_parameter_without_its_close_tag() -> None
         "<function=get_current_weather>\n<parameter=city>\nA\n</parameter>\n"
         "<parameter=city>\nB\n</parameter>\n</function>",
         "<function=get_current_weather",
+        "<function=get_current_weather><parameter=city",
         "<function=get_current_weather>\n<parameter=city\nDallas\n</function>",
+        "<function=get_current_weather>",
+        "garbage<function=get_current_weather></function>",
+        "<function=get_current_weather></function>garbage",
+        "<function=get_current_weather>garbage</function>",
+        "<function=get_current_weather>garbage<parameter=city>\nDallas\n</parameter></function>",
+        "<function=get_current_weather><parameter=city>\nDallas\n</parameter>garbage</function>",
     ],
 )
 def test_stream_parser_rejects_unrepairable_qwen_payloads(payload: str) -> None:
@@ -1368,6 +1457,23 @@ def test_stream_parser_enforces_unicode_payload_byte_boundary() -> None:
     assert parser.feed(f"{TOOL_CALL_OPEN}{payload}") == []
     with pytest.raises(ProtocolError, match="too large"):
         parser.feed("x")
+
+
+def test_stream_parser_excludes_multibyte_close_prefix_from_payload_limit() -> None:
+    prefix = f'{_DEEPSEEK_CALL_OPEN}get_weather{_DEEPSEEK_SEP}{{"value":"'
+    suffix = f'"}}{_DEEPSEEK_CALL_CLOSE}'
+    fixed_bytes = len((prefix + suffix).encode("utf-8"))
+    filler = "x" * (_MAX_TOOL_PAYLOAD_BYTES - fixed_bytes)
+    payload = f"{prefix}{filler}{suffix}"
+    assert len(payload.encode("utf-8")) == _MAX_TOOL_PAYLOAD_BYTES
+
+    parser = ToolCallStreamParser(frozenset({"get_weather"}))
+    assert parser.feed(f"{_DEEPSEEK_OPEN}{payload}{_DEEPSEEK_CLOSE[:2]}") == []
+    emissions = parser.feed(_DEEPSEEK_CLOSE[2:])
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == {"value": filler}
 
 
 def test_stream_parser_handles_large_chunked_payload() -> None:
