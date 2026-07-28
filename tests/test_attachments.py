@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import time
 from typing import Any
 
 import pytest
@@ -118,6 +119,24 @@ def test_non_base64_image_data_uri_is_rejected() -> None:
 
     with pytest.raises(AttachmentError, match="must be base64 encoded"):
         _extract(payload)
+
+
+def test_data_uri_parameters_before_base64_are_accepted() -> None:
+    payload = _image_message(f"data:image/png;charset=utf-8;base64,{PNG_B64}")
+
+    _, collected = _extract(payload)
+
+    assert collected.images[0].data == PNG_B64
+
+
+def test_data_uri_without_comma_is_rejected_without_backtracking() -> None:
+    payload = _image_message("data:image/png" + ";" * 40)
+
+    started = time.perf_counter()
+    with pytest.raises(AttachmentError, match="remote image URLs are not supported"):
+        _extract(payload)
+
+    assert time.perf_counter() - started < 1.0
 
 
 def test_pdf_file_part_becomes_document_attachment() -> None:
