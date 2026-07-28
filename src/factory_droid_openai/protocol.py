@@ -1,26 +1,29 @@
 from __future__ import annotations
 
 import json
-import math
 import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from factory_droid_openai.attachments import AttachmentSet, extract_attachments
+from factory_droid_openai.dialects import (
+    MARKER_DIALECTS,
+    NATIVE_DIALECT,
+    PAYLOAD_DECODERS,
+    TOOL_CALL_CLOSE,
+    TOOL_CALL_OPEN,
+    find_open_marker,
+    strip_code_fence,
+)
 from factory_droid_openai.errors import ProtocolError, RequestTooLargeError
 from factory_droid_openai.logs import debug as log_debug
 from factory_droid_openai.logs import trace as log_trace
+from factory_droid_openai.strictjson import decode_json_values, parse_strict_json
 
 if TYPE_CHECKING:
     from factory_droid_openai.models import ChatCompletionRequest, ToolDefinition
 
-TOOL_CALL_OPEN = "<tool_call>"
-TOOL_CALL_CLOSE = "</tool_call>"
 _MAX_TOOL_PAYLOAD_BYTES = 1_000_000
-_ARG_KEY_OPEN = "<arg_key>"
-_ARG_KEY_CLOSE = "</arg_key>"
-_ARG_VALUE_OPEN = "<arg_value>"
-_ARG_VALUE_CLOSE = "</arg_value>"
 _ARGUMENT_KEYS = ("arguments", "parameters", "args", "input")
 _UNPARSED_HEAD_CHARS = 64
 
@@ -258,13 +261,18 @@ class ToolCallStreamParser:
         self._done = False
         self._saw_tool_call = False
         self._tool_call_count = 0
+        self._dialect = NATIVE_DIALECT
 
     def feed(self, chunk: str) -> list[ProtocolEmission]:
         if not chunk:
             return []
         if self._done:
-            if chunk.strip():
+            self._text_tail += chunk
+            if self._residual(self._text_tail).strip():
                 raise ProtocolError("unexpected text after tool call")
+            # Everything left is verified noise except a control token the next
+            # chunk still has to complete.
+            self._text_tail = self._trailing_partial(self._text_tail)
             return []
         if self._capturing:
             return self._consume_tool_payload(chunk)
@@ -282,7 +290,7 @@ class ToolCallStreamParser:
             # After a tool call only whitespace may separate further calls; any
             # residual non-whitespace is trailing output and must fail closed.
             if self._saw_tool_call:
-                if self._text_tail.strip():
+                if self._residual(self._text_tail).strip():
                     raise ProtocolError("unexpected text after tool call")
             else:
                 emissions.append(TextEmission(self._text_tail))
@@ -294,19 +302,23 @@ class ToolCallStreamParser:
     def _consume_text(self, chunk: str) -> list[ProtocolEmission]:
         value = self._text_tail + chunk
         self._text_tail = ""
-        marker_index = value.find(TOOL_CALL_OPEN)
-        if marker_index >= 0:
+        found = find_open_marker(value)
+        if found is not None:
+            marker_index, dialect = found
             emissions: list[ProtocolEmission] = []
             prefix = value[:marker_index]
             if prefix:
                 emissions.extend(self._emit_text_before_marker(prefix))
             self._capturing = True
+            self._dialect = dialect
             emissions.extend(
-                self._consume_tool_payload(value[marker_index + len(TOOL_CALL_OPEN) :])
+                self._consume_tool_payload(value[marker_index + len(dialect.open_marker) :])
             )
             return emissions
 
-        held = _partial_marker_suffix_length(value, TOOL_CALL_OPEN)
+        held = max(
+            _partial_marker_suffix_length(value, dialect.open_marker) for dialect in MARKER_DIALECTS
+        )
         emit_length = len(value) - held
         if emit_length <= 0:
             self._text_tail = value
@@ -318,15 +330,39 @@ class ToolCallStreamParser:
     def _emit_text_before_marker(self, text: str) -> list[ProtocolEmission]:
         if not self._saw_tool_call:
             return [TextEmission(text)]
-        if text.strip():
+        if self._residual(text).strip():
             raise ProtocolError("unexpected text after tool call")
         return []
 
+    def _residual(self, text: str) -> str:
+        """Drops the control tokens the active dialect frames its calls with.
+
+        Only template scaffolding disappears here; prose still counts as
+        trailing output and keeps failing closed. A token split across two
+        stream chunks ends the text as a partial match, so its prefix is
+        dropped as well.
+        """
+        tokens = self._dialect.control_tokens
+        if not tokens:
+            return text
+        for token in tokens:
+            text = text.replace(token, "")
+        held = max(_partial_marker_suffix_length(text, token) for token in tokens)
+        return text[: len(text) - held] if held else text
+
+    def _trailing_partial(self, text: str) -> str:
+        tokens = self._dialect.control_tokens
+        if not tokens:
+            return ""
+        held = max(_partial_marker_suffix_length(text, token) for token in tokens)
+        return text[len(text) - held :] if held else ""
+
     def _consume_tool_payload(self, chunk: str) -> list[ProtocolEmission]:
+        close_marker = self._dialect.close_marker
         value = self._close_tail + chunk
-        close_index = value.find(TOOL_CALL_CLOSE)
+        close_index = value.find(close_marker)
         if close_index < 0:
-            held = _partial_marker_suffix_length(value, TOOL_CALL_CLOSE)
+            held = _partial_marker_suffix_length(value, close_marker)
             committed = value[:-held] if held else value
             committed_bytes = len(self._close_tail) + len(chunk.encode("utf-8")) - held
             self._append_payload(committed, committed_bytes)
@@ -340,7 +376,7 @@ class ToolCallStreamParser:
             chunk_payload = chunk[: close_index - len(self._close_tail)]
             payload_bytes = tail_bytes + len(chunk_payload.encode("utf-8"))
         self._append_payload(payload, payload_bytes)
-        trailing = value[close_index + len(TOOL_CALL_CLOSE) :]
+        trailing = value[close_index + len(close_marker) :]
         complete_payload = "".join(self._payload_chunks)
         payload_objects = self._tool_payload_objects(complete_payload)
         self._payload_chunks.clear()
@@ -353,8 +389,9 @@ class ToolCallStreamParser:
         emissions: list[ProtocolEmission] = list(self._emit_tool_calls(payload_objects))
         if self._tool_call_count >= self._max_tool_calls:
             self._done = True
-            if trailing.strip():
+            if self._residual(trailing).strip():
                 raise ProtocolError("unexpected text after tool call")
+            self._text_tail = self._trailing_partial(trailing)
             return emissions
         if trailing:
             emissions.extend(self._consume_text(trailing))
@@ -396,38 +433,54 @@ class ToolCallStreamParser:
     def _tool_payload_objects(self, payload: str) -> list[dict[str, Any]]:
         """Returns the tool-call objects a marker payload carries.
 
-        Strict JSON first. Models that ignore the single-object contract are
-        repaired into the same shape, because a fenced block, an ``<arg_key>``
-        list or two objects packed into one marker pair is a formatting slip,
-        not a request the bridge should drop. Names, argument types and
-        duplicate keys stay validated in :meth:`_tool_call_from_object`.
+        Strict JSON first, then the decoders in
+        :data:`~factory_droid_openai.dialects.PAYLOAD_DECODERS`, because a
+        fenced block, a template-token block or two objects packed into one
+        marker pair is a formatting slip, not a request the bridge should drop.
+        Names, argument types and duplicate keys stay validated in
+        :meth:`_tool_call_from_object`.
         """
         if not self._allowed_tool_names:
             raise ProtocolError("the model requested a tool when none are available")
-        body = _strip_code_fence(payload.strip())
+        body = strip_code_fence(payload.strip())
         try:
-            values = _decode_json_values(body)
+            values = decode_json_values(body)
         except (json.JSONDecodeError, ValueError) as exc:
-            repaired = _repair_tool_payload(body, self._allowed_tool_names)
-            if repaired is None:
+            decoded = self._decode_payload(body)
+            if decoded is None:
                 log_trace(
                     "tool_call.unparsed",
                     head=body[:_UNPARSED_HEAD_CHARS],
                     payload_bytes=len(body.encode("utf-8")),
                 )
                 raise ProtocolError(f"invalid tool-call JSON: {exc}") from exc
-            log_debug("tool_call.repaired", variant=repaired.variant)
-            values = [repaired.value]
+            values = decoded
         if not values:
             raise ProtocolError("invalid tool-call JSON: the payload is empty")
         objects: list[dict[str, Any]] = []
         for value in values:
+            if isinstance(value, list):
+                # Mistral, Jamba, Granite and xLAM pack their calls into one
+                # JSON array instead of one object per marker pair.
+                if not value or not all(isinstance(item, dict) for item in value):
+                    raise ProtocolError("tool-call payload must be a JSON object")
+                log_debug("tool_call.repaired", variant="json_array")
+                objects.extend(value)
+                continue
             if not isinstance(value, dict):
                 raise ProtocolError("tool-call payload must be a JSON object")
             objects.append(value)
         if len(objects) > 1:
             log_debug("tool_call.repaired", variant="packed_objects")
         return objects
+
+    def _decode_payload(self, body: str) -> list[Any] | None:
+        for decoder in PAYLOAD_DECODERS:
+            decoded = decoder.decode(body, self._allowed_tool_names)
+            if decoded is not None:
+                log_debug("tool_call.repaired", variant=decoder.name)
+                return list(decoded)
+        return None
 
     def _tool_call_from_object(self, parsed: dict[str, Any]) -> ToolCallEmission:
         name = parsed.get("name")
@@ -496,153 +549,11 @@ class StopSequenceBuffer:
         return held
 
 
-def parse_strict_json(text: str) -> Any:
-    """Parses model-generated JSON, rejecting everything outside RFC 8259.
-
-    Duplicate keys, ``NaN``/``Infinity`` literals and numbers that overflow to
-    a non-finite float are all refused, so a caller never forwards a value a
-    strict JSON parser on the client side would reject.
-    """
-    return json.loads(
-        text,
-        object_pairs_hook=_reject_duplicate_keys,
-        parse_constant=_reject_non_json_constant,
-        parse_float=_parse_finite_float,
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class _RepairedPayload:
-    variant: str
-    value: dict[str, Any]
-
-
-def _decode_json_values(text: str) -> list[Any]:
-    """Decodes the JSON values a payload holds, back to back.
-
-    A model that packs several tool calls into one marker pair produces
-    ``{...}{...}``, which ``json.loads`` rejects as trailing data.
-    """
-    decoder = json.JSONDecoder(
-        object_pairs_hook=_reject_duplicate_keys,
-        parse_constant=_reject_non_json_constant,
-        parse_float=_parse_finite_float,
-    )
-    values: list[Any] = []
-    index = 0
-    while True:
-        while index < len(text) and text[index].isspace():
-            index += 1
-        if index >= len(text):
-            return values
-        value, index = decoder.raw_decode(text, index)
-        values.append(value)
-
-
-def _strip_code_fence(payload: str) -> str:
-    if not payload.startswith("```"):
-        return payload
-    newline = payload.find("\n")
-    if newline < 0:
-        return payload
-    body = payload[newline + 1 :]
-    closing = body.rfind("```")
-    return body[:closing].strip() if closing >= 0 else body.strip()
-
-
-def _repair_tool_payload(
-    body: str,
-    allowed_tool_names: frozenset[str],
-) -> _RepairedPayload | None:
-    if _ARG_KEY_OPEN in body:
-        repaired = _repair_arg_key_payload(body)
-        if repaired is not None:
-            return _RepairedPayload("arg_key_value", repaired)
-    repaired = _repair_named_payload(body, allowed_tool_names)
-    if repaired is not None:
-        return _RepairedPayload("bare_name", repaired)
-    return None
-
-
-def _repair_arg_key_payload(body: str) -> dict[str, Any] | None:
-    """Rebuilds GLM's ``name<arg_key>k</arg_key><arg_value>v</arg_value>`` form."""
-    index = body.find(_ARG_KEY_OPEN)
-    name = body[:index].strip()
-    if not name:
-        return None
-    arguments: dict[str, Any] = {}
-    while index >= 0:
-        key_end = body.find(_ARG_KEY_CLOSE, index)
-        if key_end < 0:
-            return None
-        key = body[index + len(_ARG_KEY_OPEN) : key_end].strip()
-        value_start = body.find(_ARG_VALUE_OPEN, key_end)
-        if not key or key in arguments or value_start < 0:
-            return None
-        value_end = body.find(_ARG_VALUE_CLOSE, value_start)
-        if value_end < 0:
-            # A truncated value would silently drop data, so fail closed.
-            return None
-        raw = body[value_start + len(_ARG_VALUE_OPEN) : value_end].strip()
-        arguments[key] = _coerce_arg_value(raw)
-        index = body.find(_ARG_KEY_OPEN, value_end)
-    return {"name": name, "arguments": arguments}
-
-
-def _coerce_arg_value(raw: str) -> Any:
-    try:
-        parsed = parse_strict_json(raw)
-    except (json.JSONDecodeError, ValueError):
-        return raw
-    return parsed
-
-
-def _repair_named_payload(
-    body: str,
-    allowed_tool_names: frozenset[str],
-) -> dict[str, Any] | None:
-    """Rebuilds a payload that names the tool outside the JSON object."""
-    head, _, tail = body.partition("\n")
-    name = head.strip()
-    if name not in allowed_tool_names:
-        return None
-    remainder = tail.strip()
-    if not remainder:
-        return {"name": name, "arguments": {}}
-    try:
-        arguments = parse_strict_json(remainder)
-    except (json.JSONDecodeError, ValueError):
-        return None
-    if not isinstance(arguments, dict):
-        return None
-    return {"name": name, "arguments": arguments}
-
-
 def _tool_arguments(parsed: dict[str, Any]) -> Any:
     for key in _ARGUMENT_KEYS:
         if key in parsed:
             return parsed[key]
     return None
-
-
-def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate key '{key}'")
-        result[key] = value
-    return result
-
-
-def _reject_non_json_constant(value: str) -> None:
-    raise ValueError(f"non-JSON numeric constant '{value}'")
-
-
-def _parse_finite_float(value: str) -> float:
-    parsed = float(value)
-    if not math.isfinite(parsed):
-        raise ValueError(f"non-finite number '{value}'")
-    return parsed
 
 
 def _serialize_json(value: Any) -> tuple[str, int]:

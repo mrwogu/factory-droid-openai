@@ -456,6 +456,7 @@ def test_stream_parser_rejects_invalid_marker_sequences(
     [
         ("not-json", "invalid tool-call JSON"),
         ("[]", "must be a JSON object"),
+        ("7", "must be a JSON object"),
         ('{"name":"","arguments":{}}', "non-empty string"),
     ],
 )
@@ -597,6 +598,324 @@ def test_stream_parser_refuses_to_repair_unnamed_payloads(payload: str) -> None:
     parser = ToolCallStreamParser(frozenset({"weather"}))
 
     with pytest.raises(ProtocolError, match="invalid tool-call JSON"):
+        parser.feed(f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE}")
+
+
+_PIPE_TAG_OPEN = "<|open|>tools<|sep|>"
+_PIPE_TAG_CLOSE = "<|close|>tools<|sep|>"
+_PIPE_TAG_CALL = (
+    '<|open|>call tool="weather" index="1"<|sep|>'
+    '<|open|>argument key="city" type="string"<|sep|>Gdańsk<|close|>argument<|sep|>'
+    "<|close|>call<|sep|>"
+)
+
+
+def test_stream_parser_translates_pipe_tag_template_tokens() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    emissions = parser.feed(f"{_PIPE_TAG_OPEN}{_PIPE_TAG_CALL}{_PIPE_TAG_CLOSE}")
+    emissions.extend(parser.finish())
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert emissions[0].name == "weather"
+    assert json.loads(emissions[0].arguments) == {"city": "Gdańsk"}
+
+
+def test_stream_parser_translates_pipe_tag_tokens_inside_markers() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    emissions = parser.feed(f"{TOOL_CALL_OPEN}{_PIPE_TAG_CALL}{TOOL_CALL_CLOSE}")
+    emissions.extend(parser.finish())
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == {"city": "Gdańsk"}
+
+
+def test_stream_parser_keeps_text_before_pipe_tag_tokens() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    emissions = parser.feed(f"Checking now. {_PIPE_TAG_OPEN}{_PIPE_TAG_CALL}{_PIPE_TAG_CLOSE}")
+    emissions.extend(parser.finish())
+
+    assert [type(emission) for emission in emissions] == [TextEmission, ToolCallEmission]
+    assert isinstance(emissions[0], TextEmission)
+    assert emissions[0].text == "Checking now. "
+
+
+def test_stream_parser_translates_pipe_tag_tokens_across_chunks() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    stream = f"{_PIPE_TAG_OPEN}{_PIPE_TAG_CALL}{_PIPE_TAG_CLOSE}"
+
+    emissions: list[object] = []
+    for start in range(0, len(stream), 5):
+        emissions.extend(parser.feed(stream[start : start + 5]))
+    emissions.extend(parser.finish())
+
+    assert [type(emission) for emission in emissions] == [ToolCallEmission]
+
+
+def test_stream_parser_translates_multiple_pipe_tag_calls() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}), max_tool_calls=2)
+
+    emissions = parser.feed(
+        f"{_PIPE_TAG_OPEN}"
+        '<|open|>call tool="weather" index="1"<|sep|>'
+        '<|open|>argument key="city" type="string"<|sep|>Gdansk<|close|>argument<|sep|>'
+        "<|close|>call<|sep|>"
+        '<|open|>call tool="weather" index="2"<|sep|>'
+        '<|open|>argument key="city" type="string"<|sep|>Sopot<|close|>argument<|sep|>'
+        "<|close|>call<|sep|>"
+        f"{_PIPE_TAG_CLOSE}"
+    )
+    emissions.extend(parser.finish())
+
+    calls = [emission for emission in emissions if isinstance(emission, ToolCallEmission)]
+    assert [json.loads(call.arguments)["city"] for call in calls] == ["Gdansk", "Sopot"]
+
+
+def test_stream_parser_recovers_pipe_tag_call_without_close_marker() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    parser.feed(f"{_PIPE_TAG_OPEN}{_PIPE_TAG_CALL}")
+    emissions = parser.finish()
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+
+
+@pytest.mark.parametrize(
+    ("declared_type", "raw", "expected"),
+    [
+        ('key="city" type="string"', "123", "123"),
+        ('key="days" type="number"', "3", 3),
+        ('key="metric" type="boolean"', "true", True),
+        ('key="filter" type="object"', '{"unit":"c"}', {"unit": "c"}),
+        ('key="days"', "7", 7),
+    ],
+)
+def test_stream_parser_coerces_pipe_tag_argument_values(
+    declared_type: str,
+    raw: str,
+    expected: object,
+) -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    emissions = parser.feed(
+        f"{_PIPE_TAG_OPEN}"
+        '<|open|>call tool="weather" index="1"<|sep|>'
+        f"<|open|>argument {declared_type}<|sep|>{raw}<|close|>argument<|sep|>"
+        "<|close|>call<|sep|>"
+        f"{_PIPE_TAG_CLOSE}"
+    )
+
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert list(json.loads(emissions[0].arguments).values()) == [expected]
+
+
+def test_stream_parser_accepts_pipe_tag_call_without_arguments() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    emissions = parser.feed(
+        f"{_PIPE_TAG_OPEN}"
+        '<|open|>call tool="weather" index="1"<|sep|><|close|>call<|sep|>'
+        f"{_PIPE_TAG_CLOSE}"
+    )
+
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == {}
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        '<|open|>call tool="weather" index="1"',
+        '<|open|>call index="1"<|sep|><|close|>call',
+        '<|open|>call tool=""<|sep|><|close|>call',
+        '<|open|>call tool="weather<|sep|><|close|>call',
+        '<|open|>call tool="weather"<|sep|><|open|>argument key="city" type="string"',
+        '<|open|>call tool="weather"<|sep|><|open|>argument key="city" type="string"<|sep|>Gdansk',
+        '<|open|>call tool="weather"<|sep|><|open|>argument key=""<|sep|>Gdansk<|close|>argument',
+        '<|open|>call tool="weather"<|sep|>'
+        '<|open|>argument key="city"<|sep|>A<|close|>argument'
+        '<|open|>argument key="city"<|sep|>B<|close|>argument',
+    ],
+)
+def test_stream_parser_rejects_unrepairable_pipe_tag_payloads(call: str) -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    with pytest.raises(ProtocolError, match="invalid tool-call JSON"):
+        parser.feed(f"{TOOL_CALL_OPEN}{call}{TOOL_CALL_CLOSE}")
+
+
+def test_stream_parser_rejects_pipe_tag_call_to_unknown_tool() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    with pytest.raises(ProtocolError, match="tool 'shell' is not available"):
+        parser.feed(
+            f"{_PIPE_TAG_OPEN}"
+            '<|open|>call tool="shell" index="1"<|sep|><|close|>call<|sep|>'
+            f"{_PIPE_TAG_CLOSE}"
+        )
+
+
+def test_stream_parser_rejects_prose_after_pipe_tag_call() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    with pytest.raises(ProtocolError, match="unexpected text after tool call"):
+        parser.feed(f"{_PIPE_TAG_OPEN}{_PIPE_TAG_CALL}{_PIPE_TAG_CLOSE} and done")
+
+
+def test_stream_parser_ignores_pipe_tag_control_tokens_after_the_call() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    emissions = parser.feed(f"{_PIPE_TAG_OPEN}{_PIPE_TAG_CALL}{_PIPE_TAG_CLOSE}")
+    emissions.extend(parser.feed("<|close|><|sep|>\n"))
+    emissions.extend(parser.finish())
+
+    assert [type(emission) for emission in emissions] == [ToolCallEmission]
+
+
+_KIMI_SECTION_OPEN = "<|tool_calls_section_begin|>"
+_KIMI_SECTION_CLOSE = "<|tool_calls_section_end|>"
+_KIMI_CALL = (
+    '<|tool_call_begin|>functions.weather:0<|tool_call_argument_begin|>{"city":"Gdansk"}'
+    "<|tool_call_end|>"
+)
+_HARMONY_OPEN = "<|channel|>commentary to="
+
+
+def test_stream_parser_translates_kimi_sections() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    emissions = parser.feed(f"{_KIMI_SECTION_OPEN}{_KIMI_CALL}{_KIMI_SECTION_CLOSE}")
+    emissions.extend(parser.finish())
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert emissions[0].name == "weather"
+    assert json.loads(emissions[0].arguments) == {"city": "Gdansk"}
+
+
+def test_stream_parser_translates_multiple_kimi_calls() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}), max_tool_calls=2)
+
+    emissions = parser.feed(
+        f"{_KIMI_SECTION_OPEN}{_KIMI_CALL}"
+        '<|tool_call_begin|>functions.weather:1<|tool_call_argument_begin|>{"city":"Sopot"}'
+        f"<|tool_call_end|>{_KIMI_SECTION_CLOSE}"
+    )
+    emissions.extend(parser.finish())
+
+    calls = [emission for emission in emissions if isinstance(emission, ToolCallEmission)]
+    assert [json.loads(call.arguments)["city"] for call in calls] == ["Gdansk", "Sopot"]
+
+
+def test_stream_parser_translates_kimi_sections_across_chunks() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    stream = f"{_KIMI_SECTION_OPEN}{_KIMI_CALL}{_KIMI_SECTION_CLOSE}<|im_end|>"
+
+    emissions: list[object] = []
+    for start in range(0, len(stream), 7):
+        emissions.extend(parser.feed(stream[start : start + 7]))
+    emissions.extend(parser.finish())
+
+    assert [type(emission) for emission in emissions] == [ToolCallEmission]
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        "<|tool_call_begin|>functions.weather:0",
+        '<|tool_call_begin|>functions.weather:0<|tool_call_argument_begin|>{"city":"X"}',
+        "<|tool_call_begin|>functions.:0<|tool_call_argument_begin|>{}<|tool_call_end|>",
+        "<|tool_call_begin|>functions.weather:0<|tool_call_argument_begin|>[]<|tool_call_end|>",
+        "<|tool_call_begin|>functions.weather:0<|tool_call_argument_begin|>{oops}<|tool_call_end|>",
+    ],
+)
+def test_stream_parser_rejects_unrepairable_kimi_payloads(call: str) -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    with pytest.raises(ProtocolError, match="invalid tool-call JSON"):
+        parser.feed(f"{TOOL_CALL_OPEN}{call}{TOOL_CALL_CLOSE}")
+
+
+def test_stream_parser_accepts_kimi_call_without_namespace_or_arguments() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    emissions = parser.feed(
+        f"{_KIMI_SECTION_OPEN}"
+        "<|tool_call_begin|>weather<|tool_call_argument_begin|><|tool_call_end|>"
+        f"{_KIMI_SECTION_CLOSE}"
+    )
+
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert emissions[0].name == "weather"
+    assert json.loads(emissions[0].arguments) == {}
+
+
+def test_stream_parser_translates_harmony_commentary() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    emissions = parser.feed(
+        f'{_HARMONY_OPEN}functions.weather <|constrain|>json<|message|>{{"city":"Hel"}}<|call|>'
+    )
+    emissions.extend(parser.finish())
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert emissions[0].name == "weather"
+    assert json.loads(emissions[0].arguments) == {"city": "Hel"}
+
+
+def test_stream_parser_translates_harmony_without_constrain_tag() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    emissions = parser.feed(f"{_HARMONY_OPEN}functions.weather<|message|>{{}}<|call|>")
+    emissions.extend(parser.feed("<|end|>"))
+    emissions.extend(parser.finish())
+
+    assert [type(emission) for emission in emissions] == [ToolCallEmission]
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == {}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "functions.weather",
+        'functions.<|message|>{"city":"X"}',
+        "functions.weather<|message|>[1]",
+        "functions.weather<|message|>{oops}",
+    ],
+)
+def test_stream_parser_rejects_unrepairable_harmony_payloads(payload: str) -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    with pytest.raises(ProtocolError, match="invalid tool-call JSON"):
+        parser.feed(f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE}")
+
+
+def test_stream_parser_accepts_a_json_array_of_calls() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}), max_tool_calls=2)
+
+    emissions = parser.feed(
+        f"{TOOL_CALL_OPEN}"
+        '[{"name":"weather","arguments":{"city":"Gdansk"}},'
+        '{"name":"weather","arguments":{"city":"Sopot"}}]'
+        f"{TOOL_CALL_CLOSE}"
+    )
+
+    calls = [emission for emission in emissions if isinstance(emission, ToolCallEmission)]
+    assert [json.loads(call.arguments)["city"] for call in calls] == ["Gdansk", "Sopot"]
+
+
+@pytest.mark.parametrize("payload", ["[]", '[{"name":"weather","arguments":{}},7]'])
+def test_stream_parser_rejects_invalid_json_arrays(payload: str) -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    with pytest.raises(ProtocolError, match="must be a JSON object"):
         parser.feed(f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE}")
 
 
