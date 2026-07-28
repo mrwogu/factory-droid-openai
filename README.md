@@ -46,23 +46,26 @@ Not affiliated with, endorsed by, or maintained by Factory.
 
 ## Quick start
 
-Requires Python 3.11+, an installed `droid` CLI, and an authenticated Factory
-session. Verify the CLI once with `droid --version`.
+Several ways to run the bridge: Docker, [uv](#uv), [pipx](#pipx),
+[pip](#pip), or [from source](#from-source). Docker is the simplest, so this
+quick start uses it; the other methods are documented in
+[Installation](#installation).
 
-Install the bridge as a tool, then run it from the project directory Droid
-should operate in. The working directory defaults to the current directory, so
-no environment variable is required for local use.
+**With Docker all you need is a Factory API key. Nothing else to install** -
+no Python, no `droid` CLI, no interactive login. The image already contains
+Droid.
+
+### Step 1 - get an API key
+
+Create one at
+[app.factory.ai/settings/api-keys](https://app.factory.ai/settings/api-keys)
+and put it in your shell:
 
 ```bash
-uv tool install factory-droid-openai
-cd /path/to/your/project
-factory-droid-openai
+export FACTORY_API_KEY=fk-...
 ```
 
-`pipx install factory-droid-openai` works the same way if you prefer pipx.
-
-No `droid` CLI on the host? Use [Docker](#docker) - it bundles Droid inside
-the container, you only need `FACTORY_API_KEY`.
+### Step 2 - start the bridge
 
 ```bash
 docker run -d --name droid-bridge \
@@ -71,7 +74,19 @@ docker run -d --name droid-bridge \
   ghcr.io/mrwogu/factory-droid-openai:latest
 ```
 
-From another terminal, send a request:
+That's it. The bridge now listens on `http://127.0.0.1:8787/v1`, reachable
+only from your machine.
+
+### Step 3 - check it works
+
+```bash
+curl --fail http://127.0.0.1:8787/health
+curl --fail http://127.0.0.1:8787/v1/models
+```
+
+`/v1/models` lists every model your Factory account can use.
+
+### Step 4 - send your first request
 
 ```bash
 curl --fail http://127.0.0.1:8787/v1/chat/completions \
@@ -84,8 +99,47 @@ curl --fail http://127.0.0.1:8787/v1/chat/completions \
   }'
 ```
 
-Use any model ID from `GET /v1/models`, or the `factory-droid` alias to pick
-Droid's configured default.
+Use any model ID from `GET /v1/models`, or the `factory-droid` alias to let
+Droid pick its configured default.
+
+### Step 5 - point your editor at it
+
+| Setting | Value |
+|---|---|
+| Base URL | `http://127.0.0.1:8787/v1` |
+| API key | `none` (any placeholder; see [Authentication](#authentication)) |
+| Model | any ID from `GET /v1/models` |
+
+Ready-made configurations: [VS Code](#vs-code), [OpenClaw](#openclaw),
+[Hermes Agent](#hermes-agent),
+[OpenAI Python client](#openai-python-client).
+
+### Stopping and updating
+
+```bash
+docker logs -f droid-bridge
+docker stop droid-bridge && docker rm droid-bridge
+docker pull ghcr.io/mrwogu/factory-droid-openai:latest
+```
+
+More container options - Compose, Podman, mounting a project directory,
+bridge tokens, local builds - are in [Docker](#docker).
+
+### Prefer no Docker?
+
+If you already have Python 3.11+ and the
+[`droid` CLI](#factory-droid-cli) installed and authenticated
+(`droid --version` works), run the bridge directly from the project directory
+Droid should see:
+
+```bash
+uv tool install factory-droid-openai
+cd /path/to/your/project
+factory-droid-openai
+```
+
+`pipx install factory-droid-openai` works the same way. See
+[Installation](#installation) for pip and source installs.
 
 ## API compatibility
 
