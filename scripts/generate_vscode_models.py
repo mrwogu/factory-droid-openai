@@ -84,18 +84,24 @@ def _verify_models(
 
     async def run() -> dict[str, str]:
         gate = asyncio.Semaphore(max(1, concurrency))
-        results = await asyncio.gather(
-            *(
-                _probe_model(
-                    model_id,
-                    droid_path=droid_path,
-                    workdir=workdir,
-                    timeout_seconds=timeout_seconds,
-                    gate=gate,
-                )
-                for model_id in model_ids
+        total = len(model_ids)
+        completed = 0
+
+        async def probe(model_id: str) -> str | None:
+            nonlocal completed
+            reason = await _probe_model(
+                model_id,
+                droid_path=droid_path,
+                workdir=workdir,
+                timeout_seconds=timeout_seconds,
+                gate=gate,
             )
-        )
+            completed += 1
+            status = "ok" if reason is None else f"refused: {reason}"
+            print(f"[{completed}/{total}] {model_id}: {status}", file=sys.stderr, flush=True)
+            return reason
+
+        results = await asyncio.gather(*(probe(model_id) for model_id in model_ids))
         return {
             model_id: reason
             for model_id, reason in zip(model_ids, results, strict=True)
@@ -220,8 +226,7 @@ def main() -> None:
             timeout_seconds=float(args.verify_timeout_seconds),
             concurrency=int(args.verify_concurrency),
         )
-        for model_id, reason in sorted(refused.items()):
-            print(f"skipping {model_id}: {reason}", file=sys.stderr)
+        # Refusals already surfaced in the per-model progress lines above.
         print(
             f"verified {len(probed) - len(refused)}/{len(probed)} models",
             file=sys.stderr,

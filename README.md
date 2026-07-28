@@ -26,6 +26,7 @@ Not affiliated with, endorsed by, or maintained by Factory.
   - [OpenClaw](#openclaw)
   - [Hermes Agent](#hermes-agent)
   - [OpenAI Python client](#openai-python-client)
+  - [Other OpenAI-compatible clients](#other-openai-compatible-clients)
 - [API compatibility](#api-compatibility)
 - [API reference](#api-reference)
 - [Installation](#installation)
@@ -667,59 +668,34 @@ Setup walks through several prompts in order:
    confuse it with your Factory Droid API key - the bridge never accepts
    Factory credentials here, only its own bearer token.
 4. VS Code asks for the API type. Pick **Chat Completions**.
-5. VS Code opens `chatLanguageModels.json`. Paste the provider entry below,
-   or generate one against a running bridge with
-   `scripts/generate_vscode_models.py` (described further down).
+5. VS Code opens `chatLanguageModels.json`. Two options for filling it:
 
-Provider entry:
+   - **Copy the ready example.** A provider entry covering every model the
+     reference host exposed is committed at
+     [`examples/vscode/chatLanguageModels.json`](examples/vscode/chatLanguageModels.json).
+     Paste its contents into the file, then adjust `apiKey` and the endpoint
+     URL.
+   - **Generate your own.** Your account may have different models enabled
+     than the reference host, so run the generator against a running bridge;
+     it reads image support and reasoning effort levels from `GET
+     /v1/models`:
 
-```json
-[
-  {
-    "name": "Factory Droid",
-    "vendor": "customendpoint",
-    "apiKey": "none",
-    "apiType": "chat-completions",
-    "models": [
-      {
-        "id": "gpt-5.4",
-        "name": "GPT-5.4 via Factory Droid",
-        "url": "http://127.0.0.1:8787/v1/chat/completions",
-        "toolCalling": true,
-        "vision": true,
-        "thinking": true,
-        "streaming": true,
-        "supportsReasoningEffort": ["low", "medium", "high", "xhigh"],
-        "reasoningEffortFormat": "chat-completions",
-        "maxInputTokens": 180000,
-        "maxOutputTokens": 20000
-      }
-    ]
-  }
-]
+```bash
+uv run python scripts/generate_vscode_models.py --all-models --verify
 ```
 
-A ready-to-use provider entry covering every model the reference host exposed
-is committed at
-[`examples/vscode/chatLanguageModels.json`](examples/vscode/chatLanguageModels.json).
-Copy its contents into VS Code's `chatLanguageModels.json`, then adjust
-`apiKey` and the endpoint URL. Regenerate it against a running bridge, which
-reads image support and reasoning effort levels from `GET /v1/models`:
+`--all-models` includes every model the bridge exposes; `--verify` starts a
+Droid session for each one, drops the models Droid refuses (typically ones an
+organization policy blocks for the signed-in account), and reports progress
+per model to stderr. No model turn runs, so verification costs no tokens; it
+spawns Droid directly and takes roughly a minute for a full catalog. Narrower
+selections are possible:
 
 ```bash
 uv run python scripts/generate_vscode_models.py
 uv run python scripts/generate_vscode_models.py --all-models
 uv run python scripts/generate_vscode_models.py --model gpt-5.4 --model claude-opus-5
-uv run python scripts/generate_vscode_models.py --all-models --verify
 ```
-
-The committed example lists every model the reference host exposed. `GET
-/v1/models` returns the whole Droid catalog, including models an organization
-policy blocks for the signed-in account, so generate your own file with
-`--verify`: it starts a session for every selected model, drops the ones Droid
-refuses, and prints the refusals to stderr. No model turn runs, so verification
-costs no tokens; it spawns Droid directly and takes roughly a minute for a full
-catalog.
 
 `id` is the explicit Droid model ID. Replace it with another ID from
 `GET /v1/models` or `droid exec --help`, such as `gemini-3.1-pro-preview` or
@@ -782,6 +758,35 @@ What the bridge accepts but ignores when VS Code sends it:
 rejected with `400`; send vision inputs as base64 `data:` URIs instead.
 VSCode does not auto-discover models from a Custom Endpoint, so every Droid
 model ID you want in the picker needs its own entry in `chatLanguageModels.json`.
+
+## Other OpenAI-compatible clients
+
+Any client that accepts a custom OpenAI base URL works with the bridge. Use
+`http://127.0.0.1:8787/v1` as the base URL, `none` as the API key (or your
+bearer token when [authentication](#authentication) is enabled), and any model
+ID from `GET /v1/models`.
+
+- **Cursor**: Settings → Models → enable **OpenAI API Key**, set **Override
+  OpenAI Base URL** to the bridge URL, then add each Droid model ID under
+  model names. See the
+  [Cursor models docs](https://cursor.com/docs/models).
+- **Cline** (VS Code extension): pick the **OpenAI Compatible** provider,
+  enter the bridge base URL, API key, and one model ID per configuration.
+- **Continue**: add a model with `provider: openai` and
+  `apiBase: http://127.0.0.1:8787/v1` in `config.yaml`; repeat per Droid
+  model ID.
+- **Open WebUI**: Admin Panel → Settings → Connections → add an **OpenAI
+  API** connection with the bridge URL and key; model IDs are discovered from
+  `/v1/models`.
+- **LibreChat**: declare a custom endpoint in `librechat.yaml` with
+  `baseURL: http://127.0.0.1:8787/v1`, `apiKey: none`, and
+  `models: { fetch: true }` to pull the catalog from `/v1/models`.
+- **Cherry Studio**: add a custom OpenAI provider with the bridge URL and
+  key, then add model IDs manually or fetch them.
+- **Paperclip**: no native OpenAI-compatible provider yet
+  ([paperclipai/paperclip#4344](https://github.com/paperclipai/paperclip/issues/4344)).
+  Route agents through the **OpenCode adapter** and point OpenCode's custom
+  provider at the bridge URL.
 
 ## API reference
 
