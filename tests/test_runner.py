@@ -460,6 +460,22 @@ async def test_runner_cleanup_uses_one_bounded_deadline(tmp_path: Path) -> None:
     assert time.perf_counter() - started < 0.5
 
 
+async def _spawned_droid_pid(pid_file: Path, *, timeout: float = 15.0) -> int:
+    """Waits until the fake droid reports its pid.
+
+    Spawning a real interpreter takes seconds on a loaded machine, so the wait
+    runs against a deadline rather than a fixed iteration count, and an
+    already-created but still empty file counts as not ready.
+    """
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline:
+        raw = pid_file.read_text(encoding="utf-8").strip() if pid_file.exists() else ""
+        if raw.isdigit():
+            return int(raw)
+        await asyncio.sleep(0.01)
+    raise AssertionError("the fake droid never reported its pid")
+
+
 def _sigterm_ignoring_droid(tmp_path: Path) -> Path:
     executable = tmp_path / "fake-droid"
     pid_file = tmp_path / "child.pid"
@@ -501,16 +517,11 @@ async def test_runner_kills_and_reaps_process_ignoring_sigterm(
     )
 
     task = asyncio.create_task(_collect(runner, _request(timeout_seconds=10)))
-    for _ in range(100):
-        if pid_file.exists():
-            break
-        await asyncio.sleep(0.01)
-    assert pid_file.exists()
+    pid = await _spawned_droid_pid(pid_file)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    pid = int(pid_file.read_text(encoding="utf-8"))
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
     assert "factory_droid_openai_forced_kills_total 1" in metrics.render()
@@ -550,16 +561,11 @@ async def test_runner_does_not_count_sigterm_death_as_forced_kill(
     )
 
     task = asyncio.create_task(_collect(runner, _request(timeout_seconds=10)))
-    for _ in range(100):
-        if pid_file.exists():
-            break
-        await asyncio.sleep(0.01)
-    assert pid_file.exists()
+    pid = await _spawned_droid_pid(pid_file)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    pid = int(pid_file.read_text(encoding="utf-8"))
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
     assert "factory_droid_openai_forced_kills_total 0" in metrics.render()
@@ -831,16 +837,11 @@ async def test_cleanup_force_reaps_when_client_close_never_returns(
     )
 
     task = asyncio.create_task(_collect(runner, _request(timeout_seconds=10)))
-    for _ in range(100):
-        if pid_file.exists():
-            break
-        await asyncio.sleep(0.01)
-    assert pid_file.exists()
+    pid = await _spawned_droid_pid(pid_file)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    pid = int(pid_file.read_text(encoding="utf-8"))
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
     assert "factory_droid_openai_forced_kills_total 1" in metrics.render()
