@@ -10,6 +10,7 @@ from factory_droid_openai.protocol import (
     TOOL_CALL_CLOSE,
     TOOL_CALL_OPEN,
     ProtocolError,
+    RequestTooLargeError,
     StopSequenceBuffer,
     TextEmission,
     ToolCallEmission,
@@ -227,6 +228,16 @@ def test_build_prompt_enforces_utf8_transcript_byte_boundary() -> None:
 
     with pytest.raises(ProtocolError, match=f"maximum of {transcript_bytes - 1} bytes"):
         build_prompt(request, max_transcript_bytes=transcript_bytes - 1)
+
+
+def test_build_prompt_enforces_message_depth() -> None:
+    request = _request(
+        tools=[],
+        messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+    )
+
+    with pytest.raises(RequestTooLargeError, match="message exceeds maximum JSON depth of 2"):
+        build_prompt(request, max_json_depth=2)
 
 
 def test_build_prompt_enforces_tool_schema_depth_boundary() -> None:
@@ -772,6 +783,18 @@ def test_stream_parser_ignores_pipe_tag_control_tokens_after_the_call() -> None:
 
     emissions = parser.feed(f"{_PIPE_TAG_OPEN}{_PIPE_TAG_CALL}{_PIPE_TAG_CLOSE}")
     emissions.extend(parser.feed("<|close|><|sep|>\n"))
+    emissions.extend(parser.finish())
+
+    assert [type(emission) for emission in emissions] == [ToolCallEmission]
+
+
+def test_stream_parser_flushes_a_held_control_token_tail() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}), max_tool_calls=2)
+
+    emissions = parser.feed(f"{_PIPE_TAG_OPEN}{_PIPE_TAG_CALL}{_PIPE_TAG_CLOSE}")
+    # The trailing "<|" could still open another marker, so it stays buffered
+    # until finish decides it was only scaffolding.
+    emissions.extend(parser.feed("<|sep|>\n<|"))
     emissions.extend(parser.finish())
 
     assert [type(emission) for emission in emissions] == [ToolCallEmission]
