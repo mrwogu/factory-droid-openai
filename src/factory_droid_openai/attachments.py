@@ -23,7 +23,9 @@ DOCUMENT_MEDIA_TYPES = frozenset(
     }
 )
 
-_DATA_URI = re.compile(r"^data:([\w.+-]+/[\w.+-]+)((?:;[^,]*)*),(.*)$", re.DOTALL)
+# Parameter segments exclude ';' so the repetition has one unambiguous split per
+# input; '[^,]*' let a segment swallow separators and backtrack exponentially.
+_DATA_URI = re.compile(r"^data:([\w.+-]+/[\w.+-]+)((?:;[^;,]*)*),(.*)$", re.DOTALL)
 
 
 class AttachmentError(ProtocolError):
