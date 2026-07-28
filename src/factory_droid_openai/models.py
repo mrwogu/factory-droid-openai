@@ -49,6 +49,10 @@ class HealthResponse(BaseModel):
     status: Literal["ok"]
 
 
+class VersionResponse(BaseModel):
+    version: str
+
+
 class ModelInfo(BaseModel):
     id: str
     object: Literal["model"] = "model"
