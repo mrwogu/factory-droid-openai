@@ -269,9 +269,7 @@ class ToolCallStreamParser:
         if self._done:
             self._text_tail += chunk
             if self._residual(self._text_tail).strip():
-                raise ProtocolError(
-                    f"unexpected text after tool call ({self._dialect.name} dialect)"
-                )
+                raise self._trailing_output_error()
             # Everything left is verified noise except a control token the next
             # chunk still has to complete.
             self._text_tail = self._trailing_partial(self._text_tail)
@@ -293,9 +291,7 @@ class ToolCallStreamParser:
             # residual non-whitespace is trailing output and must fail closed.
             if self._saw_tool_call:
                 if self._residual(self._text_tail).strip():
-                    raise ProtocolError(
-                        f"unexpected text after tool call ({self._dialect.name} dialect)"
-                    )
+                    raise self._trailing_output_error()
             else:
                 emissions.append(TextEmission(self._text_tail))
             self._text_tail = ""
@@ -337,8 +333,12 @@ class ToolCallStreamParser:
         if not self._saw_tool_call:
             return [TextEmission(text)]
         if self._residual(text).strip():
-            raise ProtocolError(f"unexpected text after tool call ({self._dialect.name} dialect)")
+            raise self._trailing_output_error()
         return []
+
+    def _trailing_output_error(self) -> ProtocolError:
+        """Names the dialect so logs show which marker format produced the text."""
+        return ProtocolError(f"unexpected text after tool call ({self._dialect.name} dialect)")
 
     def _residual(self, text: str) -> str:
         """Drops the control tokens the active dialect frames its calls with.
@@ -390,9 +390,7 @@ class ToolCallStreamParser:
         if self._tool_call_count >= self._max_tool_calls:
             self._done = True
             if self._residual(trailing).strip():
-                raise ProtocolError(
-                    f"unexpected text after tool call ({self._dialect.name} dialect)"
-                )
+                raise self._trailing_output_error()
             self._text_tail = self._trailing_partial(trailing)
             return emissions
         if trailing:
