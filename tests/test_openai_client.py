@@ -110,12 +110,15 @@ async def test_official_openai_client_parses_completion_and_models(
     client, http_client = _sdk_client(tmp_path, runner)
     async with http_client:
         models = await client.models.list()
+        model = await client.models.retrieve("gpt-5.4")
         completion = await client.chat.completions.create(
             model="factory-droid",
             messages=[{"role": "user", "content": "Hello"}],
         )
 
     assert models.data[0].id == "factory-droid"
+    assert model.id == "gpt-5.4"
+    assert model.object == "model"
     assert completion.object == "chat.completion"
     assert completion.choices[0].finish_reason == "stop"
     assert completion.choices[0].message.content == "Hello from Droid"

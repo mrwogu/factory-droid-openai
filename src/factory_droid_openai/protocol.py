@@ -319,6 +319,8 @@ class ToolCallStreamParser:
         held = max(
             _partial_marker_suffix_length(value, dialect.open_marker) for dialect in MARKER_DIALECTS
         )
+        if self._saw_tool_call:
+            held = max(held, len(self._trailing_partial(value)))
         emit_length = len(value) - held
         if emit_length <= 0:
             self._text_tail = value
@@ -364,18 +366,12 @@ class ToolCallStreamParser:
         if close_index < 0:
             held = _partial_marker_suffix_length(value, close_marker)
             committed = value[:-held] if held else value
-            committed_bytes = len(self._close_tail) + len(chunk.encode("utf-8")) - held
-            self._append_payload(committed, committed_bytes)
+            self._append_payload(committed)
             self._close_tail = value[-held:] if held else ""
             return []
 
         payload = value[:close_index]
-        payload_bytes = 0
-        if payload:
-            tail_bytes = len(self._close_tail)
-            chunk_payload = chunk[: close_index - len(self._close_tail)]
-            payload_bytes = tail_bytes + len(chunk_payload.encode("utf-8"))
-        self._append_payload(payload, payload_bytes)
+        self._append_payload(payload)
         trailing = value[close_index + len(close_marker) :]
         complete_payload = "".join(self._payload_chunks)
         payload_objects = self._tool_payload_objects(complete_payload)
@@ -420,12 +416,10 @@ class ToolCallStreamParser:
             self._tool_call_count += 1
         return emissions
 
-    def _append_payload(self, value: str, value_bytes: int | None = None) -> None:
+    def _append_payload(self, value: str) -> None:
         if not value:
             return
-        self._payload_bytes += (
-            value_bytes if value_bytes is not None else len(value.encode("utf-8"))
-        )
+        self._payload_bytes += len(value.encode("utf-8"))
         if self._payload_bytes > _MAX_TOOL_PAYLOAD_BYTES:
             raise ProtocolError("tool-call payload is too large")
         self._payload_chunks.append(value)
