@@ -881,7 +881,7 @@ tool calls through the official `openai` Python client.
 | `factory_droid_session_id` | Yes | Bridge-specific session continuation, disabled by default |
 | `factory_droid_status` | Yes | Bridge-specific Droid working-state SSE events |
 | `reasoning_effort` | Yes | Mapped to Droid reasoning effort |
-| `factory_droid_reasoning_effort` | Yes | Bridge-specific override |
+| `factory_droid_reasoning_effort` | Yes | Bridge-specific override, wins over `reasoning_effort` |
 | `timeout` | Yes | Per-request value capped by server timeout |
 | `temperature`, `top_p`, penalties, `seed` | No | Accepted but ignored |
 | `max_tokens`, `max_completion_tokens` | No | Accepted but ignored |
@@ -896,6 +896,20 @@ tool calls through the official `openai` Python client.
 | Unknown fields | Accepted | Ignored by the bridge |
 
 The bridge currently returns one choice with index `0`.
+
+### Reasoning effort
+
+Requests select an effort with `factory_droid_reasoning_effort`, falling back to
+`reasoning_effort`. Valid values are `none`, `dynamic`, `off`, `minimal`, `low`,
+`medium`, `high`, `xhigh` and `max`; anything else is rejected with `400`.
+
+`FACTORY_DROID_OPENAI_REASONING_EFFORT` overrides both request fields, so
+clients that pin their own value (agent frameworks often send `medium`) get the
+effort the operator chose instead. The override applies to every model, and the
+bridge does not check it against the per-model
+`factory_droid_supported_reasoning_efforts` list from `GET /v1/models`, so an
+effort a model does not support fails that request at the Droid layer. Leave the
+variable unset to let clients choose.
 
 ### Model selection
 
@@ -1113,8 +1127,8 @@ followed by `[DONE]`.
 | `FACTORY_DROID_OPENAI_MAX_TOOL_SCHEMA_BYTES` | `1048576` | Serialized tool schema size limit |
 | `FACTORY_DROID_OPENAI_MAX_STRUCTURED_OUTPUT_BYTES` | `1048576` | Buffered structured output size limit |
 | `FACTORY_DROID_OPENAI_MAX_JSON_DEPTH` | `32` | Request JSON nesting limit |
-| `FACTORY_DROID_OPENAI_PROCESS_GRACE_SECONDS` | `2` | Wait before killing a Droid process |
-| `FACTORY_DROID_OPENAI_CLEANUP_TIMEOUT_SECONDS` | `4` | Total budget for session cleanup |
+| `FACTORY_DROID_OPENAI_PROCESS_GRACE_SECONDS` | `5` | Wait before killing a Droid process |
+| `FACTORY_DROID_OPENAI_CLEANUP_TIMEOUT_SECONDS` | `10` | Total budget for session cleanup |
 | `FACTORY_DROID_OPENAI_UVICORN_LIMIT_CONCURRENCY` | `64` | Uvicorn connection limit |
 | `FACTORY_DROID_OPENAI_UVICORN_BACKLOG` | `128` | Uvicorn listen backlog |
 | `FACTORY_DROID_OPENAI_MAX_TOOL_CALLS` | `8` | Tool calls accepted per Droid turn |
@@ -1127,6 +1141,7 @@ followed by `[DONE]`.
 | `FACTORY_DROID_OPENAI_WORKTREE` | unset | Run Droid in a git worktree |
 | `FACTORY_DROID_OPENAI_APPEND_SYSTEM_PROMPT_FILE` | unset | File appended to the Droid system prompt |
 | `FACTORY_DROID_OPENAI_MODEL_ALIAS` | `factory-droid` | Alias using Droid default model |
+| `FACTORY_DROID_OPENAI_REASONING_EFFORT` | unset | Reasoning effort forced on every request |
 | `FACTORY_DROID_OPENAI_MODEL_CACHE_SECONDS` | `300` | `GET /v1/models` catalog cache lifetime |
 | `FACTORY_DROID_OPENAI_MODEL_QUARANTINE_SECONDS` | `900` | How long a refused model stays withheld |
 | `FACTORY_DROID_OPENAI_MCP_SETTLE_SECONDS` | `0` | MCP initialization window before tool discovery |
@@ -1190,8 +1205,9 @@ surface.
 
 `forced_kills_total` counts processes that had to be killed with a signal
 because they did not exit within `FACTORY_DROID_OPENAI_PROCESS_GRACE_SECONDS`.
-`droid exec` shuts down cleanly in about a second, so a rising counter means
-stuck processes, not ordinary traffic.
+A session that just served a full turn stays busy for a few seconds past
+`SIGTERM`, so raise the grace period on a slow host before reading a rising
+counter as stuck processes.
 
 Serve `/metrics` on a loopback interface or behind your own access control;
 it carries no prompt content, but it does expose traffic shape.
@@ -1410,7 +1426,7 @@ alternate between models faster than the pool refills.
 
 ### Every request logs a forced kill
 
-Not expected any more. `droid exec` exits cleanly in about a second, so raise
+A session torn down right after a turn needs a few seconds to exit, so raise
 `FACTORY_DROID_OPENAI_PROCESS_GRACE_SECONDS` if teardown is being cut short on
 a slower host; `FACTORY_DROID_OPENAI_CLEANUP_TIMEOUT_SECONDS` must stay above
 it. With detached cleanup the kill happens after the response, so it costs the

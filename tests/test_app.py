@@ -880,6 +880,24 @@ async def test_request_options_map_to_runner_request(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_configured_reasoning_effort_overrides_request(tmp_path: Path) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+    settings = Settings(
+        droid_path="droid",
+        workdir=tmp_path,
+        timeout_seconds=30.0,
+        reasoning_effort="low",
+    )
+    app = create_app(settings, runner_factory=cast("RunnerFactory", lambda: runner))
+    payload = _payload(reasoning_effort="high", factory_droid_reasoning_effort="medium")
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert runner.requests[0].reasoning_effort == "low"
+
+
+@pytest.mark.asyncio
 async def test_bounded_queue_rejects_overload_before_stream_headers(
     tmp_path: Path,
 ) -> None:
@@ -2362,6 +2380,31 @@ async def test_chat_completion_uses_a_warm_session(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert runner.requests[0].warm_session is not None
     assert runner.requests[0].warm_session.session_id == "session-1"
+    assert "factory_droid_openai_warm_session_hits_total 1" in app.state.metrics.render()
+
+
+@pytest.mark.asyncio
+async def test_warm_session_key_follows_the_configured_reasoning_effort(tmp_path: Path) -> None:
+    runner = FakeRunner([TextDelta("hi"), RunComplete(Usage())])
+    settings = Settings(
+        droid_path="droid",
+        workdir=tmp_path,
+        timeout_seconds=30.0,
+        reasoning_effort="low",
+    )
+    app = create_app(settings, runner_factory=cast("RunnerFactory", lambda: runner))
+    key = SessionKey(model_id=None, reasoning_effort="low")
+    app.state.pool.note(key)
+    app.state.pool.offer(_warm_session(key))
+
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(reasoning_effort="high"),
+        )
+
+    assert response.status_code == 200
+    assert runner.requests[0].warm_session is not None
     assert "factory_droid_openai_warm_session_hits_total 1" in app.state.metrics.render()
 
 
