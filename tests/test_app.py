@@ -2384,6 +2384,31 @@ async def test_chat_completion_uses_a_warm_session(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_warm_session_key_follows_the_configured_reasoning_effort(tmp_path: Path) -> None:
+    runner = FakeRunner([TextDelta("hi"), RunComplete(Usage())])
+    settings = Settings(
+        droid_path="droid",
+        workdir=tmp_path,
+        timeout_seconds=30.0,
+        reasoning_effort="low",
+    )
+    app = create_app(settings, runner_factory=cast("RunnerFactory", lambda: runner))
+    key = SessionKey(model_id=None, reasoning_effort="low")
+    app.state.pool.note(key)
+    app.state.pool.offer(_warm_session(key))
+
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(reasoning_effort="high"),
+        )
+
+    assert response.status_code == 200
+    assert runner.requests[0].warm_session is not None
+    assert "factory_droid_openai_warm_session_hits_total 1" in app.state.metrics.render()
+
+
+@pytest.mark.asyncio
 async def test_extra_choices_do_not_reuse_the_warm_session(tmp_path: Path) -> None:
     runner = FakeRunner([TextDelta("hi"), RunComplete(Usage())])
     app = _app(tmp_path, runner)

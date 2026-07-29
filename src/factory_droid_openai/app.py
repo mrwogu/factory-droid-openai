@@ -639,6 +639,7 @@ def create_app(
             warm_sessions=resolved_settings.warm_session_count(),
             max_concurrency=resolved_settings.max_concurrency,
             detached_cleanup=resolved_settings.detached_cleanup,
+            reasoning_effort=resolved_settings.reasoning_effort,
         )
         try:
             yield
@@ -1040,7 +1041,8 @@ def create_app(
             messages=len(payload.messages),
             tools=len(payload.tools or ()),
             timeout_s=round(timeout_seconds, 1),
-            reasoning_effort=payload.factory_droid_reasoning_effort or payload.reasoning_effort,
+            reasoning_effort=_effective_reasoning_effort(payload, resolved_settings),
+            reasoning_effort_overridden=resolved_settings.reasoning_effort is not None,
             continuation=payload.factory_droid_session_id is not None,
         )
 
@@ -1104,14 +1106,7 @@ def create_app(
             prompt_ms=timeline.mark("prompt_ms"),
         )
 
-        # A configured effort is an override: clients that send their own
-        # value (e.g. agent frameworks defaulting to medium) get clamped to
-        # what the bridge operator chose.
-        reasoning_effort = (
-            resolved_settings.reasoning_effort
-            or payload.factory_droid_reasoning_effort
-            or payload.reasoning_effort
-        )
+        reasoning_effort = _effective_reasoning_effort(payload, resolved_settings)
         try:
             reasoning_effort = normalize_reasoning_effort(reasoning_effort)
         except RunnerError as exc:
@@ -1800,6 +1795,22 @@ def _usage_chunk(
         "choices": [],
         "usage": _usage_dict(usage),
     }
+
+
+def _effective_reasoning_effort(
+    payload: ChatCompletionRequest,
+    settings: Settings,
+) -> str | None:
+    """A configured effort overrides whatever effort the request carries.
+
+    Agent frameworks pin their own value (often ``medium``), so the operator
+    setting has to win for the bridge to hold a chosen effort.
+    """
+    return (
+        settings.reasoning_effort
+        or payload.factory_droid_reasoning_effort
+        or payload.reasoning_effort
+    )
 
 
 def _validate_options(
