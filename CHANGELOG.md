@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.1](https://github.com/mrwogu/factory-droid-openai/compare/v1.4.0...v1.4.1) (2026-07-29)
+
+
+### Bug Fixes
+
+* **config:** reasoning effort override, teardown grace, dialect in protocol error ([#29](https://github.com/mrwogu/factory-droid-openai/issues/29)) ([dd2d105](https://github.com/mrwogu/factory-droid-openai/commit/dd2d10527d024c13f6cdbfa8b7c57defb94a3723))
+
 ## [1.4.0](https://github.com/mrwogu/factory-droid-openai/compare/v1.3.4...v1.4.0) (2026-07-29)
 
 
