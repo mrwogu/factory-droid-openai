@@ -232,6 +232,43 @@ def _client(app: Any) -> httpx.AsyncClient:
 
 
 @pytest.mark.asyncio
+async def test_apps_keep_payload_tracing_configuration_isolated(tmp_path: Path) -> None:
+    trace_path = tmp_path / "trace.jsonl"
+    disabled_runner = FakeRunner([RunComplete(Usage())])
+    enabled_runner = FakeRunner([RunComplete(Usage())])
+    disabled_app = create_app(
+        Settings(workdir=tmp_path),
+        runner_factory=cast("RunnerFactory", lambda: disabled_runner),
+    )
+    enabled_app = create_app(
+        Settings(
+            workdir=tmp_path,
+            trace_payloads="full",
+            trace_payload_file=trace_path,
+        ),
+        runner_factory=cast("RunnerFactory", lambda: enabled_runner),
+    )
+
+    async with _client(disabled_app) as client:
+        disabled_response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(messages=[{"role": "user", "content": "do not trace"}]),
+        )
+    async with _client(enabled_app) as client:
+        enabled_response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(messages=[{"role": "user", "content": "trace this"}]),
+        )
+
+    assert disabled_response.status_code == 200
+    assert enabled_response.status_code == 200
+    records = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 1
+    assert "trace this" in records[0]["payload"]
+    assert "do not trace" not in records[0]["payload"]
+
+
+@pytest.mark.asyncio
 async def test_health_and_models(tmp_path: Path) -> None:
     runner = FakeRunner([])
     async with _client(_app(tmp_path, runner)) as client:

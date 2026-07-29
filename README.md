@@ -1147,6 +1147,8 @@ followed by `[DONE]`.
 | `FACTORY_DROID_OPENAI_MCP_SETTLE_SECONDS` | `0` | MCP initialization window before tool discovery |
 | `FACTORY_DROID_OPENAI_LOG_LEVEL` | `info` | Bridge and Uvicorn log level |
 | `FACTORY_DROID_OPENAI_LOG_FORMAT` | `text` | Bridge log rendering: `text` or `json` |
+| `FACTORY_DROID_OPENAI_TRACE_PAYLOADS` | `off` | Payload tracing: `off`, `heads`, or `full` |
+| `FACTORY_DROID_OPENAI_TRACE_FILE` | unset | Trace destination, required unless tracing is `off` |
 
 Command-line options:
 
@@ -1311,6 +1313,35 @@ tasks such as title generation.
 
 Log lines carry no prompt or completion text: sizes, counts, timings, model
 IDs, and session IDs only.
+
+### Payload tracing
+
+Prompts and malformed tool-call payloads stay out of the log stream. When a
+protocol bug needs the actual bytes, opt into a separate JSONL trace file:
+
+```bash
+export FACTORY_DROID_OPENAI_TRACE_PAYLOADS=heads
+export FACTORY_DROID_OPENAI_TRACE_FILE="$HOME/.cache/factory-droid-openai/trace.jsonl"
+factory-droid-openai
+```
+
+| Mode | Recorded per event |
+|---|---|
+| `off` | Nothing; the file is never created |
+| `heads` | First 2048 and last 1024 characters of the payload |
+| `full` | Whole payload, capped at 1 MiB with `payload_truncated` set |
+
+Both variables are required together, and the destination must be an existing
+directory holding a regular non-symlink file path. The file is created mode
+`0600` and re-chmodded on every write.
+
+Every line is redacted before it is written: bearer and basic credentials,
+`sk-` keys, long base64 runs, and values of key, token, secret, password, and
+authorization fields, in both the payload and the event metadata. Redaction is
+best effort, `payload_bytes` counts the original payload, and
+`redacted_sha256` digests the redacted text. Traced prompts are still private
+user content, so keep the destination outside the Droid workdir, outside version
+control, and delete it when the investigation ends.
 
 ## Authentication
 

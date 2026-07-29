@@ -8,6 +8,7 @@ from pathlib import Path
 from droid_sdk.schemas.enums import ReasoningEffort
 
 from factory_droid_openai.logs import LOG_FORMATS, LOG_LEVELS
+from factory_droid_openai.payloadlog import PAYLOAD_TRACE_MODES
 
 _REASONING_EFFORTS: tuple[str, ...] = tuple(effort.value for effort in ReasoningEffort)
 
@@ -55,6 +56,9 @@ class Settings:
     warm_sessions: int = -1
     warm_session_ttl_seconds: float = 600.0
     detached_cleanup: bool = True
+    # Off by default: prompts and tool payloads are private user content.
+    trace_payloads: str = "off"
+    trace_payload_file: Path | None = None
 
     def __post_init__(self) -> None:
         # The warm pool keys sessions by this value, so it has to match the
@@ -227,6 +231,19 @@ class Settings:
             default="text",
             allowed=LOG_FORMATS,
         )
+        trace_payloads = _choice(
+            "FACTORY_DROID_OPENAI_TRACE_PAYLOADS",
+            default="off",
+            allowed=PAYLOAD_TRACE_MODES,
+        )
+        trace_payload_file = _optional_path("FACTORY_DROID_OPENAI_TRACE_FILE")
+        if trace_payloads != "off" and trace_payload_file is None:
+            # No implicit default: the Droid session runs with workdir as its cwd,
+            # so a trace file placed there would expose every prompt to the agent.
+            raise ValueError(
+                "FACTORY_DROID_OPENAI_TRACE_FILE is required when "
+                "FACTORY_DROID_OPENAI_TRACE_PAYLOADS is not 'off'",
+            )
         port = _positive_int("FACTORY_DROID_OPENAI_PORT", default=8787)
         if port > 65535:
             raise ValueError("FACTORY_DROID_OPENAI_PORT must be at most 65535")
@@ -271,6 +288,8 @@ class Settings:
             warm_sessions=warm_sessions,
             warm_session_ttl_seconds=warm_session_ttl_seconds,
             detached_cleanup=detached_cleanup,
+            trace_payloads=trace_payloads,
+            trace_payload_file=trace_payload_file,
         )
 
 
@@ -347,6 +366,21 @@ def _optional_file(name: str) -> Path | None:
     path = Path(raw).expanduser()
     if not path.is_file():
         raise ValueError(f"{name} does not point at a readable file: {path}")
+    return path.resolve()
+
+
+def _optional_path(name: str) -> Path | None:
+    """Return an appendable file path; the parent must exist, the file need not."""
+    raw = os.getenv(name)
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    if not path.parent.is_dir():
+        raise ValueError(f"{name} parent directory does not exist: {path.parent}")
+    if path.is_symlink():
+        raise ValueError(f"{name} must not be a symlink: {path}")
+    if path.exists() and not path.is_file():
+        raise ValueError(f"{name} must be a regular file: {path}")
     return path.resolve()
 
 
