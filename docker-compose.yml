@@ -18,6 +18,8 @@
 services:
   droid-bridge:
     image: ghcr.io/mrwogu/factory-droid-openai:latest
+    # Always pull the newest image on `docker compose up`.
+    pull_policy: always
     # Build locally instead of pulling the published image:
     # build: .
     ports:

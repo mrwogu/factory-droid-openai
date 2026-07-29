@@ -69,7 +69,7 @@ export FACTORY_API_KEY=fk-...
 ### Step 2 - start the bridge
 
 ```bash
-docker run -d --name droid-bridge \
+docker run -d --rm --pull=always --name droid-bridge \
   -p 127.0.0.1:8787:8787 \
   -e FACTORY_API_KEY="$FACTORY_API_KEY" \
   ghcr.io/mrwogu/factory-droid-openai:latest
@@ -118,10 +118,12 @@ Ready-made configurations: [VS Code](#vs-code), [OpenClaw](#openclaw),
 ### Stopping and updating
 
 ```bash
-docker logs -f droid-bridge
-docker stop droid-bridge && docker rm droid-bridge
-docker pull ghcr.io/mrwogu/factory-droid-openai:latest
+docker stop droid-bridge
 ```
+
+`--rm` removes the container on stop, and `--pull=always` fetches the
+newest image on start, so rerunning the `docker run` command above always
+updates you to the latest release.
 
 More container options - Compose, Podman, mounting a project directory,
 bridge tokens, local builds - are in [Docker](#docker).
@@ -375,7 +377,7 @@ the port to loopback on the host so the bridge is not exposed to the
 network:
 
 ```bash
-docker run -d --name droid-bridge \
+docker run -d --rm --pull=always --name droid-bridge \
   -p 127.0.0.1:8787:8787 \
   -e FACTORY_API_KEY="$FACTORY_API_KEY" \
   -e FACTORY_DROID_OPENAI_API_KEY="$FACTORY_DROID_OPENAI_API_KEY" \
