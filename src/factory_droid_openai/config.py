@@ -5,7 +5,11 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from droid_sdk.schemas.enums import ReasoningEffort
+
 from factory_droid_openai.logs import LOG_FORMATS, LOG_LEVELS
+
+_REASONING_EFFORTS: tuple[str, ...] = tuple(effort.value for effort in ReasoningEffort)
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,8 +31,8 @@ class Settings:
     max_structured_output_bytes: int = 1_048_576
     max_json_depth: int = 32
     retry_after_seconds: int = 1
-    process_grace_seconds: float = 2.0
-    cleanup_timeout_seconds: float = 4.0
+    process_grace_seconds: float = 5.0
+    cleanup_timeout_seconds: float = 10.0
     server_limit_concurrency: int = 64
     server_backlog: int = 128
     max_tool_calls: int = 8
@@ -44,6 +48,8 @@ class Settings:
     worktree: str | None = None
     append_system_prompt_file: Path | None = None
     model_alias: str = "factory-droid"
+    # Overrides any reasoning_effort a request carries when set.
+    reasoning_effort: str | None = None
     log_level: str = "info"
     log_format: str = "text"
     warm_sessions: int = -1
@@ -125,13 +131,14 @@ class Settings:
         )
         process_grace_seconds = _positive_float(
             "FACTORY_DROID_OPENAI_PROCESS_GRACE_SECONDS",
-            # droid shuts down cleanly in about a second, so a shorter grace
-            # period turns every teardown into a SIGKILL.
-            default=2.0,
+            # Teardown after a full turn keeps droid busy for seconds past
+            # SIGTERM, so a shorter grace period turns every cleanup into a
+            # SIGKILL.
+            default=5.0,
         )
         cleanup_timeout_seconds = _positive_float(
             "FACTORY_DROID_OPENAI_CLEANUP_TIMEOUT_SECONDS",
-            default=4.0,
+            default=10.0,
         )
         if cleanup_timeout_seconds <= process_grace_seconds:
             raise ValueError(
@@ -192,6 +199,10 @@ class Settings:
         append_system_prompt_file = _optional_file(
             "FACTORY_DROID_OPENAI_APPEND_SYSTEM_PROMPT_FILE",
         )
+        reasoning_effort = _optional_choice(
+            "FACTORY_DROID_OPENAI_REASONING_EFFORT",
+            allowed=_REASONING_EFFORTS,
+        )
         log_level = _choice(
             "FACTORY_DROID_OPENAI_LOG_LEVEL",
             default="info",
@@ -240,6 +251,7 @@ class Settings:
             worktree=worktree,
             append_system_prompt_file=append_system_prompt_file,
             model_alias=os.getenv("FACTORY_DROID_OPENAI_MODEL_ALIAS", "factory-droid"),
+            reasoning_effort=reasoning_effort,
             log_level=log_level,
             log_format=log_format,
             warm_sessions=warm_sessions,
@@ -297,6 +309,17 @@ def _choice(name: str, *, default: str, allowed: tuple[str, ...]) -> str:
     raw = os.getenv(name)
     if raw is None or not raw.strip():
         return default
+    value = raw.strip().lower()
+    if value not in allowed:
+        raise ValueError(f"{name} must be one of: {', '.join(allowed)}")
+    return value
+
+
+def _optional_choice(name: str, *, allowed: tuple[str, ...]) -> str | None:
+    """Return the configured value, or ``None`` when the variable is unset."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
     value = raw.strip().lower()
     if value not in allowed:
         raise ValueError(f"{name} must be one of: {', '.join(allowed)}")

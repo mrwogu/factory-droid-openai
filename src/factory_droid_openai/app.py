@@ -627,7 +627,12 @@ def create_app(
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         pool.start(
-            initial_key=SessionKey(model_id=None, reasoning_effort=None),
+            # Warm with the configured effort override so clamped requests
+            # reuse the session instead of paying for a retune.
+            initial_key=SessionKey(
+                model_id=None,
+                reasoning_effort=resolved_settings.reasoning_effort,
+            ),
         )
         log_info(
             "bridge.started",
@@ -1099,7 +1104,14 @@ def create_app(
             prompt_ms=timeline.mark("prompt_ms"),
         )
 
-        reasoning_effort = payload.factory_droid_reasoning_effort or payload.reasoning_effort
+        # A configured effort is an override: clients that send their own
+        # value (e.g. agent frameworks defaulting to medium) get clamped to
+        # what the bridge operator chose.
+        reasoning_effort = (
+            resolved_settings.reasoning_effort
+            or payload.factory_droid_reasoning_effort
+            or payload.reasoning_effort
+        )
         try:
             reasoning_effort = normalize_reasoning_effort(reasoning_effort)
         except RunnerError as exc:

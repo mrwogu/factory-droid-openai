@@ -880,6 +880,24 @@ async def test_request_options_map_to_runner_request(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_configured_reasoning_effort_overrides_request(tmp_path: Path) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+    settings = Settings(
+        droid_path="droid",
+        workdir=tmp_path,
+        timeout_seconds=30.0,
+        reasoning_effort="low",
+    )
+    app = create_app(settings, runner_factory=cast("RunnerFactory", lambda: runner))
+    payload = _payload(reasoning_effort="high", factory_droid_reasoning_effort="medium")
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert runner.requests[0].reasoning_effort == "low"
+
+
+@pytest.mark.asyncio
 async def test_bounded_queue_rejects_overload_before_stream_headers(
     tmp_path: Path,
 ) -> None:

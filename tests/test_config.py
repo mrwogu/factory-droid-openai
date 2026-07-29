@@ -44,6 +44,7 @@ _ENVIRONMENT_KEYS = (
     "FACTORY_DROID_OPENAI_UVICORN_LIMIT_CONCURRENCY",
     "FACTORY_DROID_OPENAI_UVICORN_BACKLOG",
     "FACTORY_DROID_OPENAI_MODEL_ALIAS",
+    "FACTORY_DROID_OPENAI_REASONING_EFFORT",
     "FACTORY_DROID_OPENAI_LOG_LEVEL",
     "FACTORY_DROID_OPENAI_LOG_FORMAT",
     "FACTORY_DROID_OPENAI_WARM_SESSIONS",
@@ -101,6 +102,23 @@ def test_settings_from_env_rejects_unknown_log_options(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv(name, value)
 
+    with pytest.raises(ValueError, match="must be one of"):
+        Settings.from_env()
+
+
+def test_settings_from_env_reads_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_environment(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+
+    assert Settings.from_env().reasoning_effort is None
+
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_REASONING_EFFORT", " LOW ")
+    assert Settings.from_env().reasoning_effort == "low"
+
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_REASONING_EFFORT", "extreme")
     with pytest.raises(ValueError, match="must be one of"):
         Settings.from_env()
 
