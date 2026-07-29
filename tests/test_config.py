@@ -123,6 +123,15 @@ def test_settings_from_env_reads_reasoning_effort(
         Settings.from_env()
 
 
+def test_settings_normalize_reasoning_effort_on_construction() -> None:
+    assert Settings(reasoning_effort=" HIGH ").reasoning_effort == "high"
+    assert Settings(reasoning_effort="   ").reasoning_effort is None
+    assert Settings().reasoning_effort is None
+
+    with pytest.raises(ValueError, match="reasoning_effort must be one of"):
+        Settings(reasoning_effort="extreme")
+
+
 def test_warm_session_count_tracks_max_concurrency_unless_set(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

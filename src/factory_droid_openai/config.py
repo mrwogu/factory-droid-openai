@@ -56,6 +56,20 @@ class Settings:
     warm_session_ttl_seconds: float = 600.0
     detached_cleanup: bool = True
 
+    def __post_init__(self) -> None:
+        # The warm pool keys sessions by this value, so it has to match the
+        # normalized effort the request path sends to Droid, and a bad value
+        # has to fail at construction instead of on every request.
+        if self.reasoning_effort is None:
+            return
+        value = self.reasoning_effort.strip().lower()
+        if not value:
+            object.__setattr__(self, "reasoning_effort", None)
+            return
+        if value not in _REASONING_EFFORTS:
+            raise ValueError(f"reasoning_effort must be one of: {', '.join(_REASONING_EFFORTS)}")
+        object.__setattr__(self, "reasoning_effort", value)
+
     def warm_session_count(self) -> int:
         """Warm sessions to keep ready; ``-1`` keeps one spare per concurrency slot.
 
