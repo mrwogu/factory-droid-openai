@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.4.0](https://github.com/mrwogu/factory-droid-openai/compare/v1.3.4...v1.4.0) (2026-07-29)
+
+
+### Features
+
+* **api:** serve retrieve-model and version probes ([#27](https://github.com/mrwogu/factory-droid-openai/issues/27)) ([77cdd13](https://github.com/mrwogu/factory-droid-openai/commit/77cdd13372a416e05590c06b841328aa382450f1))
+* **protocol:** decode model tool-call dialects via registry ([#26](https://github.com/mrwogu/factory-droid-openai/issues/26)) ([4b45ed5](https://github.com/mrwogu/factory-droid-openai/commit/4b45ed5389cf3201f82eb6a59435cac5bddfa2df))
+* **scripts:** show verify progress in vscode model generator ([8cb2736](https://github.com/mrwogu/factory-droid-openai/commit/8cb2736b611c072e5872870eb96dd4eb400dba2a))
+
+
+### Bug Fixes
+
+* **protocol:** harden model dialect decoding ([#28](https://github.com/mrwogu/factory-droid-openai/issues/28)) ([4197ac1](https://github.com/mrwogu/factory-droid-openai/commit/4197ac1f3326ef8963681475db1157c1822d879e))
+
 ## [1.3.4](https://github.com/mrwogu/factory-droid-openai/compare/v1.3.3...v1.3.4) (2026-07-28)
 
 
