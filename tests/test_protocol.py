@@ -816,6 +816,16 @@ def test_stream_parser_rejects_prose_after_pipe_tag_call() -> None:
         parser.feed(f"{_PIPE_TAG_OPEN}{_PIPE_TAG_CALL}{_PIPE_TAG_CLOSE} and done")
 
 
+def test_stream_parser_names_the_dialect_in_trailing_text_error() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    with pytest.raises(
+        ProtocolError,
+        match=r"unexpected text after tool call \(pipe_tag dialect\)",
+    ):
+        parser.feed(f"{_PIPE_TAG_OPEN}{_PIPE_TAG_CALL}{_PIPE_TAG_CLOSE} and done")
+
+
 def test_stream_parser_ignores_pipe_tag_control_tokens_after_the_call() -> None:
     parser = ToolCallStreamParser(frozenset({"weather"}))
 
