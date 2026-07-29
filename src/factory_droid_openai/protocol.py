@@ -18,6 +18,7 @@ from factory_droid_openai.dialects import (
 from factory_droid_openai.errors import ProtocolError, RequestTooLargeError
 from factory_droid_openai.logs import debug as log_debug
 from factory_droid_openai.logs import trace as log_trace
+from factory_droid_openai.payloadlog import trace_payload
 from factory_droid_openai.strictjson import decode_json_values, parse_strict_json
 
 if TYPE_CHECKING:
@@ -451,6 +452,7 @@ class ToolCallStreamParser:
                     head=body[:_UNPARSED_HEAD_CHARS],
                     payload_bytes=len(body.encode("utf-8")),
                 )
+                trace_payload("tool_call.unparsed", body)
                 raise ProtocolError(f"invalid tool-call JSON: {exc}") from exc
             values = decoded
         if not values:
@@ -463,6 +465,7 @@ class ToolCallStreamParser:
                 if not value or not all(isinstance(item, dict) for item in value):
                     raise ProtocolError("tool-call payload must be a JSON object")
                 log_debug("tool_call.repaired", variant="json_array")
+                trace_payload("tool_call.repaired", body, variant="json_array")
                 objects.extend(value)
                 continue
             if not isinstance(value, dict):
@@ -470,6 +473,7 @@ class ToolCallStreamParser:
             objects.append(value)
         if len(objects) > 1:
             log_debug("tool_call.repaired", variant="packed_objects")
+            trace_payload("tool_call.repaired", body, variant="packed_objects")
         return objects
 
     def _decode_payload(self, body: str) -> list[Any] | None:
@@ -477,6 +481,7 @@ class ToolCallStreamParser:
             decoded = decoder.decode(body, self._allowed_tool_names)
             if decoded is not None:
                 log_debug("tool_call.repaired", variant=decoder.name)
+                trace_payload("tool_call.repaired", body, variant=decoder.name)
                 return list(decoded)
         return None
 

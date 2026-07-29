@@ -46,6 +46,7 @@ from factory_droid_openai.models import (
     SessionOperationResponse,
     VersionResponse,
 )
+from factory_droid_openai.payloadlog import configure_payload_tracing, trace_payload
 from factory_droid_openai.pool import BackgroundReaper, WarmSessionPool
 from factory_droid_openai.protocol import (
     ProtocolEmission,
@@ -590,6 +591,10 @@ def create_app(
     runner_factory: RunnerFactory | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings.from_env()
+    configure_payload_tracing(
+        mode=resolved_settings.trace_payloads,
+        path=resolved_settings.trace_payload_file,
+    )
     metrics = BridgeMetrics()
     reaper = BackgroundReaper(metrics=metrics)
     resolved_runner_factory = runner_factory or (
@@ -640,6 +645,12 @@ def create_app(
             max_concurrency=resolved_settings.max_concurrency,
             detached_cleanup=resolved_settings.detached_cleanup,
             reasoning_effort=resolved_settings.reasoning_effort,
+            trace_payloads=resolved_settings.trace_payloads,
+            trace_payload_file=(
+                str(resolved_settings.trace_payload_file)
+                if resolved_settings.trace_payload_file is not None
+                else None
+            ),
         )
         try:
             yield
@@ -1105,6 +1116,7 @@ def create_app(
             documents=len(plan.attachments.documents),
             prompt_ms=timeline.mark("prompt_ms"),
         )
+        trace_payload("chat.prompt", plan.prompt, model=payload.model)
 
         reasoning_effort = _effective_reasoning_effort(payload, resolved_settings)
         try:

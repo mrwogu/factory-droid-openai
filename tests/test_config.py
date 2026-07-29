@@ -50,6 +50,8 @@ _ENVIRONMENT_KEYS = (
     "FACTORY_DROID_OPENAI_WARM_SESSIONS",
     "FACTORY_DROID_OPENAI_WARM_SESSION_TTL_SECONDS",
     "FACTORY_DROID_OPENAI_DETACHED_CLEANUP",
+    "FACTORY_DROID_OPENAI_TRACE_PAYLOADS",
+    "FACTORY_DROID_OPENAI_TRACE_FILE",
 )
 
 
@@ -469,3 +471,70 @@ def test_settings_ignore_blank_optional_values(
 
     assert settings.worktree is None
     assert settings.append_system_prompt_file is None
+
+
+def test_settings_trace_payloads_defaults_to_off(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_environment(monkeypatch)
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
+
+    settings = Settings.from_env()
+
+    assert settings.trace_payloads == "off"
+    assert settings.trace_payload_file is None
+
+
+def test_settings_trace_payloads_defaults_file_to_workdir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_environment(monkeypatch)
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_TRACE_PAYLOADS", " FULL ")
+
+    settings = Settings.from_env()
+
+    assert settings.trace_payloads == "full"
+    assert settings.trace_payload_file == (tmp_path / "trace.jsonl").resolve()
+
+
+def test_settings_trace_payloads_reads_explicit_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_environment(monkeypatch)
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_TRACE_PAYLOADS", "heads")
+    target = tmp_path / "custom.jsonl"
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_TRACE_FILE", str(target))
+
+    settings = Settings.from_env()
+
+    assert settings.trace_payloads == "heads"
+    assert settings.trace_payload_file == target.resolve()
+
+
+def test_settings_trace_payloads_rejects_unknown_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_environment(monkeypatch)
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_TRACE_PAYLOADS", "everything")
+
+    with pytest.raises(ValueError, match="must be one of"):
+        Settings.from_env()
+
+
+def test_settings_trace_file_rejects_missing_parent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_environment(monkeypatch)
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_TRACE_FILE", str(tmp_path / "missing" / "t.jsonl"))
+
+    with pytest.raises(ValueError, match="parent directory does not exist"):
+        Settings.from_env()
