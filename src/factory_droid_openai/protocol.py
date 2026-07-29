@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any
 
 from factory_droid_openai.attachments import AttachmentSet, extract_attachments
 from factory_droid_openai.dialects import (
@@ -22,7 +22,13 @@ from factory_droid_openai.payloadlog import NULL_PAYLOAD_TRACER
 from factory_droid_openai.strictjson import decode_json_values, parse_strict_json
 
 if TYPE_CHECKING:
+    from typing import Protocol
+
     from factory_droid_openai.models import ChatCompletionRequest, ToolDefinition
+
+    class PayloadTrace(Protocol):
+        def __call__(self, event: str, payload: str, **fields: Any) -> None: ...
+
 
 _MAX_TOOL_PAYLOAD_BYTES = 1_000_000
 _ARGUMENT_KEYS = ("arguments", "parameters", "args", "input")
@@ -66,10 +72,6 @@ class ToolCallEmission:
 
 
 ProtocolEmission = TextEmission | ToolCallEmission
-
-
-class PayloadTrace(Protocol):
-    def __call__(self, event: str, payload: str, **fields: Any) -> None: ...
 
 
 def build_prompt(

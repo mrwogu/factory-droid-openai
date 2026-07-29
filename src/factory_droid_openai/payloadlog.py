@@ -156,7 +156,7 @@ class PayloadTracer:
             try:
                 if not stat.S_ISREG(os.fstat(descriptor).st_mode):
                     raise OSError("Payload trace destination must be a regular file")
-                if os.name != "nt":
+                if os.name != "nt":  # pragma: no branch - fchmod is POSIX only
                     os.fchmod(descriptor, stat.S_IRUSR | stat.S_IWUSR)
                 with os.fdopen(
                     descriptor,
