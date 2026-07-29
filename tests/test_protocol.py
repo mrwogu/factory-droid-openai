@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
 
@@ -497,6 +498,41 @@ def test_stream_parser_repairs_arg_key_value_payload() -> None:
     assert len(emissions) == 1
     assert isinstance(emissions[0], ToolCallEmission)
     assert json.loads(emissions[0].arguments) == {"city": "Gdańsk", "days": 3}
+
+
+def test_stream_parser_uses_injected_payload_tracer() -> None:
+    traces: list[tuple[str, str, dict[str, Any]]] = []
+
+    def trace(event: str, payload: str, **fields: Any) -> None:
+        traces.append((event, payload, fields))
+
+    parser = ToolCallStreamParser(
+        frozenset({"weather"}),
+        max_tool_calls=2,
+        trace_payload=trace,
+    )
+    payload = (
+        '{"name":"weather","arguments":{"city":"Gdansk"}}'
+        '{"name":"weather","arguments":{"city":"Sopot"}}'
+    )
+
+    parser.feed(f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE}")
+
+    assert traces == [("tool_call.repaired", payload, {"variant": "packed_objects"})]
+
+
+def test_stream_parser_traces_unparsed_payload() -> None:
+    traces: list[tuple[str, str, dict[str, Any]]] = []
+
+    def trace(event: str, payload: str, **fields: Any) -> None:
+        traces.append((event, payload, fields))
+
+    parser = ToolCallStreamParser(frozenset({"weather"}), trace_payload=trace)
+
+    with pytest.raises(ProtocolError, match="invalid tool-call JSON"):
+        parser.feed(f"{TOOL_CALL_OPEN}not json{TOOL_CALL_CLOSE}")
+
+    assert traces == [("tool_call.unparsed", "not json", {})]
 
 
 @pytest.mark.parametrize(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import pytest
@@ -486,13 +487,26 @@ def test_settings_trace_payloads_defaults_to_off(
     assert settings.trace_payload_file is None
 
 
-def test_settings_trace_payloads_defaults_file_to_workdir(
+def test_settings_trace_payloads_requires_explicit_file(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     _clear_environment(monkeypatch)
     monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
     monkeypatch.setenv("FACTORY_DROID_OPENAI_TRACE_PAYLOADS", " FULL ")
+
+    with pytest.raises(ValueError, match="TRACE_FILE is required"):
+        Settings.from_env()
+
+
+def test_settings_trace_payloads_normalizes_mode_with_explicit_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_environment(monkeypatch)
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_TRACE_PAYLOADS", " FULL ")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_TRACE_FILE", str(tmp_path / "trace.jsonl"))
 
     settings = Settings.from_env()
 
@@ -537,4 +551,35 @@ def test_settings_trace_file_rejects_missing_parent(
     monkeypatch.setenv("FACTORY_DROID_OPENAI_TRACE_FILE", str(tmp_path / "missing" / "t.jsonl"))
 
     with pytest.raises(ValueError, match="parent directory does not exist"):
+        Settings.from_env()
+
+
+def test_settings_trace_file_rejects_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_environment(monkeypatch)
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
+    existing = tmp_path / "traces"
+    existing.mkdir()
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_TRACE_FILE", str(existing))
+
+    with pytest.raises(ValueError, match="must be a regular file"):
+        Settings.from_env()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
+def test_settings_trace_file_rejects_symlink(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_environment(monkeypatch)
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
+    target = tmp_path / "target.jsonl"
+    target.write_text("", encoding="utf-8")
+    link = tmp_path / "trace.jsonl"
+    link.symlink_to(target)
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_TRACE_FILE", str(link))
+
+    with pytest.raises(ValueError, match="must not be a symlink"):
         Settings.from_env()

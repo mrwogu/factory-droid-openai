@@ -46,7 +46,7 @@ from factory_droid_openai.models import (
     SessionOperationResponse,
     VersionResponse,
 )
-from factory_droid_openai.payloadlog import configure_payload_tracing, trace_payload
+from factory_droid_openai.payloadlog import configure_payload_tracing
 from factory_droid_openai.pool import BackgroundReaper, WarmSessionPool
 from factory_droid_openai.protocol import (
     ProtocolEmission,
@@ -591,7 +591,7 @@ def create_app(
     runner_factory: RunnerFactory | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings.from_env()
-    configure_payload_tracing(
+    payload_tracer = configure_payload_tracing(
         mode=resolved_settings.trace_payloads,
         path=resolved_settings.trace_payload_file,
     )
@@ -1116,7 +1116,7 @@ def create_app(
             documents=len(plan.attachments.documents),
             prompt_ms=timeline.mark("prompt_ms"),
         )
-        trace_payload("chat.prompt", plan.prompt, model=payload.model)
+        payload_tracer.trace("chat.prompt", plan.prompt, model=payload.model)
 
         reasoning_effort = _effective_reasoning_effort(payload, resolved_settings)
         try:
@@ -1193,6 +1193,7 @@ def create_app(
                     max_tool_calls=(
                         resolved_settings.max_tool_calls if payload.parallel_tool_calls else 1
                     ),
+                    trace_payload=payload_tracer.trace,
                 ),
                 runner=runner,
                 run_request=run_request,
@@ -1256,6 +1257,7 @@ def create_app(
                                 if payload.parallel_tool_calls
                                 else 1
                             ),
+                            trace_payload=payload_tracer.trace,
                         ),
                         metrics=metrics,
                         request_started_at=request_started_at,
