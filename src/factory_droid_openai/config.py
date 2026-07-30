@@ -342,7 +342,9 @@ def _boolean(name: str, *, default: bool) -> bool:
 
 
 def _telemetry_enabled() -> bool:
-    if os.getenv("DO_NOT_TRACK", "").strip() == "1":
+    # The DO_NOT_TRACK convention treats any value other than "0" as opt-out.
+    do_not_track = os.getenv("DO_NOT_TRACK", "").strip()
+    if do_not_track not in {"", "0"}:
         return False
     return _boolean("FACTORY_DROID_OPENAI_TELEMETRY", default=True)
 

@@ -1,21 +1,29 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import platform
-import queue
 import sys
 import threading
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
-from typing import Literal, cast
+from typing import IO, TYPE_CHECKING, Literal, cast
 
 from factory_droid_openai.metrics import BridgeMetrics, MetricsSnapshot, RequestMetric
 
+if TYPE_CHECKING:
+    from http.client import HTTPMessage
+
 DEFAULT_TELEMETRY_ENDPOINT = "https://telemetry.guziak.net/v1/events"
 DEFAULT_TELEMETRY_INTERVAL_SECONDS = 900.0
-DEFAULT_TELEMETRY_TIMEOUT_SECONDS = 0.5
+# Reporting runs off the request path, so the budget only has to stay well below
+# the reporting interval. A tighter budget mostly discards cold DNS and TLS
+# handshakes, which silently drops the batch.
+DEFAULT_TELEMETRY_TIMEOUT_SECONDS = 5.0
+# Shutdown blocks on the final batch, so it gets a much smaller budget.
+DEFAULT_TELEMETRY_SHUTDOWN_TIMEOUT_SECONDS = 1.0
 _MAX_EVENTS_PER_REQUEST = 25
 _MAX_EVENT_COUNT = 1_000_000
 _MAX_EVENT_DURATION_SUM_MS = 1_000_000_000_000
@@ -34,6 +42,7 @@ class TelemetryReporter:
         enabled: bool,
         interval_seconds: float = DEFAULT_TELEMETRY_INTERVAL_SECONDS,
         timeout_seconds: float = DEFAULT_TELEMETRY_TIMEOUT_SECONDS,
+        shutdown_timeout_seconds: float = DEFAULT_TELEMETRY_SHUTDOWN_TIMEOUT_SECONDS,
         post: TelemetryPost | None = None,
     ) -> None:
         self._metrics = metrics
@@ -42,6 +51,7 @@ class TelemetryReporter:
         self._enabled = enabled
         self._interval_seconds = interval_seconds
         self._timeout_seconds = timeout_seconds
+        self._shutdown_timeout_seconds = shutdown_timeout_seconds
         self._post = post or _post
         self._baseline = MetricsSnapshot(requests=(), features=(), internal=())
         self._startup_pending = True
@@ -65,10 +75,16 @@ class TelemetryReporter:
         self._task = None
         if task is not None:
             self._stop.set()
-            await task
-        await self.flush()
+            # A periodic batch may be mid-flight, and shutdown must not inherit
+            # the much larger periodic budget.
+            done, _pending = await asyncio.wait({task}, timeout=self._shutdown_timeout_seconds)
+            if not done:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        await self.flush(timeout_seconds=self._shutdown_timeout_seconds)
 
-    async def flush(self) -> bool:
+    async def flush(self, *, timeout_seconds: float | None = None) -> bool:
         if not self._enabled:
             return True
         async with self._flush_lock:
@@ -82,7 +98,8 @@ class TelemetryReporter:
                 return True
             metadata = _runtime_metadata(self._app_version)
             loop = asyncio.get_running_loop()
-            deadline = loop.time() + self._timeout_seconds
+            budget = self._timeout_seconds if timeout_seconds is None else timeout_seconds
+            deadline = loop.time() + budget
             for batch in _event_batches(events):
                 remaining = deadline - loop.time()
                 if remaining <= 0:
@@ -103,16 +120,23 @@ class TelemetryReporter:
                     remaining,
                 )
                 if sent != "failed":
+                    # A timed-out send may still land, so counters advance to keep
+                    # aggregates from double counting.
                     self._baseline = _advance_snapshot(self._baseline, batch)
-                    if batch[0]["name"] == "bridge_started":
-                        self._startup_pending = False
+                if sent == "sent" and _contains_startup(batch):
+                    # Startup is the one event that must arrive, so an uncertain
+                    # send keeps it queued for the next batch.
+                    self._startup_pending = False
                 if sent != "sent":
                     return False
             return True
 
     async def _run(self) -> None:
         while not self._stop.is_set():
-            await self.flush()
+            # Reporting is best effort and shutdown awaits this task, so a
+            # reporting failure must not escape.
+            with contextlib.suppress(Exception):
+                await self.flush()
             try:
                 await asyncio.wait_for(
                     self._stop.wait(),
@@ -166,6 +190,10 @@ def _events_since(
         if count > 0:
             events.append({"name": "internal", "metric": metric_name, "count": count})
     return events
+
+
+def _contains_startup(batch: list[dict[str, object]]) -> bool:
+    return any(event["name"] == "bridge_started" for event in batch)
 
 
 def _event_batches(events: list[dict[str, object]]) -> list[list[dict[str, object]]]:
@@ -276,14 +304,16 @@ async def _post_with_deadline(
     timeout_seconds: float,
 ) -> SendResult:
     loop = asyncio.get_running_loop()
-    result: queue.SimpleQueue[bool] = queue.SimpleQueue()
+    delivered: asyncio.Future[bool] = loop.create_future()
 
     def send() -> None:
         try:
             sent = post(endpoint, body, timeout_seconds)
         except Exception:
             sent = False
-        result.put(sent)
+        # The loop can already be closed once a timed-out send returns.
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(delivered.set_result, sent)
 
     thread = threading.Thread(
         target=send,
@@ -294,15 +324,10 @@ async def _post_with_deadline(
         thread.start()
     except Exception:
         return "failed"
-    deadline = loop.time() + timeout_seconds
-    while True:
-        try:
-            return "sent" if result.get_nowait() else "failed"
-        except queue.Empty:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                return "unknown"
-            await asyncio.sleep(min(0.01, remaining))
+    done, _pending = await asyncio.wait({delivered}, timeout=timeout_seconds)
+    if not done:
+        return "unknown"
+    return "sent" if delivered.result() else "failed"
 
 
 def _runtime_metadata(app_version: str) -> dict[str, object]:
@@ -326,6 +351,25 @@ def _runtime_metadata(app_version: str) -> dict[str, object]:
     }
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuses redirects so a redirect can never downgrade the transport."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: HTTPMessage,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        del req, fp, code, msg, headers, newurl
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+
 def _post(endpoint: str, body: bytes, timeout_seconds: float) -> bool:
     try:
         if urllib.parse.urlsplit(endpoint).scheme != "https":
@@ -339,10 +383,7 @@ def _post(endpoint: str, body: bytes, timeout_seconds: float) -> bool:
             },
             method="POST",
         )
-        with urllib.request.urlopen(  # noqa: S310 - Request URL is HTTPS.
-            request,
-            timeout=timeout_seconds,
-        ) as response:
-            return bool(response.status == 204)
+        with _OPENER.open(request, timeout=timeout_seconds) as response:
+            return 200 <= int(response.status) < 300
     except (OSError, ValueError):
         return False

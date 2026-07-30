@@ -32,6 +32,7 @@ services:
       # FACTORY_DROID_OPENAI_WARM_SESSIONS: "2"
       # FACTORY_DROID_OPENAI_TIMEOUT_SECONDS: "600"
       # FACTORY_DROID_OPENAI_MODEL_CACHE_SECONDS: "300"
+      # FACTORY_DROID_OPENAI_TELEMETRY: "false"
     # Optional: expose your project to Droid as /work. Read-only is safe
     # because Factory-native tools are disabled. Uncomment to mount a workdir.
     # volumes:

@@ -1051,6 +1051,8 @@ def create_app(
         payload: ChatCompletionRequest,
         request: Request,
     ) -> JSONResponse | StreamingResponse:
+        # Requests rejected before the handler (validation, auth, request size)
+        # never reach this line, so they stay reported as "not_applicable".
         request.state.telemetry_mode = "stream" if payload.stream else "non_stream"
         timeout_seconds = min(
             payload.timeout or resolved_settings.timeout_seconds,

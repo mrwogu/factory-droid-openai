@@ -8,11 +8,14 @@ from typing import Any, cast
 
 import pytest
 
+from factory_droid_openai import telemetry as telemetry_module
 from factory_droid_openai.metrics import BridgeMetrics, MetricsSnapshot, RequestMetric
 from factory_droid_openai.telemetry import (
+    DEFAULT_TELEMETRY_TIMEOUT_SECONDS,
     TelemetryReporter,
     _event_batches,
     _events_since,
+    _NoRedirectHandler,
     _post,
     _runtime_metadata,
 )
@@ -108,7 +111,7 @@ async def test_reporter_sends_startup_and_metric_deltas(
     assert len(sent) == 2
     endpoint, startup, timeout = sent[0]
     assert endpoint == "https://telemetry.example/v1/events"
-    assert 0 < timeout <= 0.5
+    assert 0 < timeout <= DEFAULT_TELEMETRY_TIMEOUT_SECONDS
     assert startup == {
         "schema": 1,
         "app_version": "1.5.0",
@@ -175,11 +178,10 @@ async def test_reporter_swallows_sender_exceptions() -> None:
 @pytest.mark.asyncio
 async def test_reporter_bounds_sender_deadline() -> None:
     release = threading.Event()
-    calls = 0
+    bodies: list[dict[str, object]] = []
 
-    def post(_endpoint: str, _body: bytes, _timeout: float) -> bool:
-        nonlocal calls
-        calls += 1
+    def post(_endpoint: str, body: bytes, _timeout: float) -> bool:
+        bodies.append(json.loads(body))
         release.wait()
         return True
 
@@ -197,8 +199,15 @@ async def test_reporter_bounds_sender_deadline() -> None:
     assert asyncio.get_running_loop().time() - started_at < 0.1
     release.set()
     await asyncio.sleep(0)
+    # A send that outran the deadline may or may not have landed, so aggregate
+    # counters move on while the startup event is retried until it is confirmed.
     assert await reporter.flush() is True
-    assert calls == 1
+    assert [body["events"] for body in bodies] == [
+        [{"name": "bridge_started", "count": 1}],
+        [{"name": "bridge_started", "count": 1}],
+    ]
+    assert await reporter.flush() is True
+    assert len(bodies) == 2
 
 
 @pytest.mark.asyncio
@@ -455,6 +464,101 @@ async def test_reporter_start_close_and_disabled_paths() -> None:
     assert len(sent) == 2
 
 
+@pytest.mark.asyncio
+async def test_reporter_survives_a_failing_flush(monkeypatch: pytest.MonkeyPatch) -> None:
+    metrics = BridgeMetrics()
+    snapshots = 0
+
+    def telemetry_snapshot() -> MetricsSnapshot:
+        nonlocal snapshots
+        snapshots += 1
+        if snapshots == 1:
+            raise RuntimeError("snapshot failed")
+        return MetricsSnapshot(requests=(), features=(), internal=())
+
+    monkeypatch.setattr(metrics, "telemetry_snapshot", telemetry_snapshot)
+    sent: list[bytes] = []
+
+    def post(_endpoint: str, body: bytes, _timeout: float) -> bool:
+        sent.append(body)
+        return True
+
+    reporter = TelemetryReporter(
+        metrics=metrics,
+        app_version="1.5.0",
+        endpoint="https://telemetry.example/v1/events",
+        enabled=True,
+        interval_seconds=0.01,
+        post=post,
+    )
+    reporter.start()
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if sent:
+            break
+    await reporter.close()
+
+    assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_close_bounds_an_in_flight_periodic_batch() -> None:
+    release = threading.Event()
+    started = threading.Event()
+
+    def post(_endpoint: str, _body: bytes, _timeout: float) -> bool:
+        started.set()
+        release.wait()
+        return True
+
+    reporter = TelemetryReporter(
+        metrics=BridgeMetrics(),
+        app_version="1.5.0",
+        endpoint="https://telemetry.example/v1/events",
+        enabled=True,
+        interval_seconds=0.01,
+        timeout_seconds=30.0,
+        shutdown_timeout_seconds=0.05,
+        post=post,
+    )
+    reporter.start()
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if started.is_set():
+            break
+    started_at = asyncio.get_running_loop().time()
+
+    await reporter.close()
+
+    assert started.is_set()
+    assert asyncio.get_running_loop().time() - started_at < 1.0
+    release.set()
+
+
+@pytest.mark.asyncio
+async def test_close_applies_the_shutdown_deadline() -> None:
+    timeouts: list[float] = []
+
+    def post(_endpoint: str, _body: bytes, timeout: float) -> bool:
+        timeouts.append(timeout)
+        return True
+
+    reporter = TelemetryReporter(
+        metrics=BridgeMetrics(),
+        app_version="1.5.0",
+        endpoint="https://telemetry.example/v1/events",
+        enabled=True,
+        timeout_seconds=30.0,
+        shutdown_timeout_seconds=0.25,
+        post=post,
+    )
+
+    await reporter.close()
+
+    assert timeouts
+    assert all(0 < timeout <= 0.25 for timeout in timeouts)
+
+
 def test_events_since_ignores_non_positive_deltas() -> None:
     baseline = MetricsSnapshot(
         requests=(RequestMetric("health", "success", "not_applicable", 1, 100),),
@@ -522,26 +626,52 @@ class _Response:
         return None
 
 
-@pytest.mark.parametrize(("status", "expected"), [(204, True), (500, False)])
-def test_post_requires_no_content_response(
+class _Opener:
+    def __init__(self, result: _Response | Exception) -> None:
+        self._result = result
+        self.captured: dict[str, Any] = {}
+
+    def open(self, request: Any, *, timeout: float) -> _Response:
+        self.captured["request"] = request
+        self.captured["timeout"] = timeout
+        if isinstance(self._result, Exception):
+            raise self._result
+        return self._result
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [(200, True), (204, True), (302, False), (500, False)],
+)
+def test_post_accepts_success_responses_only(
     monkeypatch: pytest.MonkeyPatch,
     status: int,
     expected: bool,
 ) -> None:
-    captured: dict[str, Any] = {}
-
-    def urlopen(request: Any, *, timeout: float) -> _Response:
-        captured["request"] = request
-        captured["timeout"] = timeout
-        return _Response(status)
-
-    monkeypatch.setattr("factory_droid_openai.telemetry.urllib.request.urlopen", urlopen)
+    opener = _Opener(_Response(status))
+    monkeypatch.setattr(telemetry_module, "_OPENER", opener)
 
     assert _post("https://telemetry.example/v1/events", b"{}", 0.5) is expected
-    assert captured["request"].full_url == "https://telemetry.example/v1/events"
-    assert captured["request"].data == b"{}"
-    assert captured["request"].get_header("Content-type") == "application/json"
-    assert captured["timeout"] == 0.5
+    assert opener.captured["request"].full_url == "https://telemetry.example/v1/events"
+    assert opener.captured["request"].data == b"{}"
+    assert opener.captured["request"].get_header("Content-type") == "application/json"
+    assert opener.captured["timeout"] == 0.5
+
+
+def test_post_refuses_redirects() -> None:
+    handler = _NoRedirectHandler()
+
+    assert (
+        handler.redirect_request(
+            cast("Any", None),
+            cast("Any", None),
+            302,
+            "Found",
+            cast("Any", None),
+            "http://telemetry.example/v1/events",
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize("error", [OSError("offline"), ValueError("invalid URL")])
@@ -549,11 +679,7 @@ def test_post_swallows_network_errors(
     monkeypatch: pytest.MonkeyPatch,
     error: Exception,
 ) -> None:
-    def urlopen(_request: Any, *, timeout: float) -> _Response:
-        del timeout
-        raise error
-
-    monkeypatch.setattr("factory_droid_openai.telemetry.urllib.request.urlopen", urlopen)
+    monkeypatch.setattr(telemetry_module, "_OPENER", _Opener(error))
 
     assert _post("https://telemetry.example/v1/events", b"{}", 0.5) is False
 

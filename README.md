@@ -1148,7 +1148,7 @@ followed by `[DONE]`.
 | `FACTORY_DROID_OPENAI_LOG_LEVEL` | `info` | Bridge and Uvicorn log level |
 | `FACTORY_DROID_OPENAI_LOG_FORMAT` | `text` | Bridge log rendering: `text` or `json` |
 | `FACTORY_DROID_OPENAI_TELEMETRY` | `true` | Send anonymous aggregate usage telemetry |
-| `DO_NOT_TRACK` | unset | Set to `1` to disable telemetry |
+| `DO_NOT_TRACK` | unset | Any value other than `0` disables telemetry |
 | `FACTORY_DROID_OPENAI_TRACE_PAYLOADS` | `off` | Payload tracing: `off`, `heads`, or `full` |
 | `FACTORY_DROID_OPENAI_TRACE_FILE` | unset | Trace destination, required unless tracing is `off` |
 
@@ -1171,8 +1171,8 @@ matching server settings.
 Anonymous aggregate telemetry is enabled by default. The bridge sends a batch
 at startup, every 15 minutes, and during graceful shutdown to
 `https://telemetry.guziak.net/v1/events`. Sending runs outside request handling,
-uses a 500 ms timeout, keeps no retry queue on disk, and never fails a client
-request.
+gives up after 5 seconds (1 second during shutdown), keeps no retry queue on
+disk, and never fails a client request.
 
 Collected fields:
 
@@ -1187,9 +1187,15 @@ Collected fields:
 Telemetry never includes prompts, responses, model or tool names, tool
 arguments, attachment contents, file paths, environment variables, API keys,
 IP addresses, host User-Agent values, client timestamps, or a persistent
-installation identifier. Cloudflare processes connection metadata while
-serving the collector and uses the source IP for transient rate limiting, but
-the collector does not write it to the analytics dataset.
+installation identifier. The request body is built in
+[`src/factory_droid_openai/telemetry.py`](src/factory_droid_openai/telemetry.py),
+so every field the bridge sends can be verified from this repository.
+
+The collector runs behind Cloudflare, which processes connection metadata to
+serve the request, and the collector uses the source IP only for transient rate
+limiting rather than writing it to the analytics dataset. The collector is
+operated separately from this repository, so that part is a statement of
+operator policy rather than something this source tree can prove.
 
 Disable all telemetry before startup with either setting:
 

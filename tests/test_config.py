@@ -460,16 +460,31 @@ def test_settings_telemetry_can_be_disabled(
     assert Settings.from_env().telemetry is False
 
 
+@pytest.mark.parametrize("raw", ["1", "true", "yes", " on "])
 def test_do_not_track_overrides_telemetry_configuration(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    raw: str,
 ) -> None:
     _clear_environment(monkeypatch)
     monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
     monkeypatch.setenv("FACTORY_DROID_OPENAI_TELEMETRY", "invalid")
-    monkeypatch.setenv("DO_NOT_TRACK", "1")
+    monkeypatch.setenv("DO_NOT_TRACK", raw)
 
     assert Settings.from_env().telemetry is False
+
+
+@pytest.mark.parametrize("raw", ["", " ", "0"])
+def test_do_not_track_leaves_telemetry_configuration_alone(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    raw: str,
+) -> None:
+    _clear_environment(monkeypatch)
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("DO_NOT_TRACK", raw)
+
+    assert Settings.from_env().telemetry is True
 
 
 def test_settings_reject_non_boolean_continuity_flag(

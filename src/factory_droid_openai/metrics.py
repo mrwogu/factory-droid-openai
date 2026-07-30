@@ -56,8 +56,8 @@ class BridgeMetrics:
         status_code: int,
         seconds: float,
         *,
-        route: str,
-        mode: str,
+        route: str = "other",
+        mode: str = "not_applicable",
     ) -> None:
         with self._lock:
             self._request_totals[(outcome, status_code)] += 1
