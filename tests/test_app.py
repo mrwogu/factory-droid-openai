@@ -876,7 +876,9 @@ async def test_non_streaming_protocol_failure_returns_bad_gateway(
 ) -> None:
     runner = FakeRunner(
         [
-            TextDelta(f"{TOOL_CALL_OPEN}invalid{TOOL_CALL_CLOSE}"),
+            TextDelta(
+                f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{}}}}{TOOL_CALL_CLOSE}trailing'
+            ),
             RunComplete(Usage()),
         ]
     )
@@ -1252,7 +1254,9 @@ async def test_streaming_runner_error_uses_sse_error_shape(tmp_path: Path) -> No
 async def test_streaming_protocol_error_uses_sse_error_shape(tmp_path: Path) -> None:
     runner = FakeRunner(
         [
-            TextDelta(f"{TOOL_CALL_OPEN}invalid{TOOL_CALL_CLOSE}"),
+            TextDelta(
+                f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{}}}}{TOOL_CALL_CLOSE}trailing'
+            ),
             RunComplete(Usage()),
         ]
     )
@@ -1274,6 +1278,83 @@ async def test_streaming_protocol_error_uses_sse_error_shape(tmp_path: Path) -> 
         if line.startswith('data: {"error"')
     )
     assert error_event["error"]["type"] == "factory_protocol_error"
+
+
+@pytest.mark.asyncio
+async def test_streaming_malformed_tool_call_finishes_with_length(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [
+            TextDelta("checking "),
+            TextDelta(f'{TOOL_CALL_OPEN}weather","city":"Krakow"}}{TOOL_CALL_CLOSE}'),
+            RunComplete(Usage()),
+        ]
+    )
+    payload = _payload(
+        stream=True,
+        stream_options={"include_usage": True},
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ],
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+        metrics = await client.get("/metrics")
+
+    events = [
+        line.removeprefix("data: ")
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    chunks = [json.loads(event) for event in events if event.startswith("{")]
+    assert not any("error" in chunk for chunk in chunks)
+    assert events[-1] == "[DONE]"
+    finish_chunk = next(
+        chunk
+        for chunk in chunks
+        if chunk["choices"] and chunk["choices"][0]["finish_reason"] is not None
+    )
+    assert finish_chunk["choices"][0]["finish_reason"] == "length"
+    assert chunks[-1]["choices"] == []
+    content = "".join(
+        choice["delta"].get("content") or ""
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+    )
+    assert content == "checking "
+    assert 'outcome="truncated",status="200"} 1' in metrics.text
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_malformed_tool_call_returns_length(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [
+            TextDelta("partial answer"),
+            TextDelta(f'{TOOL_CALL_OPEN}weather","city":"Krakow"}}{TOOL_CALL_CLOSE}'),
+            RunComplete(Usage()),
+        ]
+    )
+    payload = _payload(
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ]
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+        metrics = await client.get("/metrics")
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "length"
+    assert choice["message"]["content"] == "partial answer"
+    assert "tool_calls" not in choice["message"]
+    assert runner.closed is True
+    assert 'outcome="truncated",status="200"} 1' in metrics.text
 
 
 @pytest.mark.asyncio
@@ -1353,6 +1434,37 @@ async def test_non_streaming_truncated_tool_call_returns_length(tmp_path: Path) 
     assert "tool_calls" not in choice["message"]
     assert runner.closed is True
     assert 'outcome="truncated",status="200"} 1' in metrics.text
+
+
+@pytest.mark.asyncio
+async def test_lost_prefix_repair_recovers_tool_call_when_enabled(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [
+            TextDelta(f'{TOOL_CALL_OPEN}weather","city":"Krakow"}}{TOOL_CALL_CLOSE}'),
+            RunComplete(Usage()),
+        ]
+    )
+    app = create_app(
+        Settings(workdir=tmp_path, repair_lost_prefix=True),
+        runner_factory=cast("RunnerFactory", lambda: runner),
+    )
+    payload = _payload(
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ]
+    )
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    tool_call = choice["message"]["tool_calls"][0]
+    assert tool_call["function"]["name"] == "weather"
+    assert json.loads(tool_call["function"]["arguments"]) == {"city": "Krakow"}
 
 
 @pytest.mark.asyncio

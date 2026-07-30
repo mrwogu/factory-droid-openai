@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import io
 import json
 from typing import Any
 
 import pytest
 
+from factory_droid_openai import logs
 from factory_droid_openai.models import ChatCompletionRequest
 from factory_droid_openai.protocol import (
     _MAX_TOOL_PAYLOAD_BYTES,
     TOOL_CALL_CLOSE,
     TOOL_CALL_OPEN,
     IncompleteToolCallError,
+    MalformedToolCallError,
     ProtocolError,
     RequestTooLargeError,
     StopSequenceBuffer,
@@ -534,6 +537,140 @@ def test_stream_parser_traces_unparsed_payload() -> None:
         parser.feed(f"{TOOL_CALL_OPEN}not json{TOOL_CALL_CLOSE}")
 
     assert traces == [("tool_call.unparsed", "not json", {})]
+
+
+def test_stream_parser_malformed_error_carries_name_and_size() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    body = 'weather","city":"Krakow"}'
+
+    with pytest.raises(MalformedToolCallError) as excinfo:
+        parser.feed(f"{TOOL_CALL_OPEN}{body}{TOOL_CALL_CLOSE}")
+
+    assert isinstance(excinfo.value, ProtocolError)
+    assert excinfo.value.tool_name == "weather"
+    assert excinfo.value.payload_bytes == len(body.encode("utf-8"))
+    assert "invalid tool-call JSON" in str(excinfo.value)
+
+
+def test_stream_parser_malformed_error_without_recognized_name() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    with pytest.raises(MalformedToolCallError) as excinfo:
+        parser.feed(f"{TOOL_CALL_OPEN}not json{TOOL_CALL_CLOSE}")
+
+    assert excinfo.value.tool_name is None
+
+
+def test_stream_parser_logs_unparsed_payload_details() -> None:
+    stream = io.StringIO()
+    logs.configure_logging(level="trace", log_format="json", stream=stream)
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    body = "x" * 80
+
+    with pytest.raises(MalformedToolCallError):
+        parser.feed(f"{TOOL_CALL_OPEN}{body}{TOOL_CALL_CLOSE}")
+
+    records = [json.loads(line) for line in stream.getvalue().splitlines() if line]
+    event = next(record for record in records if record["event"] == "tool_call.unparsed")
+    assert event["head"] == body[:64]
+    assert event["tail"] == body[-64:]
+    assert event["payload_bytes"] == 80
+    assert event["dialect"] == "native"
+    assert "tool_name" not in event
+
+
+def test_stream_parser_omits_tail_for_short_unparsed_payloads() -> None:
+    stream = io.StringIO()
+    logs.configure_logging(level="trace", log_format="json", stream=stream)
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    with pytest.raises(MalformedToolCallError):
+        parser.feed(f"{TOOL_CALL_OPEN}not json{TOOL_CALL_CLOSE}")
+
+    records = [json.loads(line) for line in stream.getvalue().splitlines() if line]
+    event = next(record for record in records if record["event"] == "tool_call.unparsed")
+    assert event["head"] == "not json"
+    assert "tail" not in event
+
+
+def test_stream_parser_repairs_lost_prefix_only_when_enabled() -> None:
+    body = 'weather","city":"Krakow","days":3}'
+
+    strict = ToolCallStreamParser(frozenset({"weather"}))
+    with pytest.raises(MalformedToolCallError):
+        strict.feed(f"{TOOL_CALL_OPEN}{body}{TOOL_CALL_CLOSE}")
+
+    repairing = ToolCallStreamParser(frozenset({"weather"}), repair_lost_prefix=True)
+    emissions = repairing.feed(f"{TOOL_CALL_OPEN}{body}{TOOL_CALL_CLOSE}")
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert emissions[0].name == "weather"
+    assert json.loads(emissions[0].arguments) == {"city": "Krakow", "days": 3}
+
+
+def test_stream_parser_repairs_lost_prefix_wrapped_form() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}), repair_lost_prefix=True)
+
+    emissions = parser.feed(
+        f'{TOOL_CALL_OPEN}weather","arguments":{{"city":"Gdansk"}}}}{TOOL_CALL_CLOSE}'
+    )
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == {"city": "Gdansk"}
+
+
+def test_stream_parser_repairs_lost_prefix_quoted_name() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}), repair_lost_prefix=True)
+
+    emissions = parser.feed(f'{TOOL_CALL_OPEN}"weather","city":"Sopot"}}{TOOL_CALL_CLOSE}')
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert emissions[0].name == "weather"
+    assert json.loads(emissions[0].arguments) == {"city": "Sopot"}
+
+
+def test_stream_parser_lost_prefix_prefers_longest_tool_name() -> None:
+    parser = ToolCallStreamParser(
+        frozenset({"run", "run_in_terminal"}),
+        repair_lost_prefix=True,
+    )
+
+    emissions = parser.feed(
+        f'{TOOL_CALL_OPEN}run_in_terminal","command":"cd /app"}}{TOOL_CALL_CLOSE}'
+    )
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert emissions[0].name == "run_in_terminal"
+    assert json.loads(emissions[0].arguments) == {"command": "cd /app"}
+
+
+def test_stream_parser_lost_prefix_keeps_scalar_wrapper_key() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}), repair_lost_prefix=True)
+
+    emissions = parser.feed(f'{TOOL_CALL_OPEN}weather","arguments":5}}{TOOL_CALL_CLOSE}')
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == {"arguments": 5}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        'unknown","city":"Gdansk"}',
+        'weather","city":"Gdansk"',
+        'weather","city":"A","city":"B"}',
+    ],
+)
+def test_stream_parser_lost_prefix_stays_fail_closed(body: str) -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}), repair_lost_prefix=True)
+
+    with pytest.raises(MalformedToolCallError, match="invalid tool-call JSON"):
+        parser.feed(f"{TOOL_CALL_OPEN}{body}{TOOL_CALL_CLOSE}")
 
 
 @pytest.mark.parametrize(

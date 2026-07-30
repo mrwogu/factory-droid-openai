@@ -57,6 +57,9 @@ class Settings:
     warm_session_ttl_seconds: float = 600.0
     detached_cleanup: bool = True
     telemetry: bool = True
+    # Off by default: the payload lost bytes, so the repair trusts less of the
+    # wire than the always-on decoders do.
+    repair_lost_prefix: bool = False
     # Off by default: prompts and tool payloads are private user content.
     trace_payloads: str = "off"
     trace_payload_file: Path | None = None
@@ -111,6 +114,10 @@ class Settings:
         detached_cleanup = _boolean(
             "FACTORY_DROID_OPENAI_DETACHED_CLEANUP",
             default=True,
+        )
+        repair_lost_prefix = _boolean(
+            "FACTORY_DROID_OPENAI_REPAIR_LOST_PREFIX",
+            default=False,
         )
         telemetry = _telemetry_enabled()
         max_queue_size = _non_negative_int(
@@ -291,6 +298,7 @@ class Settings:
             warm_session_ttl_seconds=warm_session_ttl_seconds,
             detached_cleanup=detached_cleanup,
             telemetry=telemetry,
+            repair_lost_prefix=repair_lost_prefix,
             trace_payloads=trace_payloads,
             trace_payload_file=trace_payload_file,
         )

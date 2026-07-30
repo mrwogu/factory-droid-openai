@@ -8,16 +8,19 @@ from typing import TYPE_CHECKING, Any
 
 from factory_droid_openai.attachments import AttachmentSet, extract_attachments
 from factory_droid_openai.dialects import (
+    LOST_PREFIX_DECODER,
     MARKER_DIALECTS,
     NATIVE_DIALECT,
     PAYLOAD_DECODERS,
     TOOL_CALL_CLOSE,
     TOOL_CALL_OPEN,
+    PayloadDecoder,
     find_open_marker,
     strip_code_fence,
 )
 from factory_droid_openai.errors import (
     IncompleteToolCallError,
+    MalformedToolCallError,
     ProtocolError,
     RequestTooLargeError,
 )
@@ -44,6 +47,7 @@ __all__ = [
     "TOOL_CALL_OPEN",
     "AttachmentSet",
     "IncompleteToolCallError",
+    "MalformedToolCallError",
     "PromptPlan",
     "ProtocolEmission",
     "ProtocolError",
@@ -262,11 +266,15 @@ class ToolCallStreamParser:
         *,
         require_tool_call: bool = False,
         max_tool_calls: int = 1,
+        repair_lost_prefix: bool = False,
         trace_payload: PayloadTrace | None = None,
     ) -> None:
         self._allowed_tool_names = allowed_tool_names
         self._require_tool_call = require_tool_call
         self._max_tool_calls = max(1, max_tool_calls)
+        self._payload_decoders: tuple[PayloadDecoder, ...] = PAYLOAD_DECODERS
+        if repair_lost_prefix:
+            self._payload_decoders = (*PAYLOAD_DECODERS, LOST_PREFIX_DECODER)
         self._trace_payload: PayloadTrace = trace_payload or NULL_PAYLOAD_TRACER.trace
         self._text_tail = ""
         self._payload_chunks: list[str] = []
@@ -465,13 +473,23 @@ class ToolCallStreamParser:
         except (json.JSONDecodeError, ValueError) as exc:
             decoded = self._decode_payload(body)
             if decoded is None:
+                tool_name = _guess_tool_name(body, self._allowed_tool_names)
                 log_trace(
                     "tool_call.unparsed",
                     head=body[:_UNPARSED_HEAD_CHARS],
+                    tail=(body[-_UNPARSED_HEAD_CHARS:] or None)
+                    if len(body) > _UNPARSED_HEAD_CHARS
+                    else None,
+                    tool_name=tool_name,
+                    dialect=self._dialect.name,
                     payload_bytes=len(body.encode("utf-8")),
                 )
                 self._trace_payload("tool_call.unparsed", body)
-                raise ProtocolError(f"invalid tool-call JSON: {exc}") from exc
+                raise MalformedToolCallError(
+                    f"invalid tool-call JSON: {exc}",
+                    tool_name=tool_name,
+                    payload_bytes=len(body.encode("utf-8")),
+                ) from exc
             values = decoded
         if not values:
             raise ProtocolError("invalid tool-call JSON: the payload is empty")
@@ -495,7 +513,7 @@ class ToolCallStreamParser:
         return objects
 
     def _decode_payload(self, body: str) -> list[Any] | None:
-        for decoder in PAYLOAD_DECODERS:
+        for decoder in self._payload_decoders:
             decoded = decoder.decode(body, self._allowed_tool_names)
             if decoded is not None:
                 log_debug("tool_call.repaired", variant=decoder.name)
@@ -596,15 +614,16 @@ def _json_depth_exceeds(value: Any, max_depth: int) -> bool:
 
 
 _NAME_FIELD_PATTERN = re.compile(r'"name"\s*:\s*"([^"\\]+)"')
-_BARE_NAME_PATTERN = re.compile(r"^([A-Za-z_][\w.-]*)(?=\s*[{[]|\s*$)")
+_BARE_NAME_PATTERN = re.compile(r"^([A-Za-z_][\w.-]*)(?=\",|\s*[{[]|\s*$)")
 
 
 def _guess_tool_name(payload: str, allowed_tool_names: frozenset[str]) -> str | None:
     """Best-effort tool name for a truncated payload.
 
-    Handles the wrapped ``{"name": ...}`` form and the bare ``name{...}`` /
-    ``name\\n{...}`` form seen from GLM-family models. Only names from the
-    allowed set are reported, so a garbled prefix never masquerades as a tool.
+    Handles the wrapped ``{"name": ...}`` form, the bare ``name{...}`` /
+    ``name\\n{...}`` form and the lost-prefix ``name","key":...}`` form seen
+    from GLM-family models. Only names from the allowed set are reported, so
+    a garbled prefix never masquerades as a tool.
     """
     match = _NAME_FIELD_PATTERN.search(payload[:256])
     if match and match.group(1) in allowed_tool_names:

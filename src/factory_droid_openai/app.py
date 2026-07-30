@@ -50,6 +50,7 @@ from factory_droid_openai.payloadlog import configure_payload_tracing
 from factory_droid_openai.pool import BackgroundReaper, WarmSessionPool
 from factory_droid_openai.protocol import (
     IncompleteToolCallError,
+    MalformedToolCallError,
     ProtocolEmission,
     ProtocolError,
     RequestTooLargeError,
@@ -1227,6 +1228,7 @@ def create_app(
                     max_tool_calls=(
                         resolved_settings.max_tool_calls if payload.parallel_tool_calls else 1
                     ),
+                    repair_lost_prefix=resolved_settings.repair_lost_prefix,
                     trace_payload=payload_tracer.trace,
                 ),
                 runner=runner,
@@ -1291,6 +1293,7 @@ def create_app(
                                 if payload.parallel_tool_calls
                                 else 1
                             ),
+                            repair_lost_prefix=resolved_settings.repair_lost_prefix,
                             trace_payload=payload_tracer.trace,
                         ),
                         metrics=metrics,
@@ -1411,7 +1414,24 @@ async def _collect_completion(
                     metrics,
                     request_started_at,
                 )
-                _apply_emissions(result, parser.feed(event.text), stop_buffer)
+                try:
+                    _apply_emissions(result, parser.feed(event.text), stop_buffer)
+                except MalformedToolCallError as exc:
+                    # Same contract as the streaming path: a tool-call payload
+                    # no decoder could parse returns completed output with
+                    # finish_reason="length" instead of a 502. The malformed
+                    # call is dropped, never executed.
+                    result.truncated = True
+                    result.completed = True
+                    log_warning(
+                        "chat.truncated",
+                        stream=False,
+                        error_type="factory_protocol_error",
+                        reason=str(exc),
+                        tool_name=exc.tool_name,
+                        payload_bytes=exc.payload_bytes,
+                    )
+                    break
                 if stop_buffer.triggered:
                     # Leaving the loop closes the runner generator, which
                     # interrupts the Droid turn instead of draining it.
@@ -1438,22 +1458,25 @@ async def _collect_completion(
             error_type="factory_incomplete_response",
         )
     if not result.stopped:
-        try:
-            _apply_emissions(result, parser.finish(), stop_buffer)
-        except IncompleteToolCallError as exc:
-            # Same contract as the streaming path: a turn that died inside a
-            # tool-call payload returns completed output with
-            # finish_reason="length" instead of a 502. The partial call is
-            # dropped, never executed.
-            result.truncated = True
-            log_warning(
-                "chat.truncated",
-                stream=False,
-                error_type="factory_protocol_error",
-                reason=str(exc),
-                tool_name=exc.tool_name,
-                payload_bytes=exc.payload_bytes,
-            )
+        if not result.truncated:
+            # A malformed payload already failed the parse; asking the parser
+            # to finish would re-raise on the same garbage.
+            try:
+                _apply_emissions(result, parser.finish(), stop_buffer)
+            except IncompleteToolCallError as exc:
+                # Same contract as the streaming path: a turn that died inside
+                # a tool-call payload returns completed output with
+                # finish_reason="length" instead of a 502. The partial call is
+                # dropped, never executed.
+                result.truncated = True
+                log_warning(
+                    "chat.truncated",
+                    stream=False,
+                    error_type="factory_protocol_error",
+                    reason=str(exc),
+                    tool_name=exc.tool_name,
+                    payload_bytes=exc.payload_bytes,
+                )
         held = stop_buffer.flush()
         if held:
             result.text_parts.append(held)
@@ -1695,12 +1718,13 @@ async def _stream_completion(
             )
             if include_usage:
                 yield _sse(_usage_chunk(request_id, created, model, usage))
-        except IncompleteToolCallError as exc:
-            # The turn died inside a tool-call payload. Surface it the way
-            # OpenAI surfaces a length cutoff - completed output plus
+        except (IncompleteToolCallError, MalformedToolCallError) as exc:
+            # The turn died inside a tool-call payload, or the payload was
+            # garbage no decoder could parse. Surface it the way OpenAI
+            # surfaces a length cutoff - completed output plus
             # finish_reason="length" - so clients continue instead of
-            # blind-retrying an unrecoverable request. The partial call is
-            # dropped, never executed.
+            # blind-retrying an unrecoverable request. The partial or
+            # malformed call is dropped, never executed.
             outcome = "truncated"
             log_warning(
                 "chat.truncated",

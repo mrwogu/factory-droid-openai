@@ -115,6 +115,7 @@ _HARMONY_CONTROL_TOKENS = (
 _FUNCTIONS_PREFIX = "functions."
 
 __all__ = [
+    "LOST_PREFIX_DECODER",
     "MARKER_DIALECTS",
     "PAYLOAD_DECODERS",
     "TOOL_CALL_CLOSE",
@@ -585,6 +586,43 @@ def _coerce_arg_value(raw: str) -> Any:
     return parsed
 
 
+_WRAPPER_KEYS = ("arguments", "parameters", "args", "input")
+
+
+def _decode_lost_prefix(
+    body: str,
+    allowed_tool_names: frozenset[str],
+) -> list[dict[str, Any]] | None:
+    """Rebuilds a call whose payload lost its opening ``{"name":"`` bytes.
+
+    Observed on GLM-family turns: the payload starts mid-object at
+    ``name","key":"value"...}``. The name must match an allowed tool exactly
+    and the remainder must strict-parse as a JSON object, so a payload that
+    is merely garbage stays rejected. Longest names match first so a tool
+    whose name prefixes another tool's name cannot shadow it.
+    """
+    for name in sorted(allowed_tool_names, key=len, reverse=True):
+        for prefix in (f'{name}","', f'"{name}","'):
+            if not body.startswith(prefix):
+                continue
+            # The forced ``{"`` opening means the remainder either parses as a
+            # JSON object or does not parse at all.
+            try:
+                parsed = parse_strict_json('{"' + body[len(prefix) :])
+            except (json.JSONDecodeError, ValueError):
+                return None
+            arguments: Any = parsed
+            if len(parsed) == 1:
+                for key in _WRAPPER_KEYS:
+                    if key in parsed and isinstance(parsed[key], dict):
+                        # The wrapped form survived as ``"arguments":{...}``;
+                        # a single-key mapping unwraps back to the arguments.
+                        arguments = parsed[key]
+                        break
+            return [{"name": name, "arguments": arguments}]
+    return None
+
+
 PAYLOAD_DECODERS: tuple[PayloadDecoder, ...] = (
     PayloadDecoder("pipe_tag_tokens", _decode_pipe_tag_tokens),
     PayloadDecoder("kimi_sections", _decode_kimi_sections),
@@ -594,3 +632,8 @@ PAYLOAD_DECODERS: tuple[PayloadDecoder, ...] = (
     PayloadDecoder("arg_key_value", _decode_arg_key_value),
     PayloadDecoder("bare_name", _decode_bare_name),
 )
+
+# Opt-in only: the payload lost bytes, so the repair trusts less of the wire
+# than the always-on decoders do. The stream parser appends this decoder only
+# when the operator enables lost-prefix repair.
+LOST_PREFIX_DECODER = PayloadDecoder("lost_prefix", _decode_lost_prefix)

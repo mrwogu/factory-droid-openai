@@ -51,6 +51,7 @@ _ENVIRONMENT_KEYS = (
     "FACTORY_DROID_OPENAI_WARM_SESSIONS",
     "FACTORY_DROID_OPENAI_WARM_SESSION_TTL_SECONDS",
     "FACTORY_DROID_OPENAI_DETACHED_CLEANUP",
+    "FACTORY_DROID_OPENAI_REPAIR_LOST_PREFIX",
     "FACTORY_DROID_OPENAI_TELEMETRY",
     "FACTORY_DROID_OPENAI_TRACE_PAYLOADS",
     "FACTORY_DROID_OPENAI_TRACE_FILE",
@@ -174,6 +175,23 @@ def test_settings_from_env_reads_pool_overrides(
 
     assert settings.warm_session_ttl_seconds == 90.0
     assert settings.detached_cleanup is False
+
+
+def test_settings_from_env_reads_repair_lost_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_environment(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+
+    assert Settings.from_env().repair_lost_prefix is False
+
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_REPAIR_LOST_PREFIX", "on")
+    assert Settings.from_env().repair_lost_prefix is True
+
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_REPAIR_LOST_PREFIX", "maybe")
+    with pytest.raises(ValueError, match="FACTORY_DROID_OPENAI_REPAIR_LOST_PREFIX"):
+        Settings.from_env()
 
 
 def test_settings_from_env_rejects_negative_warm_sessions(

@@ -24,3 +24,17 @@ class IncompleteToolCallError(ProtocolError):
             f"incomplete tool-call marker ({detail}, "
             f"{payload_bytes} bytes captured before the stream ended)"
         )
+
+
+class MalformedToolCallError(ProtocolError):
+    """A closed tool-call marker carried a payload no decoder could parse.
+
+    Same contract as :class:`IncompleteToolCallError`: the garbage payload is
+    dropped, never executed, and the guessed tool name plus size ride along
+    so logs can identify what the model tried to say.
+    """
+
+    def __init__(self, reason: str, *, tool_name: str | None, payload_bytes: int) -> None:
+        self.tool_name = tool_name
+        self.payload_bytes = payload_bytes
+        super().__init__(reason)
