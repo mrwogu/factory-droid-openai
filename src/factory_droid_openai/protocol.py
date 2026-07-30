@@ -181,7 +181,11 @@ def build_prompt(
             f"{TOOL_CALL_CLOSE}. "
             "Between the markers emit exactly one JSON object with the keys "
             '"name" and "arguments"; never emit <arg_key>/<arg_value> blocks, '
-            "a code fence, or two objects inside one marker pair. "
+            "python-style name(...) or name{...} call syntax, a code fence, "
+            "or two objects inside one marker pair. "
+            f"Example: {TOOL_CALL_OPEN}"
+            '{"name":"get_weather","arguments":{"city":"Paris"}}'
+            f"{TOOL_CALL_CLOSE}. "
             f"Do not call Droid-native tools. {trailing_rule}"
         )
         if require_tool_call:
