@@ -409,7 +409,16 @@ class ToolCallStreamParser:
         self._append_payload(payload)
         trailing = value[close_index + len(close_marker) :]
         complete_payload = "".join(self._payload_chunks)
-        payload_objects = self._tool_payload_objects(complete_payload)
+        try:
+            payload_objects = self._tool_payload_objects(complete_payload)
+        except MalformedToolCallError:
+            # The payload is garbage but complete: reset the capture state so
+            # finish() does not re-raise it as a truncated call.
+            self._payload_chunks.clear()
+            self._payload_bytes = 0
+            self._close_tail = ""
+            self._capturing = False
+            raise
         self._payload_chunks.clear()
         # The size limit is per payload, so the bounded call count is what caps
         # the total bytes a single turn can buffer.
