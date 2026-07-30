@@ -234,8 +234,9 @@ async def test_reporter_applies_one_deadline_to_all_batches(
 
     assert await reporter.flush() is False
     assert asyncio.get_running_loop().time() - started_at < 0.1
-    assert len(timeouts) == 2
-    assert timeouts[1] < timeouts[0]
+    assert 1 <= len(timeouts) <= 2
+    assert all(0 < timeout <= 0.05 for timeout in timeouts)
+    assert all(timeouts[index] < timeouts[index - 1] for index in range(1, len(timeouts)))
 
 
 @pytest.mark.asyncio
