@@ -2,6 +2,23 @@ from __future__ import annotations
 
 import threading
 from collections import Counter
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class RequestMetric:
+    route: str
+    outcome: str
+    mode: str
+    count: int
+    duration_ms_sum: int
+
+
+@dataclass(frozen=True, slots=True)
+class MetricsSnapshot:
+    requests: tuple[RequestMetric, ...]
+    features: tuple[tuple[str, int], ...]
+    internal: tuple[tuple[str, int], ...]
 
 
 class BridgeMetrics:
@@ -29,12 +46,32 @@ class BridgeMetrics:
         self._warm_misses = 0
         self._warm_failures = 0
         self._pending_reaps = 0
+        self._telemetry_requests: Counter[tuple[str, str, str]] = Counter()
+        self._telemetry_request_duration_seconds: dict[tuple[str, str, str], float] = {}
+        self._telemetry_features: Counter[str] = Counter()
 
-    def record_request(self, outcome: str, status_code: int, seconds: float) -> None:
+    def record_request(
+        self,
+        outcome: str,
+        status_code: int,
+        seconds: float,
+        *,
+        route: str,
+        mode: str,
+    ) -> None:
         with self._lock:
             self._request_totals[(outcome, status_code)] += 1
             self._request_duration_sum += max(0.0, seconds)
             self._request_duration_count += 1
+            key = (route, outcome, mode)
+            self._telemetry_requests[key] += 1
+            self._telemetry_request_duration_seconds[key] = (
+                self._telemetry_request_duration_seconds.get(key, 0.0) + max(0.0, seconds)
+            )
+
+    def record_features(self, features: tuple[str, ...]) -> None:
+        with self._lock:
+            self._telemetry_features.update(features)
 
     def observe_queue_wait(self, seconds: float) -> None:
         with self._lock:
@@ -99,6 +136,36 @@ class BridgeMetrics:
     def set_pending_reaps(self, count: int) -> None:
         with self._lock:
             self._pending_reaps = count
+
+    def telemetry_snapshot(self) -> MetricsSnapshot:
+        with self._lock:
+            requests = tuple(
+                RequestMetric(
+                    route=route,
+                    outcome=outcome,
+                    mode=mode,
+                    count=count,
+                    duration_ms_sum=round(
+                        self._telemetry_request_duration_seconds[(route, outcome, mode)] * 1000
+                    ),
+                )
+                for (route, outcome, mode), count in sorted(self._telemetry_requests.items())
+            )
+            features = tuple(sorted(self._telemetry_features.items()))
+            internal = tuple(
+                sorted(
+                    {
+                        "forced_kill": self._forced_kills,
+                        "model_discovery_failure": self._model_discovery_failures,
+                        "model_quarantine": self._model_quarantines,
+                        "warm_hit": self._warm_hits,
+                        "warm_miss": self._warm_misses,
+                        "warm_retune": self._warm_retunes,
+                        "warm_failure": self._warm_failures,
+                    }.items()
+                )
+            )
+        return MetricsSnapshot(requests=requests, features=features, internal=internal)
 
     def render(self) -> str:
         with self._lock:

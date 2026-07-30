@@ -11,6 +11,7 @@ import pytest
 from fastapi.exceptions import RequestValidationError
 from jsonschema.validators import validator_for
 
+from factory_droid_openai import telemetry as telemetry_module
 from factory_droid_openai.app import (
     AdmissionController,
     AdmissionLease,
@@ -23,7 +24,9 @@ from factory_droid_openai.app import (
     _content_length,
     _finalize_stream,
     _JsonDepthTracker,
+    _request_mode,
     _request_outcome,
+    _request_route,
     _RequestPayloadLimitError,
     _stream_completion,
     _validation_message,
@@ -1386,6 +1389,15 @@ async def test_non_streaming_truncation_overrides_completed_tool_calls(tmp_path:
 )
 def test_request_outcome_handles_truncation(state: dict[str, str], expected: str) -> None:
     assert _request_outcome(200, cast("Any", {"state": state})) == expected
+
+
+def test_request_telemetry_classifies_routes_and_modes() -> None:
+    assert _request_route(cast("Any", {"path": "/health"})) == "health"
+    assert _request_route(cast("Any", {"path": "/v1/models/gpt-test"})) == "models"
+    assert _request_route(cast("Any", {"path": "/unknown"})) == "other"
+    assert (
+        _request_mode(cast("Any", {"state": {"telemetry_mode": "unexpected"}})) == "not_applicable"
+    )
 
 
 @pytest.mark.asyncio
@@ -2753,6 +2765,7 @@ async def test_lifespan_prewarms_and_drains_the_pool(tmp_path: Path) -> None:
         workdir=tmp_path,
         timeout_seconds=30.0,
         max_concurrency=1,
+        telemetry=False,
     )
     app = create_app(settings, runner_factory=cast("RunnerFactory", lambda: runner))
 
@@ -2774,12 +2787,77 @@ async def test_detached_cleanup_can_be_disabled(tmp_path: Path) -> None:
         timeout_seconds=30.0,
         warm_sessions=0,
         detached_cleanup=False,
+        telemetry=False,
     )
     app = create_app(settings)
 
     assert app.state.pool.enabled is False
     async with app.router.lifespan_context(app):
         assert "factory_droid_openai_warm_sessions 0" in app.state.metrics.render()
+
+
+@pytest.mark.asyncio
+async def test_lifespan_flushes_anonymous_telemetry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payloads: list[dict[str, object]] = []
+
+    def post(_endpoint: str, body: bytes, _timeout: float) -> bool:
+        payloads.append(json.loads(body))
+        return True
+
+    monkeypatch.setattr(telemetry_module, "_post", post)
+    runner = FakeRunner([RunComplete(Usage())])
+    app = create_app(
+        Settings(
+            droid_path="droid",
+            workdir=tmp_path,
+            timeout_seconds=30.0,
+            warm_sessions=0,
+        ),
+        runner_factory=cast("RunnerFactory", lambda: runner),
+    )
+
+    async with app.router.lifespan_context(app):
+        async with _client(app) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json=_payload(
+                    reasoning_effort="low",
+                    n=2,
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {"name": "weather", "parameters": {}},
+                        }
+                    ],
+                ),
+            )
+        assert response.status_code == 200
+
+    events = [
+        event
+        for payload in payloads
+        for event in cast("list[dict[str, object]]", payload["events"])
+    ]
+    assert {"name": "bridge_started", "count": 1} in events
+    request_events = [event for event in events if event["name"] == "request"]
+    assert len(request_events) == 1
+    assert request_events[0] | {"duration_ms_sum": 0} == {
+        "name": "request",
+        "route": "chat_completions",
+        "outcome": "success",
+        "mode": "non_stream",
+        "count": 1,
+        "duration_ms_sum": 0,
+    }
+    assert isinstance(request_events[0]["duration_ms_sum"], int)
+    assert {"name": "feature", "feature": "tools", "count": 1} in events
+    assert {"name": "feature", "feature": "reasoning_effort", "count": 1} in events
+    assert {"name": "feature", "feature": "multiple_choices", "count": 1} in events
+    assert "Hello" not in json.dumps(payloads)
+    assert "factory-droid" not in json.dumps(payloads)
 
 
 @pytest.mark.asyncio

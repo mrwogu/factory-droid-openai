@@ -56,6 +56,7 @@ class Settings:
     warm_sessions: int = -1
     warm_session_ttl_seconds: float = 600.0
     detached_cleanup: bool = True
+    telemetry: bool = True
     # Off by default: prompts and tool payloads are private user content.
     trace_payloads: str = "off"
     trace_payload_file: Path | None = None
@@ -111,6 +112,7 @@ class Settings:
             "FACTORY_DROID_OPENAI_DETACHED_CLEANUP",
             default=True,
         )
+        telemetry = _telemetry_enabled()
         max_queue_size = _non_negative_int(
             "FACTORY_DROID_OPENAI_MAX_QUEUE_SIZE",
             default=8,
@@ -288,6 +290,7 @@ class Settings:
             warm_sessions=warm_sessions,
             warm_session_ttl_seconds=warm_session_ttl_seconds,
             detached_cleanup=detached_cleanup,
+            telemetry=telemetry,
             trace_payloads=trace_payloads,
             trace_payload_file=trace_payload_file,
         )
@@ -336,6 +339,12 @@ def _boolean(name: str, *, default: bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{name} must be a boolean value")
+
+
+def _telemetry_enabled() -> bool:
+    if os.getenv("DO_NOT_TRACK", "").strip() == "1":
+        return False
+    return _boolean("FACTORY_DROID_OPENAI_TELEMETRY", default=True)
 
 
 def _choice(name: str, *, default: str, allowed: tuple[str, ...]) -> str:
