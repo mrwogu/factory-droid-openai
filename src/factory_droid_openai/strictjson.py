@@ -5,9 +5,25 @@ import math
 from typing import Any
 
 __all__ = [
+    "DuplicateKeyError",
+    "check_no_duplicate_keys",
     "decode_json_values",
     "parse_strict_json",
 ]
+
+
+class DuplicateKeyError(ValueError):
+    """Raised when a JSON object repeats a key the bridge must not accept."""
+
+
+def check_no_duplicate_keys(text: str) -> None:
+    """Rejects a JSON document that repeats any object key.
+
+    Unlike :func:`parse_strict_json` this keeps the standard JSON number
+    handling, so it only adds the duplicate-key rejection the request-body
+    parser needs, without changing what FastAPI would otherwise accept.
+    """
+    json.loads(text, object_pairs_hook=_reject_duplicate_keys)
 
 
 def parse_strict_json(text: str) -> Any:
@@ -51,7 +67,7 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
-            raise ValueError(f"duplicate key '{key}'")
+            raise DuplicateKeyError(f"duplicate key '{key}'")
         result[key] = value
     return result
 

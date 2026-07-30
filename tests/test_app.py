@@ -1061,6 +1061,74 @@ async def test_chunked_request_body_stops_at_size_limit(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_duplicate_request_keys_are_rejected(tmp_path: Path) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            content=(
+                b'{"model":"factory-droid","model":"gpt-5.4",'
+                b'"messages":[{"role":"user","content":"hi"}]}'
+            ),
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert "duplicate key" in response.json()["error"]["message"]
+    assert not runner.requests
+
+
+@pytest.mark.asyncio
+async def test_duplicate_nested_keys_are_rejected(tmp_path: Path) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            content=(
+                b'{"model":"factory-droid",'
+                b'"messages":[{"role":"user","content":"hi","content":"dup"}]}'
+            ),
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert response.status_code == 400
+    assert "duplicate key" in response.json()["error"]["message"]
+    assert not runner.requests
+
+
+@pytest.mark.asyncio
+async def test_unique_keys_still_pass_the_size_middleware(tmp_path: Path) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            content=(b'{"model":"factory-droid","messages":[{"role":"user","content":"hi"}]}'),
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert response.status_code == 200
+    assert runner.requests
+
+
+@pytest.mark.asyncio
+async def test_malformed_json_falls_through_to_fastapi(tmp_path: Path) -> None:
+    # The duplicate-key check must not swallow a body that is not JSON at all;
+    # FastAPI still owns the malformed-JSON error.
+    runner = FakeRunner([RunComplete(Usage())])
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            content=b"{not json}",
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert not runner.requests
+
+
+@pytest.mark.asyncio
 async def test_request_body_read_has_bounded_timeout(tmp_path: Path) -> None:
     runner = FakeRunner([RunComplete(Usage())])
     app = create_app(

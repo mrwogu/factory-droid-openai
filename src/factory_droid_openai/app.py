@@ -77,6 +77,10 @@ from factory_droid_openai.runner import (
     WarmSession,
     normalize_reasoning_effort,
 )
+from factory_droid_openai.strictjson import (
+    DuplicateKeyError,
+    check_no_duplicate_keys,
+)
 from factory_droid_openai.telemetry import DEFAULT_TELEMETRY_ENDPOINT, TelemetryReporter
 
 if TYPE_CHECKING:
@@ -523,6 +527,27 @@ class RequestSizeLimitMiddleware:
                     max_request_bytes=self._max_request_bytes,
                     max_json_depth=self._max_json_depth,
                 )
+            # FastAPI binds the body with Pydantic, which keeps the last value for
+            # a repeated key instead of rejecting it. A duplicate key in the raw
+            # request body is almost always a client bug, so the bridge fails
+            # closed here before the handler can act on a silently-wrong value.
+            if body and _json_content_type(scope):
+                try:
+                    check_no_duplicate_keys(body.decode("utf-8"))
+                except DuplicateKeyError as exc:
+                    status_code = 400
+                    await _send_asgi_error(
+                        scope,
+                        receive,
+                        send,
+                        message=str(exc),
+                        status_code=400,
+                        error_type="invalid_request_error",
+                    )
+                    return
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    # Malformed JSON or encoding is left for FastAPI to report.
+                    pass
             replayed = False
 
             async def replay_receive() -> Message:
@@ -2165,6 +2190,14 @@ def _content_length(scope: Scope) -> int | None:
             return None
         return parsed if parsed >= 0 else None
     return None
+
+
+def _json_content_type(scope: Scope) -> bool:
+    for name, value in scope.get("headers", []):
+        if name.lower() != b"content-type":
+            continue
+        return bool(value.lower().strip().startswith(b"application/json"))
+    return False
 
 
 async def _read_limited_body(
