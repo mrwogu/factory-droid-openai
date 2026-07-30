@@ -586,6 +586,164 @@ def _coerce_arg_value(raw: str) -> Any:
     return parsed
 
 
+_PYTHON_CALL_PATTERN = re.compile(r"^([A-Za-z_][\w.-]*)\(\s*(\{.*\})\s*\)$", re.DOTALL)
+
+
+def _decode_python_call(
+    body: str,
+    allowed_tool_names: frozenset[str],
+) -> list[dict[str, Any]] | None:
+    """Rebuilds python-call syntax: ``name({"key":"value"})``.
+
+    Observed on GLM-family turns: the model answers with the function call it
+    would write in code instead of the requested JSON object. The name must
+    match an allowed tool exactly, so prose containing parentheses stays
+    rejected.
+    """
+    match = _PYTHON_CALL_PATTERN.match(body.strip())
+    if match is None:
+        return None
+    name = match.group(1)
+    if name not in allowed_tool_names:
+        return None
+    arguments = _decode_json_object(match.group(2))
+    if arguments is None:
+        return None
+    return [{"name": name, "arguments": arguments}]
+
+
+_BARE_CALL_PATTERN = re.compile(r"^([A-Za-z_][\w.-]*)\s*(?=\{)")
+
+
+def _decode_bare_call(
+    body: str,
+    allowed_tool_names: frozenset[str],
+) -> list[dict[str, Any]] | None:
+    """Rebuilds ``name{"key":"value"}`` - the tool name glued to its arguments.
+
+    Unlike :func:`_decode_bare_name`, no newline separates the name from the
+    JSON object. The name must match an allowed tool exactly.
+    """
+    stripped = body.strip()
+    match = _BARE_CALL_PATTERN.match(stripped)
+    if match is None:
+        return None
+    name = match.group(1)
+    if name not in allowed_tool_names:
+        return None
+    arguments = _decode_json_object(stripped[match.end() :])
+    if arguments is None:
+        return None
+    return [{"name": name, "arguments": arguments}]
+
+
+_ARG_KEY_REPAIR_TERMINATORS = ("<arg_key>", _ARG_VALUE_CLOSE, "<tool_call>")
+
+
+def _decode_arg_key_value_repair(
+    body: str,
+    allowed_tool_names: frozenset[str],
+) -> list[dict[str, Any]] | None:
+    """Rebuilds GLM's mangled arg_key form observed in the wild.
+
+    Shape per segment: ``name<arg_key>key":"value"}`` where the closing tags
+    and braces are missing or half-JSON (``":"`` separators, a trailing
+    ``"}``, a bare ``</arg_value>``). Several calls may be packed into one
+    payload separated by a literal ``<tool_call>``. Only the quote/brace
+    residue the template leaves behind is stripped; the value text itself is
+    never re-guessed. Every segment's name must match an allowed tool, so
+    prose that merely mentions ``<arg_key>`` stays rejected.
+    """
+    if _ARG_KEY_OPEN not in body:
+        return None
+    segments = [
+        segment.strip()
+        for segment in body.replace(TOOL_CALL_CLOSE, TOOL_CALL_OPEN).split(TOOL_CALL_OPEN)
+    ]
+    calls: list[dict[str, Any]] = []
+    for segment in segments:
+        if not segment:
+            continue
+        parsed = _arg_key_repair_segment(segment, allowed_tool_names)
+        if parsed is None:
+            return None
+        calls.append(parsed)
+    return calls or None
+
+
+def _arg_key_repair_segment(
+    segment: str,
+    allowed_tool_names: frozenset[str],
+) -> dict[str, Any] | None:
+    index = segment.find(_ARG_KEY_OPEN)
+    name = segment[:index].strip()
+    if not name or name not in allowed_tool_names:
+        return None
+    arguments: dict[str, Any] = {}
+    rest = segment[index:]
+    while rest.startswith(_ARG_KEY_OPEN):
+        rest = rest[len(_ARG_KEY_OPEN) :]
+        entry = _arg_key_repair_entry(rest)
+        if entry is None:
+            return None
+        key, value, rest = entry
+        if key in arguments:
+            return None
+        arguments[key] = value
+        rest = rest.lstrip()
+    # Anything left over after the last value is markup residue only.
+    if rest.strip("}\"'` \t\r\n"):
+        return None
+    return {"name": name, "arguments": arguments}
+
+
+_ARG_KEY_NAME_PATTERN = re.compile(r"^[A-Za-z_][\w.-]*$")
+
+
+def _arg_key_repair_entry(rest: str) -> tuple[str, Any, str] | None:
+    key_close = rest.find(_ARG_KEY_CLOSE)
+    json_sep = rest.find('":"')
+    if key_close >= 0 and (json_sep < 0 or key_close < json_sep):
+        # Proper ``key</arg_key><arg_value>value`` form with a missing or
+        # present closing </arg_value>.
+        key = rest[:key_close].strip()
+        tail = rest[key_close + len(_ARG_KEY_CLOSE) :]
+        if not tail.startswith(_ARG_VALUE_OPEN):
+            return None
+        tail = tail[len(_ARG_VALUE_OPEN) :]
+        value, remainder = _arg_key_repair_value(tail, quoted=False)
+    elif json_sep > 0:
+        # Mangled JSON form: ``key":"value`` with the opening quote spent on
+        # the separator.
+        key = rest[:json_sep].strip()
+        value, remainder = _arg_key_repair_value(rest[json_sep + 3 :], quoted=True)
+    else:
+        return None
+    if not _ARG_KEY_NAME_PATTERN.match(key):
+        return None
+    return key, value, remainder
+
+
+def _arg_key_repair_value(text: str, *, quoted: bool) -> tuple[Any, str]:
+    end = len(text)
+    for terminator in _ARG_KEY_REPAIR_TERMINATORS:
+        index = text.find(terminator)
+        if index >= 0 and index < end:
+            end = index
+    raw = text[:end]
+    remainder = text[end:]
+    if remainder.startswith(_ARG_VALUE_CLOSE):
+        remainder = remainder[len(_ARG_VALUE_CLOSE) :]
+    raw = raw.strip()
+    if raw.endswith('"}'):
+        raw = raw[:-2]
+    elif raw.endswith("}"):
+        raw = raw[:-1]
+    if quoted and raw.endswith('"'):
+        raw = raw[:-1]
+    return _coerce_arg_value(raw.strip()), remainder
+
+
 _WRAPPER_KEYS = ("arguments", "parameters", "args", "input")
 
 
@@ -630,7 +788,10 @@ PAYLOAD_DECODERS: tuple[PayloadDecoder, ...] = (
     PayloadDecoder("deepseek_calls", _decode_deepseek_calls),
     PayloadDecoder("function_parameter_tags", _decode_function_parameter_tags),
     PayloadDecoder("arg_key_value", _decode_arg_key_value),
+    PayloadDecoder("python_call", _decode_python_call),
+    PayloadDecoder("arg_key_value_repair", _decode_arg_key_value_repair),
     PayloadDecoder("bare_name", _decode_bare_name),
+    PayloadDecoder("bare_call", _decode_bare_call),
 )
 
 # Opt-in only: the payload lost bytes, so the repair trusts less of the wire

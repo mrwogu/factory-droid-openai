@@ -730,7 +730,6 @@ def test_stream_parser_lost_prefix_stays_fail_closed(body: str) -> None:
     [
         "weather<arg_key>city",
         "weather<arg_key>city</arg_key>",
-        "weather<arg_key>city</arg_key><arg_value>Gdansk",
         "weather<arg_key></arg_key><arg_value>Gdansk</arg_value>",
         "weather<arg_key>city</arg_key><arg_value>A</arg_value>"
         "<arg_key>city</arg_key><arg_value>B</arg_value>",
@@ -739,6 +738,161 @@ def test_stream_parser_lost_prefix_stays_fail_closed(body: str) -> None:
 )
 def test_stream_parser_rejects_unrepairable_arg_key_payloads(payload: str) -> None:
     parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    with pytest.raises(ProtocolError, match="invalid tool-call JSON"):
+        parser.feed(f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE}")
+
+
+def test_stream_parser_repairs_arg_key_value_missing_close_tag() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    emissions = parser.feed(
+        f"{TOOL_CALL_OPEN}weather<arg_key>city</arg_key><arg_value>Gdansk{TOOL_CALL_CLOSE}"
+    )
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == {"city": "Gdansk"}
+
+
+def test_stream_parser_repairs_python_call_payload() -> None:
+    parser = ToolCallStreamParser(frozenset({"skill_view"}))
+
+    emissions = parser.feed(
+        f'{TOOL_CALL_OPEN}skill_view({{"name":"apple-notes"}}){TOOL_CALL_CLOSE}'
+    )
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert emissions[0].name == "skill_view"
+    assert json.loads(emissions[0].arguments) == {"name": "apple-notes"}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        'unknown_view({"name":"apple-notes"})',
+        'skill_view({"name":"apple-notes")',
+        'skill_view({"name":})',
+        'skill_view(["apple-notes"])',
+        "skill_view()",
+        'print("hello")',
+    ],
+)
+def test_stream_parser_rejects_unrepairable_python_call_payloads(payload: str) -> None:
+    parser = ToolCallStreamParser(frozenset({"skill_view"}))
+
+    with pytest.raises(ProtocolError, match="invalid tool-call JSON"):
+        parser.feed(f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE}")
+
+
+def test_stream_parser_repairs_bare_call_payload() -> None:
+    parser = ToolCallStreamParser(frozenset({"skill_view"}))
+
+    emissions = parser.feed(f'{TOOL_CALL_OPEN}skill_view{{"name":"apple-notes"}}{TOOL_CALL_CLOSE}')
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert emissions[0].name == "skill_view"
+    assert json.loads(emissions[0].arguments) == {"name": "apple-notes"}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        'unknown_view{"name":"apple-notes"}',
+        'skill_view{"name":"apple-notes"',
+        'skill_view{"name":"a","name":"b"}',
+    ],
+)
+def test_stream_parser_rejects_unrepairable_bare_call_payloads(payload: str) -> None:
+    parser = ToolCallStreamParser(frozenset({"skill_view"}))
+
+    with pytest.raises(ProtocolError, match="invalid tool-call JSON"):
+        parser.feed(f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE}")
+
+
+def test_stream_parser_repairs_arg_key_json_residue_payload() -> None:
+    parser = ToolCallStreamParser(frozenset({"skill_view"}))
+
+    emissions = parser.feed(
+        f'{TOOL_CALL_OPEN}skill_view<arg_key>name":"apple-notes"}}{TOOL_CALL_CLOSE}'
+    )
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert emissions[0].name == "skill_view"
+    assert json.loads(emissions[0].arguments) == {"name": "apple-notes"}
+
+
+def test_stream_parser_repairs_arg_key_payload_with_leading_separator() -> None:
+    parser = ToolCallStreamParser(frozenset({"skill_view"}))
+
+    emissions = parser.feed(
+        f'{TOOL_CALL_OPEN}{TOOL_CALL_OPEN}skill_view<arg_key>name":"apple-notes"}}{TOOL_CALL_CLOSE}'
+    )
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert emissions[0].name == "skill_view"
+    assert json.loads(emissions[0].arguments) == {"name": "apple-notes"}
+
+
+def test_stream_parser_repairs_arg_key_mangled_two_call_payload() -> None:
+    parser = ToolCallStreamParser(
+        frozenset({"skill_view", "terminal"}),
+        max_tool_calls=2,
+    )
+    payload = (
+        'skill_view<arg_key>name":"apple-notes"}'
+        "<tool_call>"
+        'terminal<arg_key>command":"which memo && memo --help 2>&1 | head -40</arg_value>'
+    )
+
+    emissions = parser.feed(f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE}")
+
+    calls = [emission for emission in emissions if isinstance(emission, ToolCallEmission)]
+    assert len(calls) == 2
+    assert calls[0].name == "skill_view"
+    assert json.loads(calls[0].arguments) == {"name": "apple-notes"}
+    assert calls[1].name == "terminal"
+    assert json.loads(calls[1].arguments) == {
+        "command": "which memo && memo --help 2>&1 | head -40"
+    }
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ('skill_view<arg_key>count":"3}', {"count": 3}),
+        ('skill_view<arg_key>name":"abc"', {"name": "abc"}),
+    ],
+)
+def test_stream_parser_repairs_arg_key_value_endings(
+    payload: str,
+    expected: dict[str, Any],
+) -> None:
+    parser = ToolCallStreamParser(frozenset({"skill_view"}))
+
+    emissions = parser.feed(f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE}")
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == expected
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        'unknown<arg_key>name":"apple-notes"}',
+        'skill_view<arg_key>na me":"apple-notes"}',
+        'skill_view<arg_key>name":"a"}<arg_key>name":"b"}',
+        'skill_view<arg_key>name":"a"}</arg_value> junk',
+        'skill_view<arg_key>name":"a"}<tool_call>unknown<arg_key>k":"v"}',
+    ],
+)
+def test_stream_parser_rejects_unrepairable_arg_key_repair_payloads(payload: str) -> None:
+    parser = ToolCallStreamParser(frozenset({"skill_view"}))
 
     with pytest.raises(ProtocolError, match="invalid tool-call JSON"):
         parser.feed(f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE}")
