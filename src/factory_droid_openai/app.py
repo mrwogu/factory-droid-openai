@@ -49,6 +49,7 @@ from factory_droid_openai.models import (
 from factory_droid_openai.payloadlog import configure_payload_tracing
 from factory_droid_openai.pool import BackgroundReaper, WarmSessionPool
 from factory_droid_openai.protocol import (
+    IncompleteToolCallError,
     ProtocolEmission,
     ProtocolError,
     RequestTooLargeError,
@@ -1344,6 +1345,7 @@ class CollectedCompletion:
         self.completed = False
         self.session_id: str | None = None
         self.stopped = False
+        self.truncated = False
 
     @property
     def text(self) -> str:
@@ -1401,7 +1403,22 @@ async def _collect_completion(
             error_type="factory_incomplete_response",
         )
     if not result.stopped:
-        _apply_emissions(result, parser.finish(), stop_buffer)
+        try:
+            _apply_emissions(result, parser.finish(), stop_buffer)
+        except IncompleteToolCallError as exc:
+            # Same contract as the streaming path: a turn that died inside a
+            # tool-call payload returns completed output with
+            # finish_reason="length" instead of a 502. The partial call is
+            # dropped, never executed.
+            result.truncated = True
+            log_warning(
+                "chat.truncated",
+                stream=False,
+                error_type="factory_protocol_error",
+                reason=str(exc),
+                tool_name=exc.tool_name,
+                payload_bytes=exc.payload_bytes,
+            )
         held = stop_buffer.flush()
         if held:
             result.text_parts.append(held)
@@ -1638,6 +1655,33 @@ async def _stream_completion(
                     model,
                     delta={},
                     finish_reason="tool_calls" if saw_tool_call else "stop",
+                    include_usage=include_usage,
+                )
+            )
+            if include_usage:
+                yield _sse(_usage_chunk(request_id, created, model, usage))
+        except IncompleteToolCallError as exc:
+            # The turn died inside a tool-call payload. Surface it the way
+            # OpenAI surfaces a length cutoff - completed output plus
+            # finish_reason="length" - so clients continue instead of
+            # blind-retrying an unrecoverable request. The partial call is
+            # dropped, never executed.
+            outcome = "truncated"
+            log_warning(
+                "chat.truncated",
+                stream=True,
+                error_type="factory_protocol_error",
+                reason=str(exc),
+                tool_name=exc.tool_name,
+                payload_bytes=exc.payload_bytes,
+            )
+            yield _sse(
+                _chunk(
+                    request_id,
+                    created,
+                    model,
+                    delta={},
+                    finish_reason="length",
                     include_usage=include_usage,
                 )
             )
@@ -1986,10 +2030,15 @@ def _choice_dict(result: CollectedCompletion, index: int) -> dict[str, Any]:
         message["reasoning_content"] = result.reasoning
     if result.tool_calls:
         message["tool_calls"] = result.tool_calls
+    finish_reason = "stop"
+    if result.tool_calls:
+        finish_reason = "tool_calls"
+    elif result.truncated:
+        finish_reason = "length"
     return {
         "index": index,
         "message": message,
-        "finish_reason": "tool_calls" if result.tool_calls else "stop",
+        "finish_reason": finish_reason,
     }
 
 
@@ -2113,7 +2162,7 @@ def _request_outcome(status_code: int, scope: Scope) -> str:
     state = scope.get("state")
     if isinstance(state, dict):
         stream_outcome = state.get("stream_outcome")
-        if stream_outcome in {"success", "error", "timeout", "cancelled"}:
+        if stream_outcome in {"success", "error", "timeout", "cancelled", "truncated"}:
             return str(stream_outcome)
     if status_code < 400:
         return "success"

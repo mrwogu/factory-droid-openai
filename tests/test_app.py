@@ -1266,6 +1266,74 @@ async def test_streaming_protocol_error_uses_sse_error_shape(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_streaming_truncated_tool_call_finishes_with_length(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [
+            TextDelta("working on it"),
+            TextDelta(f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Kr'),
+            RunComplete(Usage()),
+        ]
+    )
+    payload = _payload(
+        stream=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ],
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+        metrics = await client.get("/metrics")
+
+    events = [
+        line.removeprefix("data: ")
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    chunks = [json.loads(event) for event in events if event.startswith("{")]
+    assert not any("error" in chunk for chunk in chunks)
+    assert events[-1] == "[DONE]"
+    assert chunks[-1]["choices"][0]["finish_reason"] == "length"
+    content = "".join(
+        choice["delta"].get("content") or ""
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+    )
+    assert content == "working on it"
+    assert 'outcome="truncated",status="200"} 1' in metrics.text
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_truncated_tool_call_returns_length(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [
+            TextDelta("partial answer"),
+            TextDelta(f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Kr'),
+            RunComplete(Usage()),
+        ]
+    )
+    payload = _payload(
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ]
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "length"
+    assert choice["message"]["content"] == "partial answer"
+    assert "tool_calls" not in choice["message"]
+    assert runner.closed is True
+
+
+@pytest.mark.asyncio
 async def test_chat_endpoint_requires_configured_bearer_token(tmp_path: Path) -> None:
     runner = FakeRunner([RunComplete(Usage())])
     app = _app(tmp_path, runner, api_key="secret")
