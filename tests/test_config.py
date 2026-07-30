@@ -51,8 +51,10 @@ _ENVIRONMENT_KEYS = (
     "FACTORY_DROID_OPENAI_WARM_SESSIONS",
     "FACTORY_DROID_OPENAI_WARM_SESSION_TTL_SECONDS",
     "FACTORY_DROID_OPENAI_DETACHED_CLEANUP",
+    "FACTORY_DROID_OPENAI_TELEMETRY",
     "FACTORY_DROID_OPENAI_TRACE_PAYLOADS",
     "FACTORY_DROID_OPENAI_TRACE_FILE",
+    "DO_NOT_TRACK",
 )
 
 
@@ -433,6 +435,56 @@ def test_settings_parse_boolean_flags(
     monkeypatch.setenv("FACTORY_DROID_OPENAI_SESSION_CONTINUITY", raw)
 
     assert Settings.from_env().session_continuity is expected
+
+
+def test_settings_telemetry_defaults_to_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_environment(monkeypatch)
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
+
+    assert Settings.from_env().telemetry is True
+
+
+@pytest.mark.parametrize("raw", ["0", "false", "no", "off"])
+def test_settings_telemetry_can_be_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    raw: str,
+) -> None:
+    _clear_environment(monkeypatch)
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_TELEMETRY", raw)
+
+    assert Settings.from_env().telemetry is False
+
+
+@pytest.mark.parametrize("raw", ["1", "true", "yes", " on "])
+def test_do_not_track_overrides_telemetry_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    raw: str,
+) -> None:
+    _clear_environment(monkeypatch)
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_TELEMETRY", "invalid")
+    monkeypatch.setenv("DO_NOT_TRACK", raw)
+
+    assert Settings.from_env().telemetry is False
+
+
+@pytest.mark.parametrize("raw", ["", " ", "0"])
+def test_do_not_track_leaves_telemetry_configuration_alone(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    raw: str,
+) -> None:
+    _clear_environment(monkeypatch)
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("DO_NOT_TRACK", raw)
+
+    assert Settings.from_env().telemetry is True
 
 
 def test_settings_reject_non_boolean_continuity_flag(

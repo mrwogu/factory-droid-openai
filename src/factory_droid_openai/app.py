@@ -76,6 +76,7 @@ from factory_droid_openai.runner import (
     WarmSession,
     normalize_reasoning_effort,
 )
+from factory_droid_openai.telemetry import DEFAULT_TELEMETRY_ENDPOINT, TelemetryReporter
 
 if TYPE_CHECKING:
     from jsonschema.protocols import Validator
@@ -90,6 +91,7 @@ BearerCredentials = Annotated[
 # Warming happens off the request path, so it never needs the full request
 # timeout budget.
 _WARM_TIMEOUT_CEILING = 120.0
+_BRIDGE_VERSION = "1.4.1"  # x-release-please-version
 
 CHAT_COMPLETION_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {
@@ -559,6 +561,8 @@ class RequestSizeLimitMiddleware:
                 _request_outcome(status_code, scope),
                 status_code,
                 time.perf_counter() - started,
+                route=_request_route(scope),
+                mode=_request_mode(scope),
             )
 
 
@@ -629,6 +633,12 @@ def create_app(
         ttl_seconds=resolved_settings.warm_session_ttl_seconds,
         metrics=metrics,
     )
+    telemetry = TelemetryReporter(
+        metrics=metrics,
+        app_version=_BRIDGE_VERSION,
+        endpoint=DEFAULT_TELEMETRY_ENDPOINT,
+        enabled=resolved_settings.telemetry,
+    )
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -640,11 +650,13 @@ def create_app(
                 reasoning_effort=resolved_settings.reasoning_effort,
             ),
         )
+        telemetry.start()
         log_info(
             "bridge.started",
             warm_sessions=resolved_settings.warm_session_count(),
             max_concurrency=resolved_settings.max_concurrency,
             detached_cleanup=resolved_settings.detached_cleanup,
+            telemetry=telemetry.enabled,
             reasoning_effort=resolved_settings.reasoning_effort,
             trace_payloads=resolved_settings.trace_payloads,
             trace_payload_file=(
@@ -658,6 +670,7 @@ def create_app(
         finally:
             await pool.aclose()
             await reaper.drain()
+            await telemetry.close()
 
     application = FastAPI(
         lifespan=lifespan,
@@ -667,7 +680,7 @@ def create_app(
             "An unofficial compatibility bridge for OpenAI Chat Completions clients. "
             "The bridge runs one isolated Factory Droid session per request."
         ),
-        version="1.4.1",  # x-release-please-version
+        version=_BRIDGE_VERSION,
         license_info={
             "name": "Apache License 2.0",
             "identifier": "Apache-2.0",
@@ -700,6 +713,7 @@ def create_app(
     application.state.pool = pool
     application.state.reaper = reaper
     application.state.quarantine = quarantine
+    application.state.telemetry = telemetry
 
     async def require_auth(credentials: BearerCredentials) -> None:
         expected = resolved_settings.api_key
@@ -1037,6 +1051,9 @@ def create_app(
         payload: ChatCompletionRequest,
         request: Request,
     ) -> JSONResponse | StreamingResponse:
+        # Requests rejected before the handler (validation, auth, request size)
+        # never reach this line, so they stay reported as "not_applicable".
+        request.state.telemetry_mode = "stream" if payload.stream else "non_stream"
         timeout_seconds = min(
             payload.timeout or resolved_settings.timeout_seconds,
             resolved_settings.timeout_seconds,
@@ -1131,6 +1148,21 @@ def create_app(
             log_warning("chat.rejected", status=404, phase="model", model=payload.model)
             return _error_response(quarantined, 404, "model_not_found")
 
+        features: list[str] = []
+        if payload.tools:
+            features.append("tools")
+        if structured is not None:
+            features.append("structured_output")
+        if plan.attachments:
+            features.append("attachments")
+        if reasoning_effort is not None:
+            features.append("reasoning_effort")
+        if session_id is not None:
+            features.append("session_continuity")
+        if payload.n > 1:
+            features.append("multiple_choices")
+        metrics.record_features(tuple(features))
+
         created = int(time.time())
         run_request = RunRequest(
             prompt=plan.prompt,
@@ -1180,6 +1212,7 @@ def create_app(
         if session_id is None:
             warm_session = pool.acquire(run_request.session_key())
             if warm_session is not None:
+                metrics.record_features(("warm_session",))
                 run_request = replace(run_request, warm_session=warm_session)
 
         if payload.stream:
@@ -2182,6 +2215,32 @@ def _request_outcome(status_code: int, scope: Scope) -> str:
     if status_code in {408, 504}:
         return "timeout"
     return "error"
+
+
+def _request_route(scope: Scope) -> str:
+    path = str(scope.get("path", ""))
+    if path == "/health":
+        return "health"
+    if path == "/version":
+        return "version"
+    if path == "/metrics":
+        return "metrics"
+    if path == "/v1/models" or path.startswith("/v1/models/"):
+        return "models"
+    if path == "/v1/chat/completions":
+        return "chat_completions"
+    if path.startswith("/v1/factory/sessions/"):
+        return "session_operation"
+    return "other"
+
+
+def _request_mode(scope: Scope) -> str:
+    state = scope.get("state")
+    if isinstance(state, dict):
+        mode = state.get("telemetry_mode")
+        if mode in {"stream", "non_stream"}:
+            return str(mode)
+    return "not_applicable"
 
 
 def _observe_ttft(
