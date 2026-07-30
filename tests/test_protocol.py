@@ -10,6 +10,7 @@ from factory_droid_openai.protocol import (
     _MAX_TOOL_PAYLOAD_BYTES,
     TOOL_CALL_CLOSE,
     TOOL_CALL_OPEN,
+    IncompleteToolCallError,
     ProtocolError,
     RequestTooLargeError,
     StopSequenceBuffer,
@@ -1498,6 +1499,43 @@ def test_unclosed_marker_without_tools_still_fails() -> None:
 
     with pytest.raises(ProtocolError, match="incomplete tool-call marker"):
         parser.finish()
+
+
+def test_truncated_tool_call_reports_name_and_size() -> None:
+    payload = '{"name":"weather","arguments":{"city":"Kr'
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    parser.feed(f"{TOOL_CALL_OPEN}{payload}")
+
+    with pytest.raises(IncompleteToolCallError) as excinfo:
+        parser.finish()
+
+    assert excinfo.value.tool_name == "weather"
+    assert excinfo.value.payload_bytes == len(payload.encode("utf-8"))
+    assert "weather" in str(excinfo.value)
+    assert str(len(payload.encode("utf-8"))) in str(excinfo.value)
+    # Stays a ProtocolError so existing fail-closed handlers keep working.
+    assert isinstance(excinfo.value, ProtocolError)
+
+
+def test_truncated_tool_call_guesses_bare_name_form() -> None:
+    parser = ToolCallStreamParser(frozenset({"execute_code"}))
+    parser.feed(f'{TOOL_CALL_OPEN}execute_code{{"code":"from hermes')
+
+    with pytest.raises(IncompleteToolCallError) as excinfo:
+        parser.finish()
+
+    assert excinfo.value.tool_name == "execute_code"
+
+
+def test_truncated_tool_call_without_recognized_name_reports_none() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    parser.feed(f"{TOOL_CALL_OPEN}{{")
+
+    with pytest.raises(IncompleteToolCallError) as excinfo:
+        parser.finish()
+
+    assert excinfo.value.tool_name is None
+    assert excinfo.value.payload_bytes == 1
 
 
 def test_stream_parser_rejects_oversized_payload() -> None:

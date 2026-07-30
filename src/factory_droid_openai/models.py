@@ -88,7 +88,7 @@ class AssistantMessageResponse(BaseModel):
 class ChatCompletionChoice(BaseModel):
     index: int
     message: AssistantMessageResponse
-    finish_reason: Literal["stop", "tool_calls"]
+    finish_reason: Literal["stop", "tool_calls", "length"]
 
 
 class ChatCompletionResponse(BaseModel):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -15,7 +16,11 @@ from factory_droid_openai.dialects import (
     find_open_marker,
     strip_code_fence,
 )
-from factory_droid_openai.errors import ProtocolError, RequestTooLargeError
+from factory_droid_openai.errors import (
+    IncompleteToolCallError,
+    ProtocolError,
+    RequestTooLargeError,
+)
 from factory_droid_openai.logs import debug as log_debug
 from factory_droid_openai.logs import trace as log_trace
 from factory_droid_openai.payloadlog import NULL_PAYLOAD_TRACER
@@ -38,6 +43,7 @@ __all__ = [
     "TOOL_CALL_CLOSE",
     "TOOL_CALL_OPEN",
     "AttachmentSet",
+    "IncompleteToolCallError",
     "PromptPlan",
     "ProtocolEmission",
     "ProtocolError",
@@ -293,7 +299,11 @@ class ToolCallStreamParser:
         if self._capturing:
             recovered = self._recover_unclosed_tool_call()
             if recovered is None:
-                raise ProtocolError("incomplete tool-call marker")
+                payload = "".join(self._payload_chunks) + self._close_tail
+                raise IncompleteToolCallError(
+                    tool_name=_guess_tool_name(payload, self._allowed_tool_names),
+                    payload_bytes=len(payload.encode("utf-8")),
+                )
             emissions.extend(self._emit_tool_calls(recovered))
         if self._text_tail:
             # After a tool call only whitespace may separate further calls; any
@@ -583,6 +593,27 @@ def _json_depth_exceeds(value: Any, max_depth: int) -> bool:
         children = current.values() if isinstance(current, dict) else current
         stack.extend((child, depth + 1) for child in children)
     return False
+
+
+_NAME_FIELD_PATTERN = re.compile(r'"name"\s*:\s*"([^"\\]+)"')
+_BARE_NAME_PATTERN = re.compile(r"^([A-Za-z_][\w.-]*)(?=\s*[{[]|\s*$)")
+
+
+def _guess_tool_name(payload: str, allowed_tool_names: frozenset[str]) -> str | None:
+    """Best-effort tool name for a truncated payload.
+
+    Handles the wrapped ``{"name": ...}`` form and the bare ``name{...}`` /
+    ``name\\n{...}`` form seen from GLM-family models. Only names from the
+    allowed set are reported, so a garbled prefix never masquerades as a tool.
+    """
+    match = _NAME_FIELD_PATTERN.search(payload[:256])
+    if match and match.group(1) in allowed_tool_names:
+        return match.group(1)
+    head = payload.strip().split("\n", 1)[0]
+    match = _BARE_NAME_PATTERN.match(head)
+    if match and match.group(1) in allowed_tool_names:
+        return match.group(1)
+    return None
 
 
 def _partial_marker_suffix_length(value: str, marker: str) -> int:

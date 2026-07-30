@@ -62,3 +62,7 @@ def test_openapi_contract_documents_compatibility_surface(tmp_path: Path) -> Non
     ]
     request_schema = schema["components"]["schemas"]["ChatCompletionRequest"]
     assert "response_format" in request_schema["properties"]
+    finish_reasons = schema["components"]["schemas"]["ChatCompletionChoice"]["properties"][
+        "finish_reason"
+    ]["enum"]
+    assert set(finish_reasons) == {"stop", "tool_calls", "length"}
