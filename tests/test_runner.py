@@ -29,14 +29,18 @@ from droid_sdk.schemas.enums import (
     ReasoningEffort,
 )
 
+from factory_droid_openai import runner as runner_module
 from factory_droid_openai.metrics import BridgeMetrics
+from factory_droid_openai.pool import BackgroundReaper
 from factory_droid_openai.runner import (
     DroidRunner,
     ReasoningDelta,
     RunComplete,
     RunnerError,
+    RunnerMetrics,
     RunRequest,
     SessionKey,
+    SessionReaper,
     SessionStarted,
     StatusUpdate,
     TextDelta,
@@ -45,6 +49,7 @@ from factory_droid_openai.runner import (
     WarmSession,
     _build_exec_args,
     _create_client,
+    _ManagedProcessTransport,
     _run_until,
 )
 
@@ -1345,3 +1350,182 @@ async def test_run_request_session_key_resolves_the_model_alias() -> None:
         model_id="gpt-5.4",
         reasoning_effort="high",
     )
+
+
+def test_runner_metrics_contract_carries_no_default_behavior() -> None:
+    metrics = BridgeMetrics()
+
+    RunnerMetrics.observe_droid_startup(metrics, 1.5)
+    RunnerMetrics.increment_forced_kills(metrics)
+
+    rendered = metrics.render()
+    assert "factory_droid_openai_droid_startup_seconds_count 0" in rendered
+    assert "factory_droid_openai_forced_kills_total 0" in rendered
+
+
+@pytest.mark.asyncio
+async def test_session_reaper_contract_carries_no_default_behavior() -> None:
+    reaper = BackgroundReaper()
+
+    async def teardown() -> None:
+        raise AssertionError("the contract must not run the coroutine")
+
+    coroutine = teardown()
+    try:
+        SessionReaper.submit(reaper, coroutine)
+    finally:
+        coroutine.close()
+
+    await reaper.drain(timeout=0.1)
+
+
+@pytest.mark.asyncio
+async def test_unconnected_transport_never_reports_a_forced_kill(tmp_path: Path) -> None:
+    transport = _ManagedProcessTransport(
+        exec_path="droid",
+        cwd=str(tmp_path),
+        grace_period=0.1,
+    )
+
+    await transport.close()
+
+    assert await transport.force_kill_and_reap(1.0) is False
+    assert transport.is_reaped() is True
+    assert transport.consumed_forced_kill() is False
+
+
+@pytest.mark.asyncio
+async def test_runner_warms_a_session_without_metrics(tmp_path: Path) -> None:
+    client = FakeClient([])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    session = await runner.warm(
+        SessionKey(model_id=None, reasoning_effort=None),
+        timeout_seconds=1.0,
+    )
+
+    assert session.session_id == "session-1"
+
+
+@pytest.mark.asyncio
+async def test_runner_skips_the_session_event_when_the_sdk_has_no_session_id(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient([AssistantTextDelta("hi"), TurnComplete()], session_id=None)
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    events = await _collect(runner, _request())
+
+    assert not [event for event in events if isinstance(event, SessionStarted)]
+    assert TextDelta("hi") in events
+
+
+@pytest.mark.asyncio
+async def test_runner_maps_events_without_trace_logging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runner_module, "log_enabled", lambda _level: False)
+    client = FakeClient([AssistantTextDelta("hi"), TurnComplete()])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    events = await _collect(runner, _request())
+
+    assert TextDelta("hi") in events
+
+
+@pytest.mark.asyncio
+async def test_runner_ignores_sdk_events_it_does_not_map(tmp_path: Path) -> None:
+    client = FakeClient([SimpleNamespace(kind="unknown"), TurnComplete()])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    events = await _collect(runner, _request())
+
+    assert events == [SessionStarted("session-1"), RunComplete(usage=Usage())]
+
+
+@pytest.mark.asyncio
+async def test_session_operation_cleanup_survives_a_cancelled_caller(tmp_path: Path) -> None:
+    closing = asyncio.Event()
+    release = asyncio.Event()
+
+    class SlowClosingClient(FakeClient):
+        async def close(self) -> None:
+            closing.set()
+            await release.wait()
+            self.closed = True
+
+    client = SlowClosingClient([])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+        cleanup_timeout_seconds=5.0,
+    )
+
+    task = asyncio.create_task(runner.close_session("session-1", timeout_seconds=10.0))
+    await closing.wait()
+    task.cancel()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_cleanup_reports_a_forced_kill_without_metrics(tmp_path: Path) -> None:
+    class ForcedTransport:
+        def is_reaped(self) -> bool:
+            return False
+
+        def consumed_forced_kill(self) -> bool:
+            return True
+
+        async def force_kill_and_reap(self, timeout: float) -> bool:
+            raise AssertionError(f"no budget left for a {timeout}s reap")
+
+    client = FakeClient([])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+        cleanup_timeout_seconds=0.0,
+    )
+
+    await runner._cleanup(
+        cast("Any", client),
+        cast("Any", ForcedTransport()),
+        interrupt=False,
+    )
+
+    assert client.closed is False
+
+
+def test_exec_args_accept_each_cli_only_flag_alone(tmp_path: Path) -> None:
+    prompt_file = tmp_path / "system.md"
+
+    worktree_only = _build_exec_args(worktree="wt", append_system_prompt_file=None)
+    prompt_only = _build_exec_args(worktree=None, append_system_prompt_file=prompt_file)
+
+    assert worktree_only is not None
+    assert worktree_only[5:] == ["--worktree", "wt"]
+    assert prompt_only is not None
+    assert prompt_only[5:] == ["--append-system-prompt-file", str(prompt_file)]

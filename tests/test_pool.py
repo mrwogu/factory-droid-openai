@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 
 from factory_droid_openai.metrics import BridgeMetrics
-from factory_droid_openai.pool import BackgroundReaper, WarmSessionPool
+from factory_droid_openai.pool import BackgroundReaper, PoolMetrics, WarmSessionPool
 from factory_droid_openai.runner import SessionKey, WarmSession
 
 if TYPE_CHECKING:
@@ -438,3 +438,29 @@ async def test_pool_discards_sessions_for_keys_it_never_saw() -> None:
     await asyncio.sleep(0)
 
     assert log == ["discard:model-a"]
+
+
+def test_pool_metrics_contract_carries_no_default_behavior() -> None:
+    metrics = BridgeMetrics()
+
+    PoolMetrics.set_warm_sessions(metrics, 3)
+    PoolMetrics.increment_warm_hits(metrics)
+    PoolMetrics.increment_warm_retunes(metrics)
+    PoolMetrics.increment_warm_misses(metrics)
+    PoolMetrics.increment_warm_failures(metrics)
+    PoolMetrics.set_pending_reaps(metrics, 2)
+
+    rendered = metrics.render()
+    assert "factory_droid_openai_warm_sessions 0" in rendered
+    assert "factory_droid_openai_warm_session_hits_total 0" in rendered
+    assert "factory_droid_openai_pending_reaps 0" in rendered
+
+
+def test_forgetting_an_already_evicted_key_is_a_no_op() -> None:
+    pool = _pool(FakeRunner(), max_keys=1)
+    pool.note(KEY)
+    pool.note(OTHER_KEY)
+
+    pool._forget(KEY)
+
+    assert pool._wanted == [OTHER_KEY]

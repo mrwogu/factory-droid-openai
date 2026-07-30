@@ -2780,3 +2780,395 @@ async def test_detached_cleanup_can_be_disabled(tmp_path: Path) -> None:
     assert app.state.pool.enabled is False
     async with app.router.lifespan_context(app):
         assert "factory_droid_openai_warm_sessions 0" in app.state.metrics.render()
+
+
+@pytest.mark.asyncio
+async def test_admission_release_joins_an_in_flight_release() -> None:
+    admission = BlockingAdmission()
+    lease = AdmissionLease(cast("Any", admission))
+
+    first = asyncio.create_task(lease.release())
+    await admission.started.wait()
+    second = asyncio.create_task(lease.release())
+    await asyncio.sleep(0)
+    admission.proceed.set()
+    await asyncio.gather(first, second)
+
+    assert admission.releases == 1
+
+
+@pytest.mark.asyncio
+async def test_admission_refuses_an_already_expired_deadline() -> None:
+    admission = AdmissionController(
+        max_concurrency=1,
+        max_queue_size=1,
+        metrics=BridgeMetrics(),
+    )
+
+    with pytest.raises(TimeoutError):
+        await admission.acquire(asyncio.get_running_loop().time() - 1)
+
+
+def test_json_depth_tracker_frees_depth_when_containers_close() -> None:
+    tracker = _JsonDepthTracker(2)
+
+    tracker.feed(b"[[]][[]]")
+    tracker.feed(b"[[")
+
+    with pytest.raises(_RequestPayloadLimitError, match="depth limit"):
+        tracker.feed(b"[")
+
+
+def test_json_depth_tracker_ignores_backslashes_outside_strings() -> None:
+    """A stray escape outside a string is not JSON, but it must not shift depth."""
+    tracker = _JsonDepthTracker(1)
+
+    tracker.feed(rb"\ [\]")
+    tracker.feed(b"[")
+
+    with pytest.raises(_RequestPayloadLimitError, match="depth limit"):
+        tracker.feed(b"[")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [_RequestPayloadLimitError("body too deep"), TimeoutError()],
+)
+async def test_request_limit_middleware_reraises_failures_after_the_response_started(
+    failure: Exception,
+) -> None:
+    """Once headers are on the wire the middleware cannot answer with an error."""
+
+    async def downstream(_scope: Any, _receive: Any, send: Any) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        raise failure
+
+    middleware = RequestSizeLimitMiddleware(
+        cast("Any", downstream),
+        max_request_bytes=64,
+        max_json_depth=4,
+        body_timeout_seconds=1.0,
+        metrics=BridgeMetrics(),
+    )
+
+    async def receive() -> Any:
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    sent: list[Any] = []
+
+    async def send(message: Any) -> None:
+        sent.append(message)
+
+    with pytest.raises(type(failure)):
+        await middleware(
+            cast(
+                "Any",
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/v1/chat/completions",
+                    "headers": [],
+                },
+            ),
+            receive,
+            send,
+        )
+
+    assert [message["type"] for message in sent] == ["http.response.start"]
+
+
+@pytest.mark.asyncio
+async def test_finalizing_streaming_response_finishes_a_cancelled_finalizer() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finalized = False
+
+    async def content() -> AsyncIterator[str]:
+        yield "data"
+
+    async def finalizer() -> None:
+        nonlocal finalized
+        started.set()
+        await release.wait()
+        finalized = True
+
+    response = FinalizingStreamingResponse(
+        content(),
+        finalizer=finalizer,
+        media_type="text/event-stream",
+        headers={},
+    )
+
+    async def receive() -> Any:
+        await asyncio.Event().wait()
+        return {"type": "http.disconnect"}
+
+    async def send(_message: Any) -> None:
+        return
+
+    task = asyncio.create_task(
+        response(
+            cast(
+                "Any",
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/v1/chat/completions",
+                    "headers": [],
+                    "asgi": {"spec_version": "2.4"},
+                },
+            ),
+            receive,
+            send,
+        )
+    )
+    await started.wait()
+    task.cancel()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert finalized is True
+
+
+@pytest.mark.asyncio
+async def test_model_failures_are_not_quarantined_when_the_ttl_is_zero(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [],
+        error=RunnerError("Model is gone.", status_code=404, error_type="model_not_found"),
+    )
+    app = _feature_app(tmp_path, runner, model_quarantine_seconds=0.0)
+
+    async with _client(app) as client:
+        first = await client.post("/v1/chat/completions", json=_payload())
+        second = await client.post("/v1/chat/completions", json=_payload())
+
+    assert first.status_code == 404
+    assert second.status_code == 404
+    assert "factory_droid_openai_model_quarantines_total 0" in app.state.metrics.render()
+
+
+@pytest.mark.asyncio
+async def test_runner_factory_failure_releases_the_admission_slot(tmp_path: Path) -> None:
+    attempts = 0
+
+    def factory() -> Any:
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("no droid runner")
+
+    app = create_app(
+        Settings(workdir=tmp_path, max_concurrency=1, max_queue_size=0),
+        runner_factory=cast("RunnerFactory", factory),
+    )
+
+    async with _client(app) as client:
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="no droid runner"):
+                await client.post("/v1/chat/completions", json=_payload())
+
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_request_answers_499_when_the_client_disconnects(
+    tmp_path: Path,
+) -> None:
+    runner = BlockingRunner()
+    app = _app(tmp_path, runner)
+    body = json.dumps(_payload()).encode()
+    delivered = False
+
+    async def receive() -> Any:
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        await runner.started.wait()
+        return {"type": "http.disconnect"}
+
+    sent: list[Any] = []
+
+    async def send(message: Any) -> None:
+        sent.append(message)
+
+    await app(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.4"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/chat/completions",
+            "raw_path": b"/v1/chat/completions",
+            "query_string": b"",
+            "root_path": "",
+            "headers": [
+                (b"host", b"test"),
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+            "client": ("127.0.0.1", 4242),
+            "server": ("test", 80),
+        },
+        receive,
+        send,
+    )
+
+    assert sent[0]["status"] == 499
+    assert runner.closed is True
+
+
+@pytest.mark.asyncio
+async def test_collect_completion_ignores_unmapped_runner_events() -> None:
+    runner = FakeRunner(
+        [cast("RunEvent", SimpleNamespace(kind="unknown")), RunComplete(Usage())],
+    )
+
+    result = await _collect_completion(
+        runner=cast("Any", runner),
+        run_request=RunRequest(
+            prompt="prompt",
+            model="factory-droid",
+            model_alias="factory-droid",
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        parser=ToolCallStreamParser(frozenset()),
+    )
+
+    assert result.text == ""
+    assert result.completed is True
+
+
+@pytest.mark.asyncio
+async def test_streaming_keeps_the_session_id_private_without_a_callback() -> None:
+    runner = FakeRunner([SessionStarted("session-1"), TextDelta("hi"), RunComplete(Usage())])
+
+    events = await _collect_stream(runner)
+
+    assert "factory_droid_session_id" not in "".join(events)
+    assert '"content":"hi"' in "".join(events)
+
+
+@pytest.mark.asyncio
+async def test_streaming_ignores_unmapped_runner_events() -> None:
+    runner = FakeRunner(
+        [cast("RunEvent", SimpleNamespace(kind="unknown")), RunComplete(Usage())],
+    )
+
+    events = await _collect_stream(runner)
+
+    assert '"finish_reason":"stop"' in "".join(events)
+
+
+@pytest.mark.asyncio
+async def test_streaming_structured_output_absorbs_finish_and_held_text() -> None:
+    """Structured output is buffered, so held stop-sequence text is not streamed."""
+
+    class FinishParser:
+        def feed(self, _chunk: str) -> list[ProtocolEmission]:
+            return []
+
+        def finish(self) -> list[ProtocolEmission]:
+            return [TextEmission(""), TextEmission('{"a":1}')]
+
+    schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {"a": {"type": "integer"}},
+        "required": ["a"],
+    }
+    structured = StructuredOutput(
+        payload={"type": "json_schema", "json_schema": {"name": "answer", "schema": schema}},
+        validator=validator_for(schema)(schema),
+        max_bytes=1024,
+    )
+    metrics = BridgeMetrics()
+    admission = AdmissionController(max_concurrency=1, max_queue_size=1, metrics=metrics)
+    lease = await admission.acquire(asyncio.get_running_loop().time() + 30)
+
+    events = [
+        event
+        async for event in _stream_completion(
+            request_id="chatcmpl-test",
+            created=1,
+            model="factory-droid",
+            parser=cast("Any", FinishParser()),
+            runner=cast("Any", FakeRunner([RunComplete(Usage())])),
+            run_request=RunRequest(
+                prompt="prompt",
+                model="factory-droid",
+                model_alias="factory-droid",
+                reasoning_effort=None,
+                timeout_seconds=30,
+            ),
+            lease=lease,
+            stop_sequences=("}}",),
+            structured=structured,
+        )
+    ]
+
+    body = "".join(events)
+    assert body.count('{\\"a\\":1}') == 1
+    assert '"finish_reason":"stop"' in body
+
+
+@pytest.mark.asyncio
+async def test_streaming_reports_a_cancelled_outcome() -> None:
+    runner = BlockingRunner()
+    outcomes: list[str] = []
+    metrics = BridgeMetrics()
+    admission = AdmissionController(max_concurrency=1, max_queue_size=1, metrics=metrics)
+    lease = await admission.acquire(asyncio.get_running_loop().time() + 30)
+    stream = _stream_completion(
+        request_id="chatcmpl-test",
+        created=1,
+        model="factory-droid",
+        parser=ToolCallStreamParser(frozenset()),
+        runner=cast("Any", runner),
+        run_request=RunRequest(
+            prompt="prompt",
+            model="factory-droid",
+            model_alias="factory-droid",
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        lease=lease,
+        outcome_callback=outcomes.append,
+    )
+
+    first = await anext(stream)
+    pending: asyncio.Future[str] = asyncio.ensure_future(anext(stream))
+    await runner.started.wait()
+    pending.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+
+    assert '"role":"assistant"' in first
+    assert outcomes == ["cancelled"]
+
+
+@pytest.mark.asyncio
+async def test_stream_finalizer_accepts_a_stream_without_aclose() -> None:
+    metrics = BridgeMetrics()
+    admission = AdmissionController(max_concurrency=1, max_queue_size=1, metrics=metrics)
+    lease = await admission.acquire(asyncio.get_running_loop().time() + 30)
+    request = SimpleNamespace(state=SimpleNamespace(stream_outcome="pending"))
+
+    await _finalize_stream(
+        cast("Any", SimpleNamespace(aclose=None)),
+        lease,
+        cast("Any", request),
+    )
+
+    assert request.state.stream_outcome == "cancelled"
+    assert "factory_droid_openai_active_sessions 0" in metrics.render()
+
+
+def test_request_outcome_falls_back_to_the_status_code() -> None:
+    scope = cast("Any", {"state": {"stream_outcome": "pending"}})
+
+    assert _request_outcome(200, scope) == "success"

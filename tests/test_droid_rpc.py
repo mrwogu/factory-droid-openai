@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 from droid_sdk.errors import DroidClientError
 
-from factory_droid_openai.droid_rpc import DroidRpcExtension
+from factory_droid_openai.droid_rpc import DroidRpcExtension, _ProtocolEngine
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -312,3 +312,10 @@ async def test_rpc_extension_rejects_malformed_results(result: object) -> None:
 async def test_rpc_extension_requires_an_sdk_protocol_engine() -> None:
     with pytest.raises(DroidClientError, match="protocol engine"):
         await DroidRpcExtension().fork_session(_client(None))
+
+
+@pytest.mark.asyncio
+async def test_protocol_engine_contract_carries_no_default_behavior() -> None:
+    engine: _ProtocolEngine = FakeProtocol(lambda _method, _params: {"result": {}})
+
+    assert not await _ProtocolEngine.send_request(engine, "droid.list_tools", {})

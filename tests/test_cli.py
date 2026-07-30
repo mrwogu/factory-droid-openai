@@ -90,6 +90,22 @@ def test_cli_arguments_override_server_options(
     }
 
 
+def test_cli_stays_silent_when_the_api_key_is_configured(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        Settings,
+        "from_env",
+        classmethod(lambda _cls: Settings(api_key="secret")),
+    )
+    monkeypatch.setattr(uvicorn, "run", lambda _app, **_kwargs: None)
+
+    cli.main([])
+
+    assert "WARNING" not in capsys.readouterr().err
+
+
 def test_cli_rejects_unknown_log_level(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
