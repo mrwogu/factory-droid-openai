@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, cast
 import httpx
 import pytest
 from fastapi.exceptions import RequestValidationError
+from jsonschema.validators import validator_for
 
 from factory_droid_openai.app import (
     AdmissionController,
@@ -16,12 +17,17 @@ from factory_droid_openai.app import (
     FinalizingStreamingResponse,
     RequestSizeLimitMiddleware,
     SessionRegistry,
+    StructuredOutput,
+    _collect_completion,
     _collect_completion_or_disconnect,
     _content_length,
     _finalize_stream,
     _JsonDepthTracker,
+    _request_outcome,
+    _RequestPayloadLimitError,
     _stream_completion,
     _validation_message,
+    _wait_for_disconnect,
     create_app,
 )
 from factory_droid_openai.config import Settings
@@ -36,6 +42,8 @@ from factory_droid_openai.pool import BackgroundReaper
 from factory_droid_openai.protocol import (
     TOOL_CALL_CLOSE,
     TOOL_CALL_OPEN,
+    ProtocolEmission,
+    TextEmission,
     ToolCallStreamParser,
 )
 from factory_droid_openai.runner import (
@@ -1269,13 +1277,15 @@ async def test_streaming_protocol_error_uses_sse_error_shape(tmp_path: Path) -> 
 async def test_streaming_truncated_tool_call_finishes_with_length(tmp_path: Path) -> None:
     runner = FakeRunner(
         [
-            TextDelta("working on it"),
+            TextDelta("working on EN"),
             TextDelta(f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Kr'),
             RunComplete(Usage()),
         ]
     )
     payload = _payload(
         stream=True,
+        stream_options={"include_usage": True},
+        stop="END",
         tools=[
             {
                 "type": "function",
@@ -1295,13 +1305,20 @@ async def test_streaming_truncated_tool_call_finishes_with_length(tmp_path: Path
     chunks = [json.loads(event) for event in events if event.startswith("{")]
     assert not any("error" in chunk for chunk in chunks)
     assert events[-1] == "[DONE]"
-    assert chunks[-1]["choices"][0]["finish_reason"] == "length"
+    finish_chunk = next(
+        chunk
+        for chunk in chunks
+        if chunk["choices"] and chunk["choices"][0]["finish_reason"] is not None
+    )
+    assert finish_chunk["choices"][0]["finish_reason"] == "length"
+    assert chunks[-1]["choices"] == []
+    assert chunks[-1]["usage"]["total_tokens"] == 0
     content = "".join(
         choice["delta"].get("content") or ""
         for chunk in chunks
         for choice in chunk.get("choices", [])
     )
-    assert content == "working on it"
+    assert content == "working on EN"
     assert 'outcome="truncated",status="200"} 1' in metrics.text
 
 
@@ -1324,6 +1341,7 @@ async def test_non_streaming_truncated_tool_call_returns_length(tmp_path: Path) 
     )
     async with _client(_app(tmp_path, runner)) as client:
         response = await client.post("/v1/chat/completions", json=payload)
+        metrics = await client.get("/metrics")
 
     assert response.status_code == 200
     choice = response.json()["choices"][0]
@@ -1331,6 +1349,43 @@ async def test_non_streaming_truncated_tool_call_returns_length(tmp_path: Path) 
     assert choice["message"]["content"] == "partial answer"
     assert "tool_calls" not in choice["message"]
     assert runner.closed is True
+    assert 'outcome="truncated",status="200"} 1' in metrics.text
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_truncation_overrides_completed_tool_calls(tmp_path: Path) -> None:
+    complete = (
+        f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Gdansk"}}}}{TOOL_CALL_CLOSE}'
+    )
+    truncated = f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Kr'
+    runner = FakeRunner([TextDelta(complete + truncated), RunComplete(Usage())])
+    payload = _payload(
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ]
+    )
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "length"
+    assert len(choice["message"]["tool_calls"]) == 1
+    assert choice["message"]["tool_calls"][0]["function"]["name"] == "weather"
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        ({"stream_outcome": "truncated"}, "truncated"),
+        ({}, "success"),
+    ],
+)
+def test_request_outcome_handles_truncation(state: dict[str, str], expected: str) -> None:
+    assert _request_outcome(200, cast("Any", {"state": state})) == expected
 
 
 @pytest.mark.asyncio
@@ -1420,6 +1475,68 @@ async def test_stream_generator_flushes_a_partial_stop_sequence() -> None:
 
     assert any('"content":"keep "' in event for event in events)
     assert any('"content":"HA"' in event for event in events)
+
+
+@pytest.mark.asyncio
+async def test_stream_generator_handles_truncation_without_held_text() -> None:
+    runner = FakeRunner(
+        [
+            TextDelta(f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{'),
+            RunComplete(Usage()),
+        ]
+    )
+
+    events = await _collect_stream(
+        runner,
+        allowed_tool_names=frozenset({"weather"}),
+    )
+
+    assert any('"finish_reason":"length"' in event for event in events)
+
+
+@pytest.mark.asyncio
+async def test_stream_generator_drops_buffered_structured_output_on_truncation() -> None:
+    schema = {"type": "object"}
+    validator_class = validator_for(schema)
+    structured = StructuredOutput(
+        payload={"type": "json_schema", "schema": schema},
+        validator=validator_class(schema),
+        max_bytes=1024,
+    )
+    runner = FakeRunner(
+        [
+            TextDelta("partial EN"),
+            TextDelta(f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{'),
+            RunComplete(Usage()),
+        ]
+    )
+
+    events = await _collect_stream(
+        runner,
+        allowed_tool_names=frozenset({"weather"}),
+        stop_sequences=("END",),
+        structured=structured,
+    )
+
+    assert any('"finish_reason":"length"' in event for event in events)
+    assert not any('"content":"partial EN"' in event for event in events)
+
+
+@pytest.mark.asyncio
+async def test_stream_generator_emits_validated_structured_output() -> None:
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    validator_class = validator_for(schema)
+    structured = StructuredOutput(
+        payload={"type": "json_schema", "schema": schema},
+        validator=validator_class(schema),
+        max_bytes=1024,
+    )
+    events = await _collect_stream(
+        FakeRunner([TextDelta('{"ok":true}'), RunComplete(Usage())]),
+        structured=structured,
+    )
+
+    assert any('"content":"{\\"ok\\":true}"' in event for event in events)
 
 
 @pytest.mark.asyncio
@@ -1551,12 +1668,59 @@ async def test_non_stream_disconnect_cancels_runner_cleanup() -> None:
     assert runner.closed is True
 
 
+@pytest.mark.asyncio
+async def test_collect_completion_applies_finish_emissions() -> None:
+    class FinishTextParser:
+        def feed(self, _chunk: str) -> list[ProtocolEmission]:
+            return []
+
+        def finish(self) -> list[ProtocolEmission]:
+            return [TextEmission("finished")]
+
+    result = await _collect_completion(
+        runner=cast("Any", FakeRunner([RunComplete(Usage())])),
+        run_request=RunRequest(
+            prompt="prompt",
+            model="factory-droid",
+            model_alias="factory-droid",
+            reasoning_effort=None,
+            timeout_seconds=30,
+        ),
+        parser=cast("Any", FinishTextParser()),
+    )
+
+    assert result.text == "finished"
+
+
+@pytest.mark.asyncio
+async def test_wait_for_disconnect_ignores_request_messages() -> None:
+    messages = iter(
+        [
+            {"type": "http.request", "body": b"", "more_body": False},
+            {"type": "http.disconnect"},
+        ]
+    )
+
+    async def receive() -> Any:
+        return next(messages)
+
+    await _wait_for_disconnect(cast("Any", SimpleNamespace(receive=receive)))
+
+
+def test_request_payload_limit_error_preserves_message() -> None:
+    error = _RequestPayloadLimitError("too large")
+
+    assert error.message == "too large"
+    assert str(error) == "too large"
+
+
 async def _collect_stream(
     runner: FakeRunner,
     *,
     allowed_tool_names: frozenset[str] = frozenset(),
     include_usage: bool = False,
     stop_sequences: tuple[str, ...] = (),
+    structured: StructuredOutput | None = None,
 ) -> list[str]:
     metrics = BridgeMetrics()
     admission = AdmissionController(max_concurrency=1, max_queue_size=1, metrics=metrics)
@@ -1579,6 +1743,7 @@ async def _collect_stream(
             lease=lease,
             include_usage=include_usage,
             stop_sequences=stop_sequences,
+            structured=structured,
         )
     ]
 

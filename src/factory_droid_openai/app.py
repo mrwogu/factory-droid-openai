@@ -1270,6 +1270,8 @@ def create_app(
                             499,
                             "client_disconnected",
                         )
+                    if result.truncated:
+                        request.state.stream_outcome = "truncated"
                     if result.session_id is not None:
                         sessions.remember(result.session_id)
                         started_session = result.session_id
@@ -1675,6 +1677,11 @@ async def _stream_completion(
                 tool_name=exc.tool_name,
                 payload_bytes=exc.payload_bytes,
             )
+            held = stop_buffer.flush()
+            if held:
+                chunk_payload = text_chunk(held)
+                if chunk_payload is not None:
+                    yield chunk_payload
             yield _sse(
                 _chunk(
                     request_id,
@@ -2031,10 +2038,10 @@ def _choice_dict(result: CollectedCompletion, index: int) -> dict[str, Any]:
     if result.tool_calls:
         message["tool_calls"] = result.tool_calls
     finish_reason = "stop"
-    if result.tool_calls:
-        finish_reason = "tool_calls"
-    elif result.truncated:
+    if result.truncated:
         finish_reason = "length"
+    elif result.tool_calls:
+        finish_reason = "tool_calls"
     return {
         "index": index,
         "message": message,
