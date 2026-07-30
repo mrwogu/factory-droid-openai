@@ -92,7 +92,7 @@ BearerCredentials = Annotated[
 # Warming happens off the request path, so it never needs the full request
 # timeout budget.
 _WARM_TIMEOUT_CEILING = 120.0
-_BRIDGE_VERSION = "1.4.1"  # x-release-please-version
+_BRIDGE_VERSION = "1.5.0"  # x-release-please-version
 
 CHAT_COMPLETION_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {

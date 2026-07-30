@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.5.0](https://github.com/mrwogu/factory-droid-openai/compare/v1.4.1...v1.5.0) (2026-07-30)
+
+
+### Features
+
+* add anonymous aggregate telemetry ([#35](https://github.com/mrwogu/factory-droid-openai/issues/35)) ([b453124](https://github.com/mrwogu/factory-droid-openai/commit/b4531240b3df064e2fb3f9df89c7bf3373224941))
+* **logging:** opt-in payload tracing to JSONL with redaction ([#31](https://github.com/mrwogu/factory-droid-openai/issues/31)) ([bf10ccb](https://github.com/mrwogu/factory-droid-openai/commit/bf10ccbb0c101654e453b3c4acadb21e7c6d706c))
+
+
+### Bug Fixes
+
+* **protocol:** degrade malformed tool-call JSON to length finish ([680f18e](https://github.com/mrwogu/factory-droid-openai/commit/680f18ee06bfcdc36790bc494ff44fb51b70b7a4))
+* **protocol:** finish_reason=length on truncated tool calls ([#33](https://github.com/mrwogu/factory-droid-openai/issues/33)) ([372458d](https://github.com/mrwogu/factory-droid-openai/commit/372458db3074cc3b6f6e7a9ecdfdad544a38bb0e))
+
 ## [1.4.1](https://github.com/mrwogu/factory-droid-openai/compare/v1.4.0...v1.4.1) (2026-07-29)
 
 
