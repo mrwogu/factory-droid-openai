@@ -262,9 +262,12 @@ text. Every accepted form lives in one table in
 | `<\|action_start\|><\|plugin\|>{"name":...}<\|action_end\|>` | InternLM2 |
 | `name<arg_key>key</arg_key><arg_value>value</arg_value>` | GLM |
 | a JSON array of calls inside one marker pair | Mistral, Jamba, Granite and xLAM style output |
+| `name","key":"value"...}` with the opening `{"name":"` bytes lost | GLM, only with `FACTORY_DROID_OPENAI_REPAIR_LOST_PREFIX=true` |
 
-Translation never widens validation. An unknown tool name, a truncated payload,
-a duplicate argument key, or prose after a call still fails the turn. Qwen3's
+Translation never widens validation. An unknown tool name, a duplicate
+argument key, or prose after a call still fails the turn. A truncated payload,
+or one no decoder can parse, ends the turn with `finish_reason="length"`
+instead; the partial or malformed call is dropped, never executed. Qwen3's
 XML form declares no argument types, so a scalar value stays the string the
 model wrote unless it wrote a JSON object or array.
 
@@ -1132,6 +1135,7 @@ followed by `[DONE]`.
 | `FACTORY_DROID_OPENAI_UVICORN_LIMIT_CONCURRENCY` | `64` | Uvicorn connection limit |
 | `FACTORY_DROID_OPENAI_UVICORN_BACKLOG` | `128` | Uvicorn listen backlog |
 | `FACTORY_DROID_OPENAI_MAX_TOOL_CALLS` | `8` | Tool calls accepted per Droid turn |
+| `FACTORY_DROID_OPENAI_REPAIR_LOST_PREFIX` | `false` | Repair tool-call payloads missing their opening `{"name":"` bytes |
 | `FACTORY_DROID_OPENAI_MAX_ATTACHMENTS` | `16` | Inline attachments per request |
 | `FACTORY_DROID_OPENAI_MAX_ATTACHMENT_BYTES` | `8388608` | Total encoded attachment bytes |
 | `FACTORY_DROID_OPENAI_MAX_CHOICES` | `4` | Upper bound for `n` |
@@ -1444,7 +1448,7 @@ This is a compatibility bridge, not a native OpenAI inference implementation.
 | No native SDK tool-result continuation | Each request runs a fresh Droid session; warm sessions remove its startup cost, not its empty state |
 | Python SDK protocol drift | A small isolated compatibility shim supplies structured output, tool controls, and session RPCs |
 | Session-per-request execution | Prompt caching differs from a native inference endpoint |
-| Strict tool marker protocol | Invalid generated tool payloads fail closed |
+| Strict tool marker protocol | Invalid generated tool payloads fail closed; unparseable or truncated payloads end the turn with `finish_reason="length"` |
 | Sequential tool calls only | Calls arrive one after another, never concurrently |
 
 ## Troubleshooting
