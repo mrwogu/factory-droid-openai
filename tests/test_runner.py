@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import sys
 import textwrap
 import time
@@ -346,6 +347,30 @@ async def test_runner_maps_sdk_timeout_to_gateway_timeout(tmp_path: Path) -> Non
     assert error.value.status_code == 504
     assert error.value.error_type == "factory_droid_timeout"
     assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_sdk_timeout_message_reports_elapsed_not_the_configured_ceiling(
+    tmp_path: Path,
+) -> None:
+    # The SDK fails immediately, so the timeout message must report the small
+    # elapsed time of the run, not the configured 30 s ceiling the old message
+    # echoed regardless of when the failure actually happened.
+    client = SdkTimeoutClient([])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    with pytest.raises(RunnerError) as error:
+        await _collect(runner, _request(timeout_seconds=30.0))
+
+    assert error.value.status_code == 504
+    assert error.value.error_type == "factory_droid_timeout"
+    match = re.search(r"after ([\d.]+) seconds", str(error.value))
+    assert match is not None
+    assert float(match.group(1)) < 1.0
 
 
 class MissingExecutableClient(FakeClient):
