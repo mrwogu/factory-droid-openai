@@ -66,9 +66,11 @@ uv run python scripts/e2e_matrix.py run --out traces/run-a.jsonl
 Run it from a plain shell. Inside a Droid session,
 `FACTORY_APPEND_SYSTEM_PROMPT` is exported and the bridge inherits it, so every
 recorded turn answers a different prompt than a user of the bridge would send.
-The operator's own `~/.factory/system-prompt.md` and enabled skills reach the
-model the same way, which is why a recording describes this machine, not
-default Droid behavior.
+`~/.factory/system-prompt.md` and enabled skills reach the model the same way,
+and no CLI flag turns them off: a run measures this machine's Droid profile,
+not a default one. For recordings that have to be profile-neutral, point
+`FACTORY_HOME_OVERRIDE` at a directory with its own `droid login` and no custom
+system prompt.
 
 Each request becomes one JSONL row with a verdict. Only `bridge_defect` fails
 the run; `model_behavior`, `account_policy`, `capacity`,

@@ -1,0 +1,8 @@
+{"kind": "meta", "scenario": "stop_sequence", "stream": false, "recorded_model": "gemini-3.5-flash", "expect_verdict": "pass"}
+{"kind": "session_started"}
+{"kind": "status", "state": "streaming_assistant_message"}
+{"kind": "usage", "usage": {"prompt_tokens": 461, "completion_tokens": 9, "total_tokens": 470, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "five six SEVEN eight"}
+{"kind": "text_delta", "text": ""}
+{"kind": "status", "state": "idle"}
+{"kind": "run_complete", "usage": {"prompt_tokens": 461, "completion_tokens": 9, "total_tokens": 470, "prompt_tokens_details": {"cached_tokens": 0}}}

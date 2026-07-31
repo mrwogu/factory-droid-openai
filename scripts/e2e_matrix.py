@@ -133,7 +133,10 @@ def _tool_scenarios() -> list[Scenario]:
                 "messages": [{"role": "user", "content": prompt}],
                 "tools": [_WEATHER_TOOL],
             },
+            # The prompt tells the model to use the tool, so skipping it is
+            # non-compliance even though tool_choice stays "auto".
             expect_finish=("tool_calls", "stop"),
+            expect_tool_call=True,
             expect_content=False,
         ),
         Scenario(
@@ -414,6 +417,15 @@ def _read_json_observation(
             duration_ms=duration_ms,
             transport_error="response was not a JSON object",
         )
+    return _completion_observation(body, response.headers, response.status_code, duration_ms)
+
+
+def _completion_observation(
+    body: dict[str, Any],
+    headers: httpx.Headers,
+    status: int,
+    duration_ms: float,
+) -> Observation:
     choices = body.get("choices")
     choice = choices[0] if isinstance(choices, list) and choices else {}
     message = choice.get("message", {}) if isinstance(choice, dict) else {}
@@ -421,13 +433,13 @@ def _read_json_observation(
     content = message.get("content") or ""
     error_type, error_message = _error_fields(body)
     return Observation(
-        status=response.status_code,
+        status=status,
         error_type=error_type,
         error_message=error_message,
         finish_reason=choice.get("finish_reason") if isinstance(choice, dict) else None,
         tool_calls=len(tool_calls) if isinstance(tool_calls, list) else 0,
         content_chars=len(content) if isinstance(content, str) else 0,
-        request_id=response.headers.get("x-request-id"),
+        request_id=headers.get("x-request-id"),
         duration_ms=duration_ms,
     )
 
@@ -558,6 +570,15 @@ class Bridge:
                 json=body,
                 timeout=scenario.timeout_seconds,
             ) as response:
+                if "text/event-stream" not in response.headers.get("content-type", ""):
+                    # A request rejected before the stream starts answers with
+                    # a plain JSON error, so reading it as SSE would report an
+                    # empty stream instead of the refusal the bridge sent.
+                    await response.aread()
+                    return _read_json_observation(
+                        response,
+                        duration_ms=(time.perf_counter() - started) * 1000,
+                    )
                 events = [
                     ((time.perf_counter() - started) * 1000, line.removeprefix("data: "))
                     async for line in response.aiter_lines()
