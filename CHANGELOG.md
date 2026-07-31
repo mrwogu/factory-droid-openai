@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.2](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.1...v1.6.2) (2026-07-31)
+
+
+### Bug Fixes
+
+* **bridge:** prevent client tool-call hangs ([#45](https://github.com/mrwogu/factory-droid-openai/issues/45)) ([e98c5e6](https://github.com/mrwogu/factory-droid-openai/commit/e98c5e69bbea063fc7ba17290b5d89c6cdce3611))
+
 ## [1.6.1](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.0...v1.6.1) (2026-07-31)
 
 
