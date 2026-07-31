@@ -162,6 +162,30 @@ def test_build_prompt_shows_a_concrete_tool_call_example() -> None:
     assert "python-style name(...) or name{...} call syntax" in plan.prompt
 
 
+def test_build_prompt_names_the_callable_tools() -> None:
+    request = _request(
+        tools=[
+            {"type": "function", "function": {"name": "weather", "parameters": {}}},
+            {"type": "function", "function": {"name": "clock", "parameters": {}}},
+        ]
+    )
+
+    plan = build_prompt(request)
+
+    assert "The client provides these callable tools: clock, weather." in plan.prompt
+
+
+def test_build_prompt_forbids_prose_when_a_tool_call_is_required() -> None:
+    request = _request(
+        tools=[{"type": "function", "function": {"name": "weather", "parameters": {}}}],
+        tool_choice="required",
+    )
+
+    plan = build_prompt(request)
+
+    assert "reply with the tool request markers only and no prose" in plan.prompt
+
+
 def test_tool_choice_limits_the_available_tool() -> None:
     request = _request(
         tools=[

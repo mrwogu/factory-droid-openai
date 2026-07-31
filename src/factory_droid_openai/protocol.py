@@ -175,7 +175,13 @@ def build_prompt(
         else:
             count_rule = "If a tool is needed, output exactly one tool request using "
             trailing_rule = "Do not add text after the closing marker."
+        # Weaker models read the transcript as data and answer that no tool
+        # exists, so the rule names what is callable instead of leaving the
+        # schemas to be discovered inside the JSON below.
+        available = ", ".join(sorted(tool_names))
         tool_rule = (
+            f"The client provides these callable tools: {available}. "
+            'Their JSON Schemas are in the "tools" array of the transcript below. '
             f"{count_rule}"
             f"{TOOL_CALL_OPEN}"
             '{"name":"allowed_tool_name","arguments":{"key":"value"}}'
@@ -190,7 +196,11 @@ def build_prompt(
             f"Do not call Droid-native tools. {trailing_rule}"
         )
         if require_tool_call:
-            tool_rule += " A tool call is required for this response."
+            tool_rule += (
+                " A tool call is required for this response: reply with the tool "
+                "request markers only and no prose, even if you would rather "
+                "explain or ask a question."
+            )
     else:
         tool_rule = f"No tools are available. Never output {TOOL_CALL_OPEN} or {TOOL_CALL_CLOSE}."
 
