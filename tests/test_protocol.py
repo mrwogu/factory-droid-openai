@@ -90,6 +90,24 @@ def test_build_prompt_preserves_openai_transcript_and_tools() -> None:
     assert plan.allowed_tool_names == frozenset({"weather"})
 
 
+def test_build_prompt_shows_a_concrete_tool_call_example() -> None:
+    request = _request(
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ]
+    )
+
+    plan = build_prompt(request)
+
+    assert (
+        'Example: <tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>.'
+    ) in plan.prompt
+    assert "python-style name(...) or name{...} call syntax" in plan.prompt
+
+
 def test_tool_choice_limits_the_available_tool() -> None:
     request = _request(
         tools=[
