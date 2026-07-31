@@ -23,6 +23,10 @@ from factory_droid_openai.protocol import (
     build_prompt,
     parse_strict_json,
 )
+from factory_droid_openai.strictjson import (
+    DuplicateKeyError,
+    check_no_duplicate_keys,
+)
 
 
 def _request(**overrides: object) -> ChatCompletionRequest:
@@ -403,6 +407,27 @@ def test_strict_json_rejects_values_outside_the_json_grammar(
 
 def test_strict_json_keeps_finite_numbers() -> None:
     assert parse_strict_json('{"amount":1.5,"count":2}') == {"amount": 1.5, "count": 2}
+
+
+def test_check_no_duplicate_keys_rejects_repeated_keys() -> None:
+    with pytest.raises(DuplicateKeyError, match="duplicate key 'model'"):
+        check_no_duplicate_keys('{"model":"a","model":"b"}')
+
+
+def test_check_no_duplicate_keys_rejects_nested_repeats() -> None:
+    with pytest.raises(DuplicateKeyError, match="duplicate key 'content'"):
+        check_no_duplicate_keys('{"messages":[{"content":"a","content":"b"}]}')
+
+
+def test_check_no_duplicate_keys_accepts_unique_keys() -> None:
+    # Must not raise for a well-formed document, including nested objects.
+    check_no_duplicate_keys('{"model":"a","messages":[{"role":"user","content":"hi"}]}')
+
+
+def test_check_no_duplicate_keys_keeps_standard_number_handling() -> None:
+    # Unlike parse_strict_json, this check must not reject values the standard
+    # JSON parser accepts, so it only adds the duplicate-key rejection.
+    check_no_duplicate_keys('{"big":1e400}')
 
 
 def test_stream_parser_rejects_non_finite_tool_arguments() -> None:
