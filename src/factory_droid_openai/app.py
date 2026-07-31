@@ -1320,6 +1320,7 @@ def create_app(
                 structured=structured,
                 failure_callback=note_runner_failure,
                 drain_seconds=resolved_settings.tool_call_drain_seconds,
+                trace_event=payload_tracer.trace,
             )
             return FinalizingStreamingResponse(
                 event_stream,
@@ -1372,6 +1373,7 @@ def create_app(
                         request_started_at=request_started_at,
                         stop_sequences=payload.stop_sequences,
                         drain_seconds=resolved_settings.tool_call_drain_seconds,
+                        trace_event=payload_tracer.trace,
                     )
                     if result is None:
                         request.state.telemetry_error_type = "client_disconnected"
@@ -1473,12 +1475,30 @@ class CollectedCompletion:
         return "".join(self.reasoning_parts)
 
 
+def _event_record(event: RunEvent) -> dict[str, Any]:
+    """Describe one SDK event as the JSON the replay fixtures are built from."""
+    if isinstance(event, TextDelta):
+        return {"kind": "text_delta", "text": event.text}
+    if isinstance(event, ReasoningDelta):
+        return {"kind": "reasoning_delta", "text": event.text}
+    if isinstance(event, UsageUpdate):
+        return {"kind": "usage", "usage": _usage_dict(event.usage)}
+    if isinstance(event, RunComplete):
+        return {"kind": "run_complete", "usage": _usage_dict(event.usage)}
+    if isinstance(event, StatusUpdate):
+        return {"kind": "status", "state": event.state}
+    # The session id identifies a Factory account session and replay never
+    # needs it, so SessionStarted is recorded without its payload.
+    return {"kind": "session_started"}
+
+
 async def _run_events(
     runner: DroidRunner,
     run_request: RunRequest,
     *,
     drain_seconds: float,
     saw_tool_call: Callable[[], bool],
+    trace_event: Callable[..., None] | None = None,
 ) -> AsyncGenerator[RunEvent, None]:
     """Yield runner events, bounding the wait once a tool call is complete.
 
@@ -1511,6 +1531,12 @@ async def _run_events(
                     # answer stands instead of turning into a 504.
                     return
                 raise
+            if trace_event is not None:
+                trace_event(
+                    "droid.event",
+                    json.dumps(_event_record(event), ensure_ascii=False),
+                    model=run_request.model,
+                )
             yield event
 
 
@@ -1523,6 +1549,7 @@ async def _collect_completion(
     request_started_at: float | None = None,
     stop_sequences: tuple[str, ...] = (),
     drain_seconds: float = DEFAULT_TOOL_CALL_DRAIN_SECONDS,
+    trace_event: Callable[..., None] | None = None,
 ) -> CollectedCompletion:
     result = CollectedCompletion()
     stop_buffer = StopSequenceBuffer(stop_sequences)
@@ -1533,6 +1560,7 @@ async def _collect_completion(
             run_request,
             drain_seconds=drain_seconds,
             saw_tool_call=lambda: bool(result.tool_calls),
+            trace_event=trace_event,
         )
     ) as events:
         async for event in events:
@@ -1630,6 +1658,7 @@ async def _collect_completion_or_disconnect(
     request_started_at: float | None = None,
     stop_sequences: tuple[str, ...] = (),
     drain_seconds: float = DEFAULT_TOOL_CALL_DRAIN_SECONDS,
+    trace_event: Callable[..., None] | None = None,
 ) -> CollectedCompletion | None:
     completion_task = asyncio.create_task(
         _collect_completion(
@@ -1640,6 +1669,7 @@ async def _collect_completion_or_disconnect(
             request_started_at=request_started_at,
             stop_sequences=stop_sequences,
             drain_seconds=drain_seconds,
+            trace_event=trace_event,
         )
     )
     disconnect_task = asyncio.create_task(_wait_for_disconnect(request))
@@ -1686,6 +1716,7 @@ async def _stream_completion(
     structured: StructuredOutput | None = None,
     failure_callback: Callable[[str, RunnerError], None] | None = None,
     drain_seconds: float = DEFAULT_TOOL_CALL_DRAIN_SECONDS,
+    trace_event: Callable[..., None] | None = None,
 ) -> AsyncIterator[str]:
     usage = Usage()
     completed = False
@@ -1730,6 +1761,7 @@ async def _stream_completion(
                     run_request,
                     drain_seconds=drain_seconds,
                     saw_tool_call=lambda: saw_tool_call,
+                    trace_event=trace_event,
                 )
             ) as events:
                 async for event in events:
