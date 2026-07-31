@@ -1333,6 +1333,8 @@ def create_app(
                         )
                     if result.truncated:
                         request.state.stream_outcome = "truncated"
+                    elif result.malformed_note is not None:
+                        request.state.stream_outcome = "malformed"
                     if result.session_id is not None:
                         sessions.remember(result.session_id)
                         started_session = result.session_id
@@ -1409,6 +1411,7 @@ class CollectedCompletion:
         self.session_id: str | None = None
         self.stopped = False
         self.truncated = False
+        self.malformed_note: str | None = None
 
     @property
     def text(self) -> str:
@@ -1442,14 +1445,17 @@ async def _collect_completion(
                 try:
                     _apply_emissions(result, parser.feed(event.text), stop_buffer)
                 except MalformedToolCallError as exc:
-                    # Same contract as the streaming path: a tool-call payload
-                    # no decoder could parse returns completed output with
-                    # finish_reason="length" instead of a 502. The malformed
-                    # call is dropped, never executed.
-                    result.truncated = True
+                    # The payload closed but no decoder could parse it, so
+                    # continuing the turn would only make the model repeat the
+                    # same garbage. Answer with finish_reason="stop" plus a
+                    # visible note naming the expected format instead: the
+                    # client stops auto-continuing, and a resubmitted
+                    # transcript tells the model how to re-emit the call. The
+                    # malformed call is dropped, never executed.
+                    result.malformed_note = _malformed_tool_call_note(exc)
                     result.completed = True
                     log_warning(
-                        "chat.truncated",
+                        "chat.malformed",
                         stream=False,
                         error_type="factory_protocol_error",
                         reason=str(exc),
@@ -1483,9 +1489,9 @@ async def _collect_completion(
             error_type="factory_incomplete_response",
         )
     if not result.stopped:
-        if not result.truncated:
-            # A malformed payload already failed the parse; asking the parser
-            # to finish would re-raise on the same garbage.
+        if not result.truncated and result.malformed_note is None:
+            # A failed parse already settled the turn; asking the parser to
+            # finish would re-raise on the same garbage.
             try:
                 _apply_emissions(result, parser.finish(), stop_buffer)
             except IncompleteToolCallError as exc:
@@ -1575,6 +1581,7 @@ async def _stream_completion(
     usage = Usage()
     completed = False
     saw_tool_call = False
+    saw_text = False
     observed_ttft = False
     outcome = "success"
     stop_buffer = StopSequenceBuffer(stop_sequences)
@@ -1634,6 +1641,7 @@ async def _stream_completion(
                             if text:
                                 chunk_payload = text_chunk(text)
                                 if chunk_payload is not None:
+                                    saw_text = True
                                     yield chunk_payload
                         if stop_buffer.triggered:
                             # Closing the runner generator interrupts the Droid
@@ -1713,11 +1721,13 @@ async def _stream_completion(
                     if text:
                         chunk_payload = text_chunk(text)
                         if chunk_payload is not None:
+                            saw_text = True
                             yield chunk_payload
                 held = stop_buffer.flush()
                 if held:
                     chunk_payload = text_chunk(held)
                     if chunk_payload is not None:
+                        saw_text = True
                         yield chunk_payload
             if structured is not None and structured_buffer is not None:
                 structured_text = structured_buffer.text()
@@ -1743,13 +1753,12 @@ async def _stream_completion(
             )
             if include_usage:
                 yield _sse(_usage_chunk(request_id, created, model, usage))
-        except (IncompleteToolCallError, MalformedToolCallError) as exc:
-            # The turn died inside a tool-call payload, or the payload was
-            # garbage no decoder could parse. Surface it the way OpenAI
-            # surfaces a length cutoff - completed output plus
+        except IncompleteToolCallError as exc:
+            # The turn died inside a tool-call payload. Surface it the way
+            # OpenAI surfaces a length cutoff - completed output plus
             # finish_reason="length" - so clients continue instead of
-            # blind-retrying an unrecoverable request. The partial or
-            # malformed call is dropped, never executed.
+            # blind-retrying an unrecoverable request. The partial call is
+            # dropped, never executed.
             outcome = "truncated"
             log_warning(
                 "chat.truncated",
@@ -1771,6 +1780,43 @@ async def _stream_completion(
                     model,
                     delta={},
                     finish_reason="length",
+                    include_usage=include_usage,
+                )
+            )
+            if include_usage:
+                yield _sse(_usage_chunk(request_id, created, model, usage))
+        except MalformedToolCallError as exc:
+            # The payload closed but no decoder could parse it. A length
+            # finish would make the client ask the model to "continue", which
+            # only repeats the same garbage in a loop, so answer with
+            # finish_reason="stop" plus a visible note naming the expected
+            # format. The malformed call is dropped, never executed.
+            outcome = "malformed"
+            log_warning(
+                "chat.malformed",
+                stream=True,
+                error_type="factory_protocol_error",
+                reason=str(exc),
+                tool_name=exc.tool_name,
+                payload_bytes=exc.payload_bytes,
+            )
+            held = stop_buffer.flush()
+            if held:
+                chunk_payload = text_chunk(held)
+                if chunk_payload is not None:
+                    saw_text = True
+                    yield chunk_payload
+            note = _malformed_tool_call_note(exc)
+            note_chunk = text_chunk(f"\n\n{note}" if saw_text else note)
+            if note_chunk is not None:
+                yield note_chunk
+            yield _sse(
+                _chunk(
+                    request_id,
+                    created,
+                    model,
+                    delta={},
+                    finish_reason="tool_calls" if saw_tool_call else "stop",
                     include_usage=include_usage,
                 )
             )
@@ -2109,10 +2155,29 @@ def _reject_remote_schema_refs(value: Any) -> None:
             _reject_remote_schema_refs(item)
 
 
+def _malformed_tool_call_note(exc: MalformedToolCallError) -> str:
+    """Client- and model-readable explanation for a dropped malformed call.
+
+    The note becomes assistant content, so a client that resubmits the
+    transcript hands the model the exact format to re-emit instead of
+    repeating the payload no decoder could parse.
+    """
+    tool = f' for tool "{exc.tool_name}"' if exc.tool_name else ""
+    return (
+        f"[bridge notice: dropped a malformed tool call{tool} "
+        f"({exc.payload_bytes} bytes, undecodable payload). To call a tool, emit "
+        '<tool_call>{"name":"<tool_name>","arguments":{...}}</tool_call> '
+        "with exactly one JSON object between the markers.]"
+    )
+
+
 def _choice_dict(result: CollectedCompletion, index: int) -> dict[str, Any]:
+    content = result.text
+    if result.malformed_note is not None:
+        content = f"{content}\n\n{result.malformed_note}" if content else result.malformed_note
     message: dict[str, Any] = {
         "role": "assistant",
-        "content": result.text or None,
+        "content": content or None,
     }
     if result.reasoning:
         message["reasoning"] = result.reasoning
@@ -2259,7 +2324,7 @@ def _request_outcome(status_code: int, scope: Scope) -> str:
     state = scope.get("state")
     if isinstance(state, dict):
         stream_outcome = state.get("stream_outcome")
-        if stream_outcome in {"success", "error", "timeout", "cancelled", "truncated"}:
+        if stream_outcome in {"success", "error", "timeout", "cancelled", "truncated", "malformed"}:
             return str(stream_outcome)
     if status_code < 400:
         return "success"

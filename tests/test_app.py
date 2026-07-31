@@ -1349,7 +1349,7 @@ async def test_streaming_protocol_error_uses_sse_error_shape(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_streaming_malformed_tool_call_finishes_with_length(tmp_path: Path) -> None:
+async def test_streaming_malformed_tool_call_stops_with_note(tmp_path: Path) -> None:
     runner = FakeRunner(
         [
             TextDelta("checking "),
@@ -1384,19 +1384,21 @@ async def test_streaming_malformed_tool_call_finishes_with_length(tmp_path: Path
         for chunk in chunks
         if chunk["choices"] and chunk["choices"][0]["finish_reason"] is not None
     )
-    assert finish_chunk["choices"][0]["finish_reason"] == "length"
+    assert finish_chunk["choices"][0]["finish_reason"] == "stop"
     assert chunks[-1]["choices"] == []
     content = "".join(
         choice["delta"].get("content") or ""
         for chunk in chunks
         for choice in chunk.get("choices", [])
     )
-    assert content == "checking "
-    assert 'outcome="truncated",status="200"} 1' in metrics.text
+    assert content.startswith("checking \n\n[bridge notice: dropped a malformed tool call")
+    assert 'for tool "weather"' in content
+    assert "<tool_call>" in content
+    assert 'outcome="malformed",status="200"} 1' in metrics.text
 
 
 @pytest.mark.asyncio
-async def test_non_streaming_malformed_tool_call_returns_length(tmp_path: Path) -> None:
+async def test_non_streaming_malformed_tool_call_stops_with_note(tmp_path: Path) -> None:
     runner = FakeRunner(
         [
             TextDelta("partial answer"),
@@ -1418,11 +1420,143 @@ async def test_non_streaming_malformed_tool_call_returns_length(tmp_path: Path) 
 
     assert response.status_code == 200
     choice = response.json()["choices"][0]
-    assert choice["finish_reason"] == "length"
-    assert choice["message"]["content"] == "partial answer"
+    assert choice["finish_reason"] == "stop"
+    content = choice["message"]["content"]
+    assert content.startswith("partial answer\n\n[bridge notice: dropped a malformed tool call")
+    assert 'for tool "weather"' in content
     assert "tool_calls" not in choice["message"]
     assert runner.closed is True
-    assert 'outcome="truncated",status="200"} 1' in metrics.text
+    assert 'outcome="malformed",status="200"} 1' in metrics.text
+
+
+@pytest.mark.asyncio
+async def test_streaming_malformed_tool_call_without_prior_text(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [
+            TextDelta(f"{TOOL_CALL_OPEN}not json{TOOL_CALL_CLOSE}"),
+            RunComplete(Usage()),
+        ]
+    )
+    payload = _payload(
+        stream=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ],
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    chunks = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith('data: {"')
+    ]
+    content = "".join(
+        choice["delta"].get("content") or ""
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+    )
+    assert content.startswith("[bridge notice: dropped a malformed tool call (")
+    assert "for tool" not in content
+    finish_chunk = next(
+        chunk
+        for chunk in chunks
+        if chunk["choices"] and chunk["choices"][0]["finish_reason"] is not None
+    )
+    assert finish_chunk["choices"][0]["finish_reason"] == "stop"
+
+
+@pytest.mark.asyncio
+async def test_streaming_malformed_tool_call_flushes_held_text(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [
+            TextDelta("working on EN"),
+            TextDelta(f"{TOOL_CALL_OPEN}not json{TOOL_CALL_CLOSE}"),
+            RunComplete(Usage()),
+        ]
+    )
+    payload = _payload(
+        stream=True,
+        stop="END",
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ],
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    chunks = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith('data: {"')
+    ]
+    content = "".join(
+        choice["delta"].get("content") or ""
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+    )
+    assert content.startswith("working on EN\n\n[bridge notice:")
+
+
+@pytest.mark.asyncio
+async def test_stream_generator_drops_note_for_structured_output() -> None:
+    schema = {"type": "object"}
+    validator_class = validator_for(schema)
+    structured = StructuredOutput(
+        payload={"type": "json_schema", "schema": schema},
+        validator=validator_class(schema),
+        max_bytes=1024,
+    )
+    runner = FakeRunner(
+        [
+            TextDelta(f"{TOOL_CALL_OPEN}not json{TOOL_CALL_CLOSE}"),
+            RunComplete(Usage()),
+        ]
+    )
+
+    events = await _collect_stream(
+        runner,
+        allowed_tool_names=frozenset({"weather"}),
+        structured=structured,
+    )
+
+    assert any('"finish_reason":"stop"' in event for event in events)
+    assert not any("bridge notice" in event for event in events)
+
+
+@pytest.mark.asyncio
+async def test_stream_generator_drops_held_text_for_structured_output() -> None:
+    schema = {"type": "object"}
+    validator_class = validator_for(schema)
+    structured = StructuredOutput(
+        payload={"type": "json_schema", "schema": schema},
+        validator=validator_class(schema),
+        max_bytes=1024,
+    )
+    runner = FakeRunner(
+        [
+            TextDelta("working on EN"),
+            TextDelta(f"{TOOL_CALL_OPEN}not json{TOOL_CALL_CLOSE}"),
+            RunComplete(Usage()),
+        ]
+    )
+
+    events = await _collect_stream(
+        runner,
+        allowed_tool_names=frozenset({"weather"}),
+        stop_sequences=("END",),
+        structured=structured,
+    )
+
+    assert any('"finish_reason":"stop"' in event for event in events)
+    assert not any("working on" in event for event in events)
+    assert not any("bridge notice" in event for event in events)
 
 
 @pytest.mark.asyncio
@@ -1564,6 +1698,7 @@ async def test_non_streaming_truncation_overrides_completed_tool_calls(tmp_path:
     ("state", "expected"),
     [
         ({"stream_outcome": "truncated"}, "truncated"),
+        ({"stream_outcome": "malformed"}, "malformed"),
         ({}, "success"),
     ],
 )

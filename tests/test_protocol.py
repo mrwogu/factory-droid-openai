@@ -604,6 +604,15 @@ def test_stream_parser_malformed_error_without_recognized_name() -> None:
     assert excinfo.value.tool_name is None
 
 
+def test_stream_parser_finish_after_malformed_does_not_reraise() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    with pytest.raises(MalformedToolCallError):
+        parser.feed(f"{TOOL_CALL_OPEN}not json{TOOL_CALL_CLOSE}")
+
+    assert parser.finish() == []
+
+
 def test_stream_parser_logs_unparsed_payload_details() -> None:
     stream = io.StringIO()
     logs.configure_logging(level="trace", log_format="json", stream=stream)
