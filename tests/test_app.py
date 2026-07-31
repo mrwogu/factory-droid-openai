@@ -24,11 +24,16 @@ from factory_droid_openai.app import (
     _content_length,
     _finalize_stream,
     _JsonDepthTracker,
+    _latency_bucket,
+    _model_family,
+    _payload_size_bucket,
     _request_mode,
     _request_outcome,
     _request_route,
+    _request_telemetry_features,
     _RequestPayloadLimitError,
     _stream_completion,
+    _telemetry_error_category,
     _validation_message,
     _wait_for_disconnect,
     create_app,
@@ -1715,6 +1720,95 @@ def test_request_telemetry_classifies_routes_and_modes() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("factory-droid", "factory_default"),
+        ("gpt-5.4", "gpt"),
+        ("gemini-3.1-pro", "gemini"),
+        ("claude-sonnet", "claude"),
+        ("custom-model", "other"),
+    ],
+)
+def test_model_family_is_coarse_and_stable(model: str, expected: str) -> None:
+    assert _model_family(model) == expected
+
+
+@pytest.mark.parametrize(
+    ("seconds", "expected"),
+    [
+        (0.099, "lt_100ms"),
+        (0.1, "100ms_500ms"),
+        (0.5, "500ms_1s"),
+        (1.0, "1s_5s"),
+        (5.0, "5s_30s"),
+        (30.0, "gt_30s"),
+    ],
+)
+def test_latency_bucket_is_bounded(seconds: float, expected: str) -> None:
+    assert _latency_bucket(seconds) == expected
+
+
+@pytest.mark.parametrize(
+    ("size", "expected"),
+    [
+        (0, "empty"),
+        (10_239, "lt_10kb"),
+        (10_240, "10kb_100kb"),
+        (102_400, "100kb_1mb"),
+        (1_048_576, "gt_1mb"),
+    ],
+)
+def test_payload_size_bucket_is_bounded(size: int, expected: str) -> None:
+    assert _payload_size_bucket(size) == expected
+
+
+def test_request_telemetry_features_use_only_coarse_dimensions() -> None:
+    scope = cast(
+        "Any",
+        {
+            "path": "/v1/chat/completions",
+            "state": {
+                "telemetry_model_family": "gpt",
+                "payload_size_bucket": "10kb_100kb",
+            },
+        },
+    )
+
+    features = _request_telemetry_features(scope, status_code=504, seconds=5.0)
+
+    assert features == (
+        "request_latency:chat_completions:5s_30s",
+        "request_payload:chat_completions:10kb_100kb",
+        "model_family:gpt",
+        "request_error:chat_completions:timeout",
+    )
+
+
+@pytest.mark.parametrize(
+    ("status_code", "outcome", "expected"),
+    [
+        (429, "error", "rate_limited"),
+        (401, "error", "authentication"),
+        (404, "error", "not_found"),
+        (200, "success", "other"),
+    ],
+)
+def test_telemetry_error_category_covers_status_fallbacks(
+    status_code: int,
+    outcome: str,
+    expected: str,
+) -> None:
+    assert (
+        _telemetry_error_category(
+            cast("Any", {"state": {}}),
+            status_code=status_code,
+            outcome=outcome,
+        )
+        == expected
+    )
+
+
 @pytest.mark.asyncio
 async def test_chat_endpoint_requires_configured_bearer_token(tmp_path: Path) -> None:
     runner = FakeRunner([RunComplete(Usage())])
@@ -3171,6 +3265,21 @@ async def test_lifespan_flushes_anonymous_telemetry(
     assert {"name": "feature", "feature": "tools", "count": 1} in events
     assert {"name": "feature", "feature": "reasoning_effort", "count": 1} in events
     assert {"name": "feature", "feature": "multiple_choices", "count": 1} in events
+    assert {
+        "name": "feature",
+        "feature": "model_family:factory_default",
+        "count": 1,
+    } in events
+    assert any(
+        event["name"] == "feature"
+        and str(event["feature"]).startswith("request_latency:chat_completions:")
+        for event in events
+    )
+    assert any(
+        event["name"] == "feature"
+        and str(event["feature"]).startswith("request_payload:chat_completions:")
+        for event in events
+    )
     assert "Hello" not in json.dumps(payloads)
     assert "factory-droid" not in json.dumps(payloads)
 

@@ -1184,14 +1184,19 @@ Collected fields:
   CPU architecture
 - route category, streaming mode, outcome category, request count, and aggregate
   duration
+- coarse latency buckets by route, payload-size buckets by route, and normalized
+  model family
+- coarse error category by route, without error messages
 - counts for tools, structured output, attachments, reasoning effort, session
   continuity, multiple choices, and warm-session use
 - aggregate warm-pool, model-discovery, quarantine, and forced-kill counters
 
-Telemetry never includes prompts, responses, model or tool names, tool
-arguments, attachment contents, file paths, environment variables, API keys,
-IP addresses, host User-Agent values, client timestamps, or a persistent
-installation identifier. The request body is built in
+Telemetry never includes prompts, responses, full model names, tool names, tool
+arguments, attachment contents, file paths, environment variables, API keys, IP
+addresses, host User-Agent values, client timestamps, or a persistent
+installation identifier. Model usage is reduced to a fixed family such as
+`gpt`, `gemini`, or `other`; latency and payload size use fixed buckets. The
+request body is built in
 [`src/factory_droid_openai/telemetry.py`](src/factory_droid_openai/telemetry.py),
 so every field the bridge sends can be verified from this repository.
 

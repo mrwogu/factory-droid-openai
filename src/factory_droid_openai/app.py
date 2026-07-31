@@ -97,6 +97,26 @@ BearerCredentials = Annotated[
 # timeout budget.
 _WARM_TIMEOUT_CEILING = 120.0
 _BRIDGE_VERSION = "1.5.0"  # x-release-please-version
+_LATENCY_BUCKETS = (
+    (0.1, "lt_100ms"),
+    (0.5, "100ms_500ms"),
+    (1.0, "500ms_1s"),
+    (5.0, "1s_5s"),
+    (30.0, "5s_30s"),
+)
+_PAYLOAD_SIZE_BUCKETS = (
+    (10_240, "lt_10kb"),
+    (102_400, "10kb_100kb"),
+    (1_048_576, "100kb_1mb"),
+)
+_MODEL_FAMILY_PREFIXES = (
+    (("gpt-", "o1", "o3", "o4"), "gpt"),
+    (("gemini",), "gemini"),
+    (("claude",), "claude"),
+    (("qwen",), "qwen"),
+    (("kimi",), "kimi"),
+    (("deepseek",), "deepseek"),
+)
 
 CHAT_COMPLETION_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {
@@ -508,10 +528,15 @@ class RequestSizeLimitMiddleware:
             if message["type"] == "http.response.start":
                 response_started = True
                 status_code = int(message["status"])
+                _set_request_state(scope, status_code=status_code)
             await send(message)
 
         try:
             if content_length is not None and content_length > self._max_request_bytes:
+                _set_request_state(
+                    scope,
+                    payload_size_bucket=_payload_size_bucket(content_length),
+                )
                 status_code = 413
                 self._metrics.increment_payload_rejections()
                 await _send_payload_too_large(
@@ -527,6 +552,7 @@ class RequestSizeLimitMiddleware:
                     max_request_bytes=self._max_request_bytes,
                     max_json_depth=self._max_json_depth,
                 )
+            _set_request_state(scope, payload_size_bucket=_payload_size_bucket(len(body)))
             # FastAPI binds the body with Pydantic, which keeps the last value for
             # a repeated key instead of rejecting it. A duplicate key in the raw
             # request body is almost always a client bug, so the bridge fails
@@ -583,12 +609,18 @@ class RequestSizeLimitMiddleware:
         except _ClientDisconnectedError:
             status_code = 499
         finally:
+            elapsed = time.perf_counter() - started
             self._metrics.record_request(
                 _request_outcome(status_code, scope),
                 status_code,
-                time.perf_counter() - started,
+                elapsed,
                 route=_request_route(scope),
                 mode=_request_mode(scope),
+                features=_request_telemetry_features(
+                    scope,
+                    status_code=status_code,
+                    seconds=elapsed,
+                ),
             )
 
 
@@ -756,7 +788,8 @@ def create_app(
             )
 
     @application.exception_handler(BridgeHTTPError)
-    async def handle_bridge_error(_request: Request, exc: BridgeHTTPError) -> JSONResponse:
+    async def handle_bridge_error(request: Request, exc: BridgeHTTPError) -> JSONResponse:
+        request.state.telemetry_error_type = exc.error_type
         return _error_response(
             exc.message,
             exc.status_code,
@@ -766,9 +799,10 @@ def create_app(
 
     @application.exception_handler(RequestValidationError)
     async def handle_validation_error(
-        _request: Request,
+        request: Request,
         exc: RequestValidationError,
     ) -> JSONResponse:
+        request.state.telemetry_error_type = "invalid_request_error"
         return _error_response(
             _validation_message(exc),
             400,
@@ -1080,6 +1114,7 @@ def create_app(
         # Requests rejected before the handler (validation, auth, request size)
         # never reach this line, so they stay reported as "not_applicable".
         request.state.telemetry_mode = "stream" if payload.stream else "non_stream"
+        request.state.telemetry_model_family = _model_family(payload.model)
         timeout_seconds = min(
             payload.timeout or resolved_settings.timeout_seconds,
             resolved_settings.timeout_seconds,
@@ -1103,18 +1138,21 @@ def create_app(
 
         rejection = _validate_options(payload, resolved_settings)
         if rejection is not None:
+            request.state.telemetry_error_type = "invalid_request_error"
             log_warning("chat.rejected", status=rejection.status_code, phase="options")
             return rejection
 
         session_id: str | None = None
         if payload.factory_droid_session_id is not None:
             if not resolved_settings.session_continuity:
+                request.state.telemetry_error_type = "invalid_request_error"
                 return _error_response(
                     "Session continuity is disabled on this bridge.",
                     400,
                     "invalid_request_error",
                 )
             if not sessions.knows(payload.factory_droid_session_id):
+                request.state.telemetry_error_type = "session_not_found"
                 return _error_response(
                     "Unknown Factory Droid session. Only sessions created by this "
                     "bridge process can be continued.",
@@ -1145,9 +1183,11 @@ def create_app(
             )
         except RequestTooLargeError as exc:
             metrics.increment_payload_rejections()
+            request.state.telemetry_error_type = "invalid_request_error"
             log_warning("chat.rejected", status=413, phase="prompt", reason=str(exc))
             return _error_response(str(exc), 413, "invalid_request_error")
         except ProtocolError as exc:
+            request.state.telemetry_error_type = "invalid_request_error"
             log_warning("chat.rejected", status=400, phase="prompt", reason=str(exc))
             return _error_response(str(exc), 400, "invalid_request_error")
 
@@ -1166,11 +1206,13 @@ def create_app(
         try:
             reasoning_effort = normalize_reasoning_effort(reasoning_effort)
         except RunnerError as exc:
+            request.state.telemetry_error_type = exc.error_type
             log_warning("chat.rejected", status=exc.status_code, phase="reasoning_effort")
             return _error_response(str(exc), exc.status_code, exc.error_type)
 
         quarantined = quarantine.reason(payload.model)
         if quarantined is not None:
+            request.state.telemetry_error_type = "model_not_found"
             log_warning("chat.rejected", status=404, phase="model", model=payload.model)
             return _error_response(quarantined, 404, "model_not_found")
 
@@ -1207,6 +1249,7 @@ def create_app(
             lease = await admission.acquire(deadline)
         except AdmissionRejectedError:
             metrics.increment_overload_rejections()
+            request.state.telemetry_error_type = "rate_limit_error"
             log_warning("chat.rejected", status=429, phase="queue")
             return _error_response(
                 "Factory Droid request queue is full.",
@@ -1215,6 +1258,7 @@ def create_app(
                 headers={"Retry-After": str(resolved_settings.retry_after_seconds)},
             )
         except TimeoutError:
+            request.state.telemetry_error_type = "factory_droid_timeout"
             log_warning(
                 "chat.rejected",
                 status=504,
@@ -1326,6 +1370,7 @@ def create_app(
                         stop_sequences=payload.stop_sequences,
                     )
                     if result is None:
+                        request.state.telemetry_error_type = "client_disconnected"
                         return _error_response(
                             "Client disconnected.",
                             499,
@@ -1343,6 +1388,7 @@ def create_app(
                     total_usage = _add_usage(total_usage, result.usage)
                     choices.append(_choice_dict(result, index))
         except ProtocolError as exc:
+            request.state.telemetry_error_type = "factory_protocol_error"
             log_warning(
                 "chat.failed",
                 status=502,
@@ -1351,6 +1397,7 @@ def create_app(
             )
             return _error_response(str(exc), 502, "factory_protocol_error")
         except RunnerError as exc:
+            request.state.telemetry_error_type = exc.error_type
             log_warning("chat.failed", status=exc.status_code, error_type=exc.error_type)
             note_runner_failure(payload.model, exc)
             return _error_response(str(exc), exc.status_code, exc.error_type)
@@ -2257,6 +2304,45 @@ def _content_length(scope: Scope) -> int | None:
     return None
 
 
+def _set_request_state(scope: Scope, **values: object) -> None:
+    state = scope.get("state")
+    if not isinstance(state, dict):
+        state = {}
+        scope["state"] = state
+    state.update(values)
+
+
+def _request_state(scope: Scope) -> dict[str, object]:
+    state = scope.get("state")
+    return state if isinstance(state, dict) else {}
+
+
+def _payload_size_bucket(size: int) -> str:
+    if size <= 0:
+        return "empty"
+    for upper, bucket in _PAYLOAD_SIZE_BUCKETS:
+        if size < upper:
+            return bucket
+    return "gt_1mb"
+
+
+def _latency_bucket(seconds: float) -> str:
+    for upper, bucket in _LATENCY_BUCKETS:
+        if seconds < upper:
+            return bucket
+    return "gt_30s"
+
+
+def _model_family(model: str) -> str:
+    normalized = model.strip().lower()
+    if normalized == "factory-droid":
+        return "factory_default"
+    for prefixes, family in _MODEL_FAMILY_PREFIXES:
+        if normalized.startswith(prefixes):
+            return family
+    return "other"
+
+
 def _json_content_type(scope: Scope) -> bool:
     for name, value in scope.get("headers", []):
         if name.lower() != b"content-type":
@@ -2357,12 +2443,80 @@ def _request_route(scope: Scope) -> str:
 
 
 def _request_mode(scope: Scope) -> str:
-    state = scope.get("state")
-    if isinstance(state, dict):
-        mode = state.get("telemetry_mode")
-        if mode in {"stream", "non_stream"}:
-            return str(mode)
+    mode = _request_state(scope).get("telemetry_mode")
+    if mode in {"stream", "non_stream"}:
+        return str(mode)
     return "not_applicable"
+
+
+def _telemetry_error_category(
+    scope: Scope,
+    *,
+    status_code: int,
+    outcome: str,
+) -> str:
+    error_type = _request_state(scope).get("telemetry_error_type")
+    if isinstance(error_type, str):
+        categories = {
+            "authentication_error": "authentication",
+            "client_disconnected": "cancelled",
+            "factory_droid_timeout": "timeout",
+            "factory_incomplete_response": "incomplete_response",
+            "factory_protocol_error": "protocol",
+            "factory_droid_sdk_error": "sdk",
+            "invalid_request_error": "invalid_request",
+            "model_not_found": "model_not_found",
+            "rate_limit_error": "rate_limited",
+            "session_not_found": "session_not_found",
+        }
+        return categories.get(error_type, "other")
+    if outcome in {"cancelled"} or status_code == 499:
+        return "cancelled"
+    if outcome in {"malformed", "truncated"}:
+        return "protocol"
+    if outcome == "error" and status_code < 400:
+        return "stream_error"
+    if status_code == 413:
+        return "payload_too_large"
+    if status_code == 429:
+        return "rate_limited"
+    if status_code in {408, 504}:
+        return "timeout"
+    if status_code == 401:
+        return "authentication"
+    if status_code == 404:
+        return "not_found"
+    if 400 <= status_code < 500:
+        return "invalid_request"
+    if status_code >= 500:
+        return "server_error"
+    return "other"
+
+
+def _request_telemetry_features(
+    scope: Scope,
+    *,
+    status_code: int,
+    seconds: float,
+) -> tuple[str, ...]:
+    route = _request_route(scope)
+    state = _request_state(scope)
+    outcome = _request_outcome(status_code, scope)
+    features = [
+        f"request_latency:{route}:{_latency_bucket(max(0.0, seconds))}",
+        f"request_payload:{route}:{state.get('payload_size_bucket', 'unknown')}",
+    ]
+    model_family = state.get("telemetry_model_family")
+    if route == "chat_completions" and isinstance(model_family, str):
+        features.append(f"model_family:{model_family}")
+    if outcome != "success":
+        error_category = _telemetry_error_category(
+            scope,
+            status_code=status_code,
+            outcome=outcome,
+        )
+        features.append(f"request_error:{route}:{error_category}")
+    return tuple(features)
 
 
 def _observe_ttft(
