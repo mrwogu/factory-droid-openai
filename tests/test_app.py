@@ -200,6 +200,8 @@ class GateRunner(FakeRunner):
 
 
 class ToolCallBlockingRunner(FakeRunner):
+    """Emits one complete tool call, then trailing events, then never completes."""
+
     def __init__(self, events: list[RunEvent]) -> None:
         super().__init__(events)
         self.started = asyncio.Event()
@@ -212,7 +214,28 @@ class ToolCallBlockingRunner(FakeRunner):
                 f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Hel"}}}}'
                 f"{TOOL_CALL_CLOSE}"
             )
+            for event in self.events:
+                yield event
             await asyncio.Event().wait()
+        finally:
+            self.closed = True
+
+
+class ToolCallFailingRunner(FakeRunner):
+    """Emits one complete tool call, then fails the turn."""
+
+    def __init__(self, failure: RunnerError) -> None:
+        super().__init__([])
+        self.failure = failure
+
+    async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
+        self.requests.append(request)
+        try:
+            yield TextDelta(
+                f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Hel"}}}}'
+                f"{TOOL_CALL_CLOSE}"
+            )
+            raise self.failure
         finally:
             self.closed = True
 
@@ -832,6 +855,140 @@ async def test_tool_call_timeout_without_turn_complete_returns_completion(
 
 
 @pytest.mark.asyncio
+async def test_tool_call_drain_keeps_usage_reported_by_the_sdk(tmp_path: Path) -> None:
+    runner = ToolCallBlockingRunner([UsageUpdate(Usage(11, 4, 1, 0))])
+    payload = _payload(
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ],
+        tool_choice="required",
+    )
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["usage"]["total_tokens"] == 15
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_backend_timeout_after_tool_call_returns_the_call(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    # Cancelling the drained event races the runner deadline, which reports
+    # the cancellation as a backend timeout even though the call is complete.
+    runner = ToolCallFailingRunner(
+        RunnerError(
+            "Factory Droid timed out after 30.0 seconds.",
+            status_code=504,
+            error_type="factory_droid_timeout",
+        )
+    )
+    payload = _payload(
+        stream=stream,
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ],
+        tool_choice="required",
+    )
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    if stream:
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and not line.endswith("[DONE]")
+        ]
+        assert events[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    else:
+        assert response.json()["choices"][0]["finish_reason"] == "tool_calls"
+
+
+@pytest.mark.asyncio
+async def test_other_failures_after_a_tool_call_still_surface(tmp_path: Path) -> None:
+    runner = ToolCallFailingRunner(
+        RunnerError("Factory Droid SDK failed: boom", error_type="factory_droid_sdk_error")
+    )
+    payload = _payload(
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ],
+        tool_choice="required",
+    )
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "factory_droid_sdk_error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_truncated_payload_after_a_tool_call_keeps_tool_calls_finish(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    # "length" would make the client ask the model to continue instead of
+    # running the call it already received.
+    runner = FakeRunner(
+        [
+            TextDelta(
+                f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Hel"}}}}'
+                f"{TOOL_CALL_CLOSE}"
+            ),
+            TextDelta(f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Kr'),
+            RunComplete(Usage()),
+        ]
+    )
+    payload = _payload(
+        stream=stream,
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ],
+    )
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    if stream:
+        chunks = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and not line.endswith("[DONE]")
+        ]
+        finish_reasons = [
+            choice["finish_reason"]
+            for chunk in chunks
+            for choice in chunk["choices"]
+            if choice["finish_reason"] is not None
+        ]
+        assert finish_reasons == ["tool_calls"]
+    else:
+        choice = response.json()["choices"][0]
+        assert choice["finish_reason"] == "tool_calls"
+        assert len(choice["message"]["tool_calls"]) == 1
+
+
+@pytest.mark.asyncio
 async def test_streaming_chat_completion_uses_openai_sse(tmp_path: Path) -> None:
     usage = Usage(8, 3, 1, 0)
     runner = FakeRunner(
@@ -1217,19 +1374,21 @@ async def test_invalid_tool_name_is_rejected_before_runner(tmp_path: Path) -> No
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("field", ["max_tokens", "max_completion_tokens"])
-async def test_token_limit_fields_are_rejected_explicitly(
+async def test_token_limit_fields_are_accepted_and_ignored(
     tmp_path: Path,
     field: str,
 ) -> None:
-    runner = FakeRunner([RunComplete(Usage())])
+    # Copilot, litellm and LangChain send these by default; rejecting them
+    # would break every one of those clients.
+    runner = FakeRunner([TextDelta("Hi"), RunComplete(Usage())])
     payload = _payload(**{field: 5})
 
     async with _client(_app(tmp_path, runner)) as client:
         response = await client.post("/v1/chat/completions", json=payload)
 
-    assert response.status_code == 400
-    assert "not supported" in response.json()["error"]["message"]
-    assert runner.requests == []
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["finish_reason"] == "stop"
+    assert len(runner.requests) == 1
 
 
 @pytest.mark.asyncio
@@ -1823,7 +1982,7 @@ async def test_lost_prefix_repair_recovers_tool_call_when_enabled(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_non_streaming_truncation_overrides_completed_tool_calls(tmp_path: Path) -> None:
+async def test_non_streaming_truncation_keeps_completed_tool_calls(tmp_path: Path) -> None:
     complete = (
         f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Gdansk"}}}}{TOOL_CALL_CLOSE}'
     )
@@ -1842,7 +2001,7 @@ async def test_non_streaming_truncation_overrides_completed_tool_calls(tmp_path:
         response = await client.post("/v1/chat/completions", json=payload)
 
     choice = response.json()["choices"][0]
-    assert choice["finish_reason"] == "length"
+    assert choice["finish_reason"] == "tool_calls"
     assert len(choice["message"]["tool_calls"]) == 1
     assert choice["message"]["tool_calls"][0]["function"]["name"] == "weather"
 

@@ -116,6 +116,34 @@ def test_build_prompt_rejects_malformed_assistant_tool_arguments(arguments: str)
         build_prompt(request)
 
 
+@pytest.mark.parametrize("arguments", ["", "   "])
+def test_build_prompt_normalizes_blank_assistant_tool_arguments(arguments: str) -> None:
+    request = _request(
+        messages=[
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_old",
+                        "type": "function",
+                        "function": {"name": "weather", "arguments": arguments},
+                    }
+                ],
+            }
+        ]
+    )
+
+    plan = build_prompt(request)
+    serialized = plan.prompt.split("OPENAI_TRANSCRIPT_JSON\n", 1)[1].split(
+        "\nEND_OPENAI_TRANSCRIPT_JSON",
+        1,
+    )[0]
+    transcript = json.loads(serialized)
+
+    assert transcript["messages"][0]["tool_calls"][0]["function"]["arguments"] == "{}"
+
+
 def test_build_prompt_shows_a_concrete_tool_call_example() -> None:
     request = _request(
         tools=[

@@ -34,6 +34,7 @@ _ENVIRONMENT_KEYS = (
     "FACTORY_DROID_OPENAI_PROCESS_GRACE_SECONDS",
     "FACTORY_DROID_OPENAI_CLEANUP_TIMEOUT_SECONDS",
     "FACTORY_DROID_OPENAI_MAX_TOOL_CALLS",
+    "FACTORY_DROID_OPENAI_TOOL_CALL_DRAIN_SECONDS",
     "FACTORY_DROID_OPENAI_MAX_ATTACHMENTS",
     "FACTORY_DROID_OPENAI_MAX_ATTACHMENT_BYTES",
     "FACTORY_DROID_OPENAI_MAX_CHOICES",
@@ -414,6 +415,7 @@ def test_settings_read_feature_limits_from_environment(
     prompt_file.write_text("extra instructions", encoding="utf-8")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
     monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_TOOL_CALLS", "3")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_TOOL_CALL_DRAIN_SECONDS", "1.5")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_ATTACHMENTS", "0")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_ATTACHMENT_BYTES", "1024")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_CHOICES", "2")
@@ -429,6 +431,7 @@ def test_settings_read_feature_limits_from_environment(
     settings = Settings.from_env()
 
     assert settings.max_tool_calls == 3
+    assert settings.tool_call_drain_seconds == 1.5
     assert settings.max_attachments == 0
     assert settings.max_attachment_bytes == 1024
     assert settings.max_choices == 2

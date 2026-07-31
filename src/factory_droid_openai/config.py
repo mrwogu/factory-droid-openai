@@ -12,6 +12,11 @@ from factory_droid_openai.payloadlog import PAYLOAD_TRACE_MODES
 
 _REASONING_EFFORTS: tuple[str, ...] = tuple(effort.value for effort in ReasoningEffort)
 
+# Droid does not always emit a completion event after a client-side tool call,
+# so the bridge stops waiting this long after one arrives. Raise it when a
+# model spreads parallel calls over slower gaps than this.
+DEFAULT_TOOL_CALL_DRAIN_SECONDS = 0.5
+
 
 @dataclass(frozen=True, slots=True)
 class Settings:
@@ -37,6 +42,7 @@ class Settings:
     server_limit_concurrency: int = 64
     server_backlog: int = 128
     max_tool_calls: int = 8
+    tool_call_drain_seconds: float = DEFAULT_TOOL_CALL_DRAIN_SECONDS
     max_attachments: int = 16
     max_attachment_bytes: int = 8_388_608
     max_choices: int = 4
@@ -186,6 +192,10 @@ class Settings:
             "FACTORY_DROID_OPENAI_MAX_TOOL_CALLS",
             default=8,
         )
+        tool_call_drain_seconds = _positive_float(
+            "FACTORY_DROID_OPENAI_TOOL_CALL_DRAIN_SECONDS",
+            default=DEFAULT_TOOL_CALL_DRAIN_SECONDS,
+        )
         max_attachments = _non_negative_int(
             "FACTORY_DROID_OPENAI_MAX_ATTACHMENTS",
             default=16,
@@ -279,6 +289,7 @@ class Settings:
             server_limit_concurrency=server_limit_concurrency,
             server_backlog=server_backlog,
             max_tool_calls=max_tool_calls,
+            tool_call_drain_seconds=tool_call_drain_seconds,
             max_attachments=max_attachments,
             max_attachment_bytes=max_attachment_bytes,
             max_choices=max_choices,

@@ -245,6 +245,19 @@ The bridge validates the tool name and JSON arguments, then returns a standard
 OpenAI `tool_calls` object. The OpenAI client executes the tool and sends its
 result in the next request.
 
+Tool names follow the OpenAI constraint: 1 to 64 characters of `A-Z`, `a-z`,
+`0-9`, `_` or `-`. A name with a dot, a colon, or any other character is
+rejected with `400` before Droid starts, both in `tools` and in assistant
+`tool_calls` a client replays. Replayed `arguments` must be a strict JSON
+object; a blank string is read as `{}`.
+
+A complete tool call ends the assistant turn. Droid does not always send a
+completion event after one, so the bridge waits
+`FACTORY_DROID_OPENAI_TOOL_CALL_DRAIN_SECONDS` for further events, then
+answers with `finish_reason="tool_calls"` instead of holding the request open
+until the backend timeout. Raise that value for models that spread parallel
+calls over longer gaps.
+
 A model sometimes answers in the chat template it was trained on instead of
 that contract. The bridge translates those forms into the same `tool_calls`
 object rather than failing the turn or leaking template tokens as assistant
@@ -267,7 +280,9 @@ text. Every accepted form lives in one table in
 Translation never widens validation. An unknown tool name, a duplicate
 argument key, or prose after a call still fails the turn. A truncated payload,
 or one no decoder can parse, ends the turn with `finish_reason="length"`
-instead; the partial or malformed call is dropped, never executed. Qwen3's
+instead; the partial or malformed call is dropped, never executed. When an
+earlier call in the same turn did complete, the turn keeps
+`finish_reason="tool_calls"` so the client runs the call it already received. Qwen3's
 XML form declares no argument types, so a scalar value stays the string the
 model wrote unless it wrote a JSON object or array.
 
@@ -873,7 +888,7 @@ tool calls through the official `openai` Python client.
 |---|---|---|
 | `model` | Yes | Alias uses Droid default; other values become Droid model IDs |
 | `messages` | Yes | Complete transcript serialized in original order |
-| `tools` | Yes | OpenAI function tools |
+| `tools` | Yes | OpenAI function tools; names must match `^[A-Za-z0-9_-]{1,64}$` |
 | `tool_choice` | Yes | `auto`, `none`, `required`, or one named function |
 | `stream` | Yes | OpenAI-compatible SSE chunks |
 | `stream_options.include_usage` | Yes | Emits null usage on normal chunks and one final usage-only chunk |
@@ -887,7 +902,7 @@ tool calls through the official `openai` Python client.
 | `factory_droid_reasoning_effort` | Yes | Bridge-specific override, wins over `reasoning_effort` |
 | `timeout` | Yes | Per-request value capped by server timeout |
 | `temperature`, `top_p`, penalties, `seed` | No | Accepted but ignored |
-| `max_tokens`, `max_completion_tokens` | No | Accepted but ignored |
+| `max_tokens`, `max_completion_tokens` | No | Accepted but ignored; Droid owns the output budget |
 | `response_format` | Yes | `json_schema` and `json_object`; validated again before completion |
 | `functions`, `function_call` | No | Legacy function-calling fields are ignored |
 | `modalities`, `audio` | No | Accepted but ignored |
@@ -958,6 +973,10 @@ maps to `404 model_not_found` and remembers for
 `x-factory-droid-models-quarantined` header, chat requests for it are refused
 without starting Droid, and the warm-session pool stops warming it. Set the
 value to `0` to disable quarantining.
+
+Droid reports some unusable model IDs mid-stream rather than when the session
+starts. Those map to the same `404 model_not_found` instead of running until
+the request timeout.
 
 ### Reasoning
 
@@ -1135,6 +1154,7 @@ followed by `[DONE]`.
 | `FACTORY_DROID_OPENAI_UVICORN_LIMIT_CONCURRENCY` | `64` | Uvicorn connection limit |
 | `FACTORY_DROID_OPENAI_UVICORN_BACKLOG` | `128` | Uvicorn listen backlog |
 | `FACTORY_DROID_OPENAI_MAX_TOOL_CALLS` | `8` | Tool calls accepted per Droid turn |
+| `FACTORY_DROID_OPENAI_TOOL_CALL_DRAIN_SECONDS` | `0.5` | Wait for further events after a complete tool call |
 | `FACTORY_DROID_OPENAI_REPAIR_LOST_PREFIX` | `false` | Repair tool-call payloads missing their opening `{"name":"` bytes |
 | `FACTORY_DROID_OPENAI_MAX_ATTACHMENTS` | `16` | Inline attachments per request |
 | `FACTORY_DROID_OPENAI_MAX_ATTACHMENT_BYTES` | `8388608` | Total encoded attachment bytes |
