@@ -233,7 +233,11 @@ async def test_bridge_reads_a_streamed_completion(e2e: ModuleType) -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         del request
-        return httpx.Response(200, text=body, headers={"x-request-id": "req-2"})
+        return httpx.Response(
+            200,
+            text=body,
+            headers={"x-request-id": "req-2", "content-type": "text/event-stream"},
+        )
 
     bridge = _bridge(e2e, handler)
     async with bridge.client:
@@ -294,10 +298,34 @@ async def test_bridge_flags_responses_that_are_not_completion_objects(
 
 
 @pytest.mark.asyncio
+async def test_a_stream_request_rejected_before_the_stream_reads_the_json_error(
+    e2e: ModuleType,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            404,
+            json={"error": {"type": "model_not_found", "message": "not for this account"}},
+        )
+
+    bridge = _bridge(e2e, handler)
+    async with bridge.client:
+        observation = await bridge.run("m", _scenario(e2e, stream=True))
+
+    assert observation.status == 404
+    assert observation.error_type == "model_not_found"
+    assert observation.error_message == "not for this account"
+
+
+@pytest.mark.asyncio
 async def test_bridge_flags_invalid_stream_json(e2e: ModuleType) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         del request
-        return httpx.Response(200, text="data: {oops\n\n")
+        return httpx.Response(
+            200,
+            text="data: {oops\n\n",
+            headers={"content-type": "text/event-stream"},
+        )
 
     bridge = _bridge(e2e, handler)
     async with bridge.client:
