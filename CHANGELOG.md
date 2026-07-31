@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.6.0](https://github.com/mrwogu/factory-droid-openai/compare/v1.5.0...v1.6.0) (2026-07-31)
+
+
+### Features
+
+* **protocol:** show a concrete tool-call example in the prompt ([#38](https://github.com/mrwogu/factory-droid-openai/issues/38)) ([bcc14ca](https://github.com/mrwogu/factory-droid-openai/commit/bcc14cada1276f453ee19595de22cd41a921141a))
+* **telemetry:** add privacy-safe aggregate dimensions ([#42](https://github.com/mrwogu/factory-droid-openai/issues/42)) ([7e4221b](https://github.com/mrwogu/factory-droid-openai/commit/7e4221b02b76670bbc236144602b8a5e9c879b0b))
+
+
+### Bug Fixes
+
+* **api:** reject duplicate keys in the raw request body ([#39](https://github.com/mrwogu/factory-droid-openai/issues/39)) ([dd75d60](https://github.com/mrwogu/factory-droid-openai/commit/dd75d60428d843c9d9953da02969c3d805f09c42))
+* **api:** stop+note on malformed tool calls instead of length ([#37](https://github.com/mrwogu/factory-droid-openai/issues/37)) ([54dd2d8](https://github.com/mrwogu/factory-droid-openai/commit/54dd2d80d53ce2132519b9406b41fb2c15d1e680))
+* **protocol:** repair python-call and mangled arg_key tool calls ([#36](https://github.com/mrwogu/factory-droid-openai/issues/36)) ([5bb9159](https://github.com/mrwogu/factory-droid-openai/commit/5bb9159014a16ef64e67fd240cd02143a0b892c8))
+* **runner:** report elapsed time in the timeout error message ([#40](https://github.com/mrwogu/factory-droid-openai/issues/40)) ([287d598](https://github.com/mrwogu/factory-droid-openai/commit/287d598c013ada5e9a470bf46e63582a81ca3066))
+
 ## [1.5.0](https://github.com/mrwogu/factory-droid-openai/compare/v1.4.1...v1.5.0) (2026-07-30)
 
 
