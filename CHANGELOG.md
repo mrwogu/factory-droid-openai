@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.1](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.0...v1.6.1) (2026-07-31)
+
+
+### Bug Fixes
+
+* **telemetry:** categorize mid-stream timeouts ([#43](https://github.com/mrwogu/factory-droid-openai/issues/43)) ([df70d96](https://github.com/mrwogu/factory-droid-openai/commit/df70d96aa5be3e1eec68aea7c5e83f260b806077))
+
 ## [1.6.0](https://github.com/mrwogu/factory-droid-openai/compare/v1.5.0...v1.6.0) (2026-07-31)
 
 
