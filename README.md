@@ -208,7 +208,7 @@ factory-droid-openai
 - Client disconnect cancellation
 - Discoverable, verified Factory-native tool disabling
 - Versioned and externally validated OpenAPI 3.1 contract
-- Strict typing, locked dependencies, and at least 95% branch coverage
+- Strict typing, locked dependencies, and 100% branch coverage
 
 ## How it works
 
