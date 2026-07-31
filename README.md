@@ -1401,6 +1401,12 @@ factory-droid-openai
 | `heads` | First 2048 and last 1024 characters of the payload |
 | `full` | Whole payload, capped at 1 MiB with `payload_truncated` set |
 
+Traced events cover the built prompt (`chat.prompt`), parser repairs, and the
+raw Droid event stream (`droid.event`, one record per text delta, reasoning
+delta, status, usage, and completion event). Session identifiers are never
+written. A `full` trace is what
+[`scripts/e2e_fixtures.py`](CONTRIBUTING.md#end-to-end-matrix) replays offline.
+
 Both variables are required together, and the destination must be an existing
 directory holding a regular non-symlink file path. The file is created mode
 `0600` and re-chmodded on every write.

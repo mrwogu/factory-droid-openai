@@ -47,6 +47,49 @@ uv run ruff format .
 
 CI runs tests on every supported Python version.
 
+## End-to-end matrix
+
+The default suite never talks to Factory. Behavior that only shows up with a
+real model is covered by a separate, manual loop: run the matrix, read the
+verdicts, fix, run again, compare.
+
+Start a bridge with payload tracing on, then run every scenario against every
+model the bridge lists:
+
+```bash
+export FACTORY_DROID_OPENAI_TRACE_PAYLOADS=full
+export FACTORY_DROID_OPENAI_TRACE_FILE="$PWD/traces/trace.jsonl"
+uv run factory-droid-openai &
+uv run python scripts/e2e_matrix.py run --out traces/run-a.jsonl
+```
+
+Each request becomes one JSONL row with a verdict. Only `bridge_defect` fails
+the run; `model_behavior`, `account_policy`, `capacity`,
+`provider_unavailable`, and `backend_timeout` describe the environment, not the
+code. Re-render a report or diff two runs after a change:
+
+```bash
+uv run python scripts/e2e_matrix.py report traces/run-a.jsonl
+uv run python scripts/e2e_matrix.py compare traces/run-a.jsonl traces/run-b.jsonl
+```
+
+`compare` exits non-zero on any pass to non-pass transition, which makes it the
+A/B tool for prompt and parser changes.
+
+Turn what a live run found into offline regression tests:
+
+```bash
+uv run python scripts/e2e_fixtures.py build \
+  --trace traces/trace.jsonl --run traces/run-a.jsonl
+```
+
+Each fixture in `tests/fixtures/events/` holds one recorded Droid event stream
+plus the contract it satisfied, and `tests/test_replay.py` replays all of them
+through the ASGI app on every test run. Live runs stay in `traces/`, which is
+gitignored: rows and traces carry model output and account-specific denials.
+Fixtures are committed, so review them for private prompt content before adding
+them.
+
 ## Change guidelines
 
 - Keep the bridge local-first and OpenAI-compatible.

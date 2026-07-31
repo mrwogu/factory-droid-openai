@@ -50,6 +50,16 @@ body:
       description: Output from `python --version`.
     validations:
       required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: >-
+        Model id sent in the request. Tool-call behavior differs per model, so
+        a report without it is hard to reproduce.
+      placeholder: claude-sonnet-4-5
+    validations:
+      required: true
   - type: dropdown
     id: response-mode
     attributes:
@@ -66,6 +76,20 @@ body:
       label: Sanitized logs
       description: Remove credentials, private paths, and sensitive prompt content.
       render: text
+  - type: textarea
+    id: recorded-events
+    attributes:
+      label: Recorded Droid events (optional, most useful)
+      description: >-
+        A recorded event stream turns this report into an offline regression
+        test. Restart the bridge with
+        `FACTORY_DROID_OPENAI_TRACE_PAYLOADS=full` and
+        `FACTORY_DROID_OPENAI_TRACE_FILE=/path/trace.jsonl`, reproduce once,
+        then paste the `droid.event` lines of that request:
+        `grep '"event": "droid.event"' /path/trace.jsonl`. Every line contains
+        the model output verbatim, so read it before pasting and remove
+        anything private. See the payload tracing section of the README.
+      render: json
   - type: checkboxes
     id: checks
     attributes:

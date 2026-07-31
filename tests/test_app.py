@@ -321,9 +321,53 @@ async def test_apps_keep_payload_tracing_configuration_isolated(tmp_path: Path) 
     assert disabled_response.status_code == 200
     assert enabled_response.status_code == 200
     records = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
-    assert len(records) == 1
-    assert "trace this" in records[0]["payload"]
-    assert "do not trace" not in records[0]["payload"]
+    prompts = [record for record in records if record["event"] == "chat.prompt"]
+    assert len(prompts) == 1
+    assert "trace this" in prompts[0]["payload"]
+    assert "do not trace" not in prompts[0]["payload"]
+
+
+@pytest.mark.asyncio
+async def test_payload_tracing_records_sdk_events_for_replay(tmp_path: Path) -> None:
+    trace_path = tmp_path / "trace.jsonl"
+    runner = FakeRunner(
+        [
+            SessionStarted("session-secret"),
+            StatusUpdate("executing_tool"),
+            ReasoningDelta("thinking"),
+            TextDelta("hello"),
+            UsageUpdate(Usage(input_tokens=1, output_tokens=1)),
+            RunComplete(Usage(input_tokens=1, output_tokens=2)),
+        ]
+    )
+    app = create_app(
+        Settings(
+            workdir=tmp_path,
+            trace_payloads="full",
+            trace_payload_file=trace_path,
+        ),
+        runner_factory=cast("RunnerFactory", lambda: runner),
+    )
+
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=_payload())
+
+    assert response.status_code == 200
+    records = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    events = [
+        json.loads(record["payload"]) for record in records if record["event"] == "droid.event"
+    ]
+    assert [event["kind"] for event in events] == [
+        "session_started",
+        "status",
+        "reasoning_delta",
+        "text_delta",
+        "usage",
+        "run_complete",
+    ]
+    assert events[3]["text"] == "hello"
+    assert events[5]["usage"]["completion_tokens"] == 2
+    assert "session-secret" not in trace_path.read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio
