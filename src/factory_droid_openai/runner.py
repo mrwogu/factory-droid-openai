@@ -60,7 +60,9 @@ _BASE_EXEC_ARGS = (
 # error, so the wording is the only signal that the model, not the bridge, is
 # at fault.
 _MODEL_DENIED_PATTERN = re.compile(
-    r"(?:model (?:is )?not (?:allowed|available|permitted|enabled)|invalid model id)",
+    r"(?:model (?:is )?not (?:allowed|available|permitted|enabled|found|deployed)"
+    r"|model (?:is )?inaccessible"
+    r"|invalid model id)",
     re.IGNORECASE,
 )
 
@@ -838,10 +840,10 @@ def _error_event_failure(event: ErrorEvent, *, model: str | None) -> RunnerError
     denied = _model_denied_error(message, model=model)
     if denied is not None:
         return denied
-    return RunnerError(
-        message,
-        error_type=event.error_type or "factory_droid_error",
-    )
+    # The SDK labels error events with its own class names, such as "Error".
+    # Forwarding those as OpenAI error types would put undocumented values in
+    # the public contract, so the detail stays in the message instead.
+    return RunnerError(message, error_type="factory_droid_error")
 
 
 def _model_denied_error(message: str, *, model: str | None) -> RunnerError | None:

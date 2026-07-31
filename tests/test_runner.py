@@ -276,12 +276,22 @@ async def test_runner_maps_sdk_error_event(tmp_path: Path) -> None:
     with pytest.raises(RunnerError, match="service failed") as error:
         _ = [event async for event in runner.run(_request())]
 
-    assert error.value.error_type == "ServiceError"
+    assert error.value.error_type == "factory_droid_error"
 
 
 @pytest.mark.asyncio
-async def test_runner_maps_invalid_model_error_event(tmp_path: Path) -> None:
-    client = FakeClient([ErrorEvent("Invalid model ID in request body", "Error")])
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Invalid model ID in request body",
+        "Model is not allowed for this organization",
+        # Verbatim from a provider that lists a model it cannot serve.
+        '404 {"error":{"message":"Model not found, inaccessible, and/or not deployed",'
+        '"param":"model","code":"NOT_FOUND","type":"error"}}',
+    ],
+)
+async def test_runner_maps_unusable_model_error_event(tmp_path: Path, message: str) -> None:
+    client = FakeClient([ErrorEvent(message, "Error")])
     runner = DroidRunner(
         droid_path="droid",
         workdir=tmp_path,
