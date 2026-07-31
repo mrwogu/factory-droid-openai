@@ -8,7 +8,7 @@ import secrets
 import time
 import uuid
 from collections import OrderedDict, deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Annotated, Any, TypeVar
 
@@ -21,7 +21,7 @@ from jsonschema.exceptions import SchemaError
 from jsonschema.validators import validator_for
 
 from factory_droid_openai.availability import ModelQuarantine
-from factory_droid_openai.config import Settings
+from factory_droid_openai.config import DEFAULT_TOOL_CALL_DRAIN_SECONDS, Settings
 from factory_droid_openai.droid_rpc import DroidRpcExtension
 from factory_droid_openai.logs import bind_request, current_timeline
 from factory_droid_openai.logs import debug as log_debug
@@ -66,6 +66,7 @@ from factory_droid_openai.runner import (
     DroidRunner,
     ReasoningDelta,
     RunComplete,
+    RunEvent,
     RunnerError,
     RunRequest,
     SessionKey,
@@ -1318,6 +1319,7 @@ def create_app(
                 expose_session=resolved_settings.session_continuity,
                 structured=structured,
                 failure_callback=note_runner_failure,
+                drain_seconds=resolved_settings.tool_call_drain_seconds,
             )
             return FinalizingStreamingResponse(
                 event_stream,
@@ -1369,6 +1371,7 @@ def create_app(
                         metrics=metrics,
                         request_started_at=request_started_at,
                         stop_sequences=payload.stop_sequences,
+                        drain_seconds=resolved_settings.tool_call_drain_seconds,
                     )
                     if result is None:
                         request.state.telemetry_error_type = "client_disconnected"
@@ -1470,6 +1473,47 @@ class CollectedCompletion:
         return "".join(self.reasoning_parts)
 
 
+async def _run_events(
+    runner: DroidRunner,
+    run_request: RunRequest,
+    *,
+    drain_seconds: float,
+    saw_tool_call: Callable[[], bool],
+) -> AsyncGenerator[RunEvent, None]:
+    """Yield runner events, bounding the wait once a tool call is complete.
+
+    Droid does not always emit TurnComplete after a client-side tool call, so
+    an unbounded ``async for`` stalls the client for the whole backend timeout.
+    A complete tool call is already a complete assistant turn: the bridge keeps
+    reading only while events arrive within ``drain_seconds``, which leaves
+    room for parallel calls the SDK has already queued.
+    """
+    async with contextlib.aclosing(runner.run(run_request)) as events:
+        iterator = events.__aiter__()
+        while True:
+            try:
+                if saw_tool_call():
+                    event = await asyncio.wait_for(
+                        iterator.__anext__(),
+                        timeout=drain_seconds,
+                    )
+                else:
+                    event = await iterator.__anext__()
+            except StopAsyncIteration:
+                return
+            except TimeoutError:
+                return
+            except RunnerError as exc:
+                if saw_tool_call() and exc.error_type == "factory_droid_timeout":
+                    # Cancelling the pending event can race the runner's own
+                    # deadline, which reports the cancellation as a backend
+                    # timeout. The turn already produced a tool call, so the
+                    # answer stands instead of turning into a 504.
+                    return
+                raise
+            yield event
+
+
 async def _collect_completion(
     *,
     runner: DroidRunner,
@@ -1478,11 +1522,19 @@ async def _collect_completion(
     metrics: BridgeMetrics | None = None,
     request_started_at: float | None = None,
     stop_sequences: tuple[str, ...] = (),
+    drain_seconds: float = DEFAULT_TOOL_CALL_DRAIN_SECONDS,
 ) -> CollectedCompletion:
     result = CollectedCompletion()
     stop_buffer = StopSequenceBuffer(stop_sequences)
     observed_ttft = False
-    async with contextlib.aclosing(runner.run(run_request)) as events:
+    async with contextlib.aclosing(
+        _run_events(
+            runner,
+            run_request,
+            drain_seconds=drain_seconds,
+            saw_tool_call=lambda: bool(result.tool_calls),
+        )
+    ) as events:
         async for event in events:
             if isinstance(event, TextDelta):
                 observed_ttft = _observe_ttft(
@@ -1491,7 +1543,8 @@ async def _collect_completion(
                     request_started_at,
                 )
                 try:
-                    _apply_emissions(result, parser.feed(event.text), stop_buffer)
+                    emissions = parser.feed(event.text)
+                    _apply_emissions(result, emissions, stop_buffer)
                 except MalformedToolCallError as exc:
                     # The payload closed but no decoder could parse it, so
                     # continuing the turn would only make the model repeat the
@@ -1531,6 +1584,11 @@ async def _collect_completion(
             elif isinstance(event, RunComplete):
                 result.usage = event.usage
                 result.completed = True
+                break
+    if result.tool_calls:
+        # A complete client tool call settles the turn even when the drain
+        # ended before Droid sent a completion event.
+        result.completed = True
     if not result.completed:
         raise RunnerError(
             "Factory Droid ended without a completion event.",
@@ -1571,6 +1629,7 @@ async def _collect_completion_or_disconnect(
     metrics: BridgeMetrics | None = None,
     request_started_at: float | None = None,
     stop_sequences: tuple[str, ...] = (),
+    drain_seconds: float = DEFAULT_TOOL_CALL_DRAIN_SECONDS,
 ) -> CollectedCompletion | None:
     completion_task = asyncio.create_task(
         _collect_completion(
@@ -1580,6 +1639,7 @@ async def _collect_completion_or_disconnect(
             metrics=metrics,
             request_started_at=request_started_at,
             stop_sequences=stop_sequences,
+            drain_seconds=drain_seconds,
         )
     )
     disconnect_task = asyncio.create_task(_wait_for_disconnect(request))
@@ -1625,6 +1685,7 @@ async def _stream_completion(
     expose_session: bool = False,
     structured: StructuredOutput | None = None,
     failure_callback: Callable[[str, RunnerError], None] | None = None,
+    drain_seconds: float = DEFAULT_TOOL_CALL_DRAIN_SECONDS,
 ) -> AsyncIterator[str]:
     usage = Usage()
     completed = False
@@ -1663,7 +1724,14 @@ async def _stream_completion(
             )
         )
         try:
-            async with contextlib.aclosing(runner.run(run_request)) as events:
+            async with contextlib.aclosing(
+                _run_events(
+                    runner,
+                    run_request,
+                    drain_seconds=drain_seconds,
+                    saw_tool_call=lambda: saw_tool_call,
+                )
+            ) as events:
                 async for event in events:
                     if isinstance(event, TextDelta):
                         observed_ttft = _observe_ttft(
@@ -1743,7 +1811,12 @@ async def _stream_completion(
                     elif isinstance(event, RunComplete):
                         usage = event.usage
                         completed = True
+                        break
 
+            if saw_tool_call:
+                # A complete client tool call settles the turn even when the
+                # drain ended before Droid sent a completion event.
+                completed = True
             if not completed:
                 raise RunnerError(
                     "Factory Droid ended without a completion event.",
@@ -1827,7 +1900,10 @@ async def _stream_completion(
                     created,
                     model,
                     delta={},
-                    finish_reason="length",
+                    # A call already on the wire outranks the truncated payload
+                    # that followed it, so the client runs it instead of asking
+                    # the model to continue.
+                    finish_reason="tool_calls" if saw_tool_call else "length",
                     include_usage=include_usage,
                 )
             )
@@ -2233,10 +2309,13 @@ def _choice_dict(result: CollectedCompletion, index: int) -> dict[str, Any]:
     if result.tool_calls:
         message["tool_calls"] = result.tool_calls
     finish_reason = "stop"
-    if result.truncated:
-        finish_reason = "length"
-    elif result.tool_calls:
+    if result.tool_calls:
+        # A captured call outranks a truncated payload that follows it: with
+        # "length" the client asks the model to continue instead of running
+        # the call it already received.
         finish_reason = "tool_calls"
+    elif result.truncated:
+        finish_reason = "length"
     return {
         "index": index,
         "message": message,

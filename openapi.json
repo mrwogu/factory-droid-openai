@@ -120,6 +120,30 @@
             "title": "Factory Droid Status",
             "type": "boolean"
           },
+          "max_completion_tokens": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Completion Tokens"
+          },
+          "max_tokens": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Tokens"
+          },
           "messages": {
             "items": {
               "$ref": "#/components/schemas/ChatMessage"
@@ -133,7 +157,7 @@
           },
           "n": {
             "default": 1,
-            "minimum": 1,
+            "minimum": 1.0,
             "title": "N",
             "type": "integer"
           },
@@ -213,7 +237,7 @@
           "timeout": {
             "anyOf": [
               {
-                "exclusiveMinimum": 0,
+                "exclusiveMinimum": 0.0,
                 "type": "number"
               },
               {
@@ -602,6 +626,9 @@
             "type": "string"
           },
           "name": {
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9_-]+$",
             "title": "Name",
             "type": "string"
           }
@@ -933,6 +960,9 @@
             "type": "string"
           },
           "name": {
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9_-]+$",
             "title": "Name",
             "type": "string"
           },
@@ -1101,6 +1131,16 @@
               }
             }
           },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
           "502": {
             "content": {
               "application/json": {
@@ -1130,16 +1170,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1206,6 +1236,16 @@
               }
             }
           },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
           "502": {
             "content": {
               "application/json": {
@@ -1235,16 +1275,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1319,6 +1349,16 @@
               }
             }
           },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
           "502": {
             "content": {
               "application/json": {
@@ -1348,16 +1388,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1434,6 +1464,16 @@
               }
             }
           },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
           "502": {
             "content": {
               "application/json": {
@@ -1463,16 +1503,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1539,6 +1569,16 @@
               }
             }
           },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
           "502": {
             "content": {
               "application/json": {
@@ -1568,16 +1608,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1644,6 +1674,16 @@
               }
             }
           },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
           "502": {
             "content": {
               "application/json": {
@@ -1673,16 +1713,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1736,6 +1766,16 @@
               }
             }
           },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
           "502": {
             "content": {
               "application/json": {
@@ -1765,16 +1805,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1849,6 +1879,16 @@
               }
             }
           },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
           "502": {
             "content": {
               "application/json": {
@@ -1878,16 +1918,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [

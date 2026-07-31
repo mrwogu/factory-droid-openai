@@ -60,7 +60,7 @@ _BASE_EXEC_ARGS = (
 # error, so the wording is the only signal that the model, not the bridge, is
 # at fault.
 _MODEL_DENIED_PATTERN = re.compile(
-    r"model (?:is )?not (?:allowed|available|permitted|enabled)",
+    r"(?:model (?:is )?not (?:allowed|available|permitted|enabled)|invalid model id)",
     re.IGNORECASE,
 )
 
@@ -502,9 +502,9 @@ class DroidRunner:
                             error_type="factory_native_tool_blocked",
                         )
                     elif isinstance(event, ErrorEvent):
-                        raise RunnerError(
-                            event.message or "Factory Droid returned an error.",
-                            error_type=event.error_type or "factory_droid_error",
+                        raise _error_event_failure(
+                            event,
+                            model=_resolve_model_id(request.model, request.model_alias),
                         )
         except (TimeoutError, DroidTimeoutError) as exc:
             raise RunnerError(
@@ -819,16 +819,39 @@ def sdk_error(exc: DroidClientError, *, model: str | None = None) -> RunnerError
     has to read as an unavailable model rather than a bridge failure.
     """
     message = str(exc)
-    if _MODEL_DENIED_PATTERN.search(message):
-        subject = f"Model '{model}'" if model else "The requested model"
-        return RunnerError(
-            f"{subject} is not available for this Factory account: {message}",
-            status_code=404,
-            error_type="model_not_found",
-        )
+    denied = _model_denied_error(message, model=model)
+    if denied is not None:
+        return denied
     return RunnerError(
         f"Factory Droid SDK failed: {message}",
         error_type="factory_droid_sdk_error",
+    )
+
+
+def _error_event_failure(event: ErrorEvent, *, model: str | None) -> RunnerError:
+    """Map a Droid error event onto the closest OpenAI-compatible error.
+
+    Droid reports an unusable model id mid-stream instead of failing the
+    session call, so the same denial wording decides the status code here.
+    """
+    message = event.message or "Factory Droid returned an error."
+    denied = _model_denied_error(message, model=model)
+    if denied is not None:
+        return denied
+    return RunnerError(
+        message,
+        error_type=event.error_type or "factory_droid_error",
+    )
+
+
+def _model_denied_error(message: str, *, model: str | None) -> RunnerError | None:
+    if not _MODEL_DENIED_PATTERN.search(message):
+        return None
+    subject = f"Model '{model}'" if model else "The requested model"
+    return RunnerError(
+        f"{subject} is not available for this Factory account: {message}",
+        status_code=404,
+        error_type="model_not_found",
     )
 
 

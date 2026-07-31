@@ -52,6 +52,7 @@ from factory_droid_openai.runner import (
     _create_client,
     _ManagedProcessTransport,
     _run_until,
+    sdk_error,
 )
 
 if TYPE_CHECKING:
@@ -276,6 +277,22 @@ async def test_runner_maps_sdk_error_event(tmp_path: Path) -> None:
         _ = [event async for event in runner.run(_request())]
 
     assert error.value.error_type == "ServiceError"
+
+
+@pytest.mark.asyncio
+async def test_runner_maps_invalid_model_error_event(tmp_path: Path) -> None:
+    client = FakeClient([ErrorEvent("Invalid model ID in request body", "Error")])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    with pytest.raises(RunnerError) as error:
+        _ = [event async for event in runner.run(_request(model="not-a-live-model"))]
+
+    assert error.value.status_code == 404
+    assert error.value.error_type == "model_not_found"
 
 
 class BlockingClient(FakeClient):
@@ -1311,6 +1328,17 @@ async def test_runner_reports_a_policy_blocked_model_as_unavailable(tmp_path: Pa
     assert caught.value.status_code == 404
     assert caught.value.error_type == "model_not_found"
     assert "claude-fable-5" in str(caught.value)
+
+
+def test_runner_maps_invalid_model_id_as_unavailable() -> None:
+    error = sdk_error(
+        DroidClientError('400 {"detail":"Invalid model ID in request body"}'),
+        model="not-a-live-model",
+    )
+
+    assert error.status_code == 404
+    assert error.error_type == "model_not_found"
+    assert "not-a-live-model" in str(error)
 
 
 @pytest.mark.asyncio

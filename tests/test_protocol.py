@@ -94,6 +94,56 @@ def test_build_prompt_preserves_openai_transcript_and_tools() -> None:
     assert plan.allowed_tool_names == frozenset({"weather"})
 
 
+@pytest.mark.parametrize("arguments", ['{"city":"A","city":"B"}', "[]"])
+def test_build_prompt_rejects_malformed_assistant_tool_arguments(arguments: str) -> None:
+    request = _request(
+        messages=[
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_old",
+                        "type": "function",
+                        "function": {"name": "weather", "arguments": arguments},
+                    }
+                ],
+            }
+        ]
+    )
+
+    with pytest.raises(ProtocolError, match="assistant tool-call arguments"):
+        build_prompt(request)
+
+
+@pytest.mark.parametrize("arguments", ["", "   "])
+def test_build_prompt_normalizes_blank_assistant_tool_arguments(arguments: str) -> None:
+    request = _request(
+        messages=[
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_old",
+                        "type": "function",
+                        "function": {"name": "weather", "arguments": arguments},
+                    }
+                ],
+            }
+        ]
+    )
+
+    plan = build_prompt(request)
+    serialized = plan.prompt.split("OPENAI_TRANSCRIPT_JSON\n", 1)[1].split(
+        "\nEND_OPENAI_TRANSCRIPT_JSON",
+        1,
+    )[0]
+    transcript = json.loads(serialized)
+
+    assert transcript["messages"][0]["tool_calls"][0]["function"]["arguments"] == "{}"
+
+
 def test_build_prompt_shows_a_concrete_tool_call_example() -> None:
     request = _request(
         tools=[
