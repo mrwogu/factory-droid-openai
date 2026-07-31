@@ -38,7 +38,7 @@
   ]
   testing: [
     "Cover behavior with unit, ASGI integration, official OpenAI client, and package smoke tests",
-    "Maintain at least 95 percent branch coverage",
+    "Maintain 100 percent branch coverage",
     "Run Ruff, strict mypy, pytest with coverage, OpenAPI validation, and uv build"
   ]
   git: {
