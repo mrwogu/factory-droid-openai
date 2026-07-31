@@ -29,6 +29,10 @@ def test_metrics_snapshot_contains_only_telemetry_dimensions() -> None:
         1.25,
         route="chat_completions",
         mode="stream",
+        features=(
+            "model_family:gpt",
+            "request_latency:chat_completions:1s_5s",
+        ),
     )
     metrics.record_request(
         "error",
@@ -61,7 +65,12 @@ def test_metrics_snapshot_contains_only_telemetry_dimensions() -> None:
         RequestMetric("health", "success", "not_applicable", 2, 1),
         RequestMetric("models", "error", "not_applicable", 1, 0),
     )
-    assert snapshot.features == (("attachments", 1), ("tools", 2))
+    assert snapshot.features == (
+        ("attachments", 1),
+        ("model_family:gpt", 1),
+        ("request_latency:chat_completions:1s_5s", 1),
+        ("tools", 2),
+    )
     assert snapshot.internal == (
         ("forced_kill", 1),
         ("model_discovery_failure", 1),

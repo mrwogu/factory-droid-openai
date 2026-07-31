@@ -58,6 +58,7 @@ class BridgeMetrics:
         *,
         route: str = "other",
         mode: str = "not_applicable",
+        features: tuple[str, ...] = (),
     ) -> None:
         with self._lock:
             self._request_totals[(outcome, status_code)] += 1
@@ -68,6 +69,7 @@ class BridgeMetrics:
             self._telemetry_request_duration_seconds[key] = (
                 self._telemetry_request_duration_seconds.get(key, 0.0) + max(0.0, seconds)
             )
+            self._telemetry_features.update(features)
 
     def record_features(self, features: tuple[str, ...]) -> None:
         with self._lock:
