@@ -18,3 +18,5 @@ Describe the change and why it is needed.
 - [ ] OpenAI response shapes remain compatible in streaming and non-streaming modes.
 - [ ] Factory-native tools remain blocked.
 - [ ] Documentation and tests cover user-visible behavior changes.
+- [ ] Behavior found against a live model is frozen as a replay fixture in
+      `tests/fixtures/events/`, or the reason it cannot be is stated above.
