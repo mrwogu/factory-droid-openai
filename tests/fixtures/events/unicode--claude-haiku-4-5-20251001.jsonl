@@ -1,0 +1,33 @@
+{"kind": "meta", "scenario": "unicode", "stream": false, "recorded_model": "claude-haiku-4-5-20251001", "expect_verdict": "pass"}
+{"kind": "session_started"}
+{"kind": "status", "state": "streaming_assistant_message"}
+{"kind": "usage", "usage": {"prompt_tokens": 492, "completion_tokens": 32, "total_tokens": 524, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "G"}
+{"kind": "text_delta", "text": "dańsk to"}
+{"kind": "text_delta", "text": " pi"}
+{"kind": "text_delta", "text": "ęk"}
+{"kind": "text_delta", "text": "ne"}
+{"kind": "text_delta", "text": " histor"}
+{"kind": "text_delta", "text": "yczne miasto na"}
+{"kind": "text_delta", "text": "d M"}
+{"kind": "text_delta", "text": "orzem B"}
+{"kind": "text_delta", "text": "ał"}
+{"kind": "text_delta", "text": "t"}
+{"kind": "text_delta", "text": "yckim, sł"}
+{"kind": "text_delta", "text": "yn"}
+{"kind": "text_delta", "text": "ne z"}
+{"kind": "text_delta", "text": " b"}
+{"kind": "text_delta", "text": "ogat"}
+{"kind": "text_delta", "text": "ej archit"}
+{"kind": "text_delta", "text": "ektury,"}
+{"kind": "text_delta", "text": " rat"}
+{"kind": "text_delta", "text": "usza"}
+{"kind": "text_delta", "text": " i znacz"}
+{"kind": "text_delta", "text": "ą"}
+{"kind": "text_delta", "text": "cej r"}
+{"kind": "text_delta", "text": "oli w pol"}
+{"kind": "text_delta", "text": "skiej"}
+{"kind": "text_delta", "text": " histor"}
+{"kind": "text_delta", "text": "ii."}
+{"kind": "status", "state": "idle"}
+{"kind": "run_complete", "usage": {"prompt_tokens": 492, "completion_tokens": 32, "total_tokens": 524, "prompt_tokens_details": {"cached_tokens": 0}}}

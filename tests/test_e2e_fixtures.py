@@ -98,6 +98,29 @@ def test_only_selected_rows_with_recorded_events_become_fixtures(
     }
 
 
+def test_reasoning_is_dropped_unless_it_is_asked_for(fixtures_script: ModuleType) -> None:
+    rows = [_row()]
+    events = {
+        "req-1": [
+            {"kind": "reasoning_delta", "text": "operator instructions quoted back"},
+            {"kind": "text_delta", "text": "a"},
+        ]
+    }
+
+    stripped = fixtures_script.build_fixtures(rows, events)
+    kept = fixtures_script.build_fixtures(rows, events, keep_reasoning=True)
+
+    assert [line["kind"] for line in stripped["tool-required--gpt-5-4.jsonl"]] == [
+        "meta",
+        "text_delta",
+    ]
+    assert [line["kind"] for line in kept["tool-required--gpt-5-4.jsonl"]] == [
+        "meta",
+        "reasoning_delta",
+        "text_delta",
+    ]
+
+
 def test_other_verdicts_can_be_exported_on_purpose(fixtures_script: ModuleType) -> None:
     rows = [_row(verdict="model_behavior")]
     events = {"req-1": [{"kind": "text_delta", "text": "a"}]}

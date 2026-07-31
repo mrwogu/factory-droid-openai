@@ -1,0 +1,40 @@
+{"kind": "meta", "scenario": "unicode", "stream": true, "recorded_model": "claude-haiku-4-5-20251001", "expect_verdict": "pass"}
+{"kind": "session_started"}
+{"kind": "status", "state": "streaming_assistant_message"}
+{"kind": "usage", "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "usage", "usage": {"prompt_tokens": 492, "completion_tokens": 32, "total_tokens": 524, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "G"}
+{"kind": "text_delta", "text": "dańsk to"}
+{"kind": "text_delta", "text": " pi"}
+{"kind": "text_delta", "text": "ęk"}
+{"kind": "text_delta", "text": "ne"}
+{"kind": "text_delta", "text": " histor"}
+{"kind": "text_delta", "text": "yczne miasto na"}
+{"kind": "text_delta", "text": "d M"}
+{"kind": "text_delta", "text": "orzem"}
+{"kind": "text_delta", "text": " B"}
+{"kind": "text_delta", "text": "ał"}
+{"kind": "text_delta", "text": "tyc"}
+{"kind": "text_delta", "text": "kim,"}
+{"kind": "text_delta", "text": " zn"}
+{"kind": "text_delta", "text": "ane"}
+{"kind": "text_delta", "text": " ze"}
+{"kind": "text_delta", "text": " swoj"}
+{"kind": "text_delta", "text": "ej b"}
+{"kind": "text_delta", "text": "ogat"}
+{"kind": "text_delta", "text": "ej architektur"}
+{"kind": "text_delta", "text": ","}
+{"kind": "text_delta", "text": " port"}
+{"kind": "text_delta", "text": "owych"}
+{"kind": "text_delta", "text": " tra"}
+{"kind": "text_delta", "text": "dycji i "}
+{"kind": "text_delta", "text": "waż"}
+{"kind": "text_delta", "text": "nej"}
+{"kind": "text_delta", "text": " r"}
+{"kind": "text_delta", "text": "oli"}
+{"kind": "text_delta", "text": " w pol"}
+{"kind": "text_delta", "text": "skiej"}
+{"kind": "text_delta", "text": " historii."}
+{"kind": "usage", "usage": {"prompt_tokens": 492, "completion_tokens": 32, "total_tokens": 524, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "status", "state": "idle"}
+{"kind": "run_complete", "usage": {"prompt_tokens": 492, "completion_tokens": 32, "total_tokens": 524, "prompt_tokens_details": {"cached_tokens": 0}}}

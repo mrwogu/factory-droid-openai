@@ -1,0 +1,44 @@
+{"kind": "meta", "scenario": "unicode", "stream": false, "recorded_model": "gpt-5.4-mini", "expect_verdict": "pass"}
+{"kind": "session_started"}
+{"kind": "status", "state": "streaming_assistant_message"}
+{"kind": "usage", "usage": {"prompt_tokens": 492, "completion_tokens": 9, "total_tokens": 501, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "G"}
+{"kind": "text_delta", "text": "da"}
+{"kind": "text_delta", "text": "ń"}
+{"kind": "text_delta", "text": "sk"}
+{"kind": "text_delta", "text": " to"}
+{"kind": "text_delta", "text": " pię"}
+{"kind": "text_delta", "text": "kne"}
+{"kind": "text_delta", "text": ","}
+{"kind": "text_delta", "text": " history"}
+{"kind": "text_delta", "text": "czne"}
+{"kind": "text_delta", "text": " mi"}
+{"kind": "text_delta", "text": "asto"}
+{"kind": "text_delta", "text": " nad"}
+{"kind": "text_delta", "text": " Ba"}
+{"kind": "text_delta", "text": "ł"}
+{"kind": "text_delta", "text": "ty"}
+{"kind": "text_delta", "text": "kiem"}
+{"kind": "text_delta", "text": ","}
+{"kind": "text_delta", "text": " sł"}
+{"kind": "text_delta", "text": "yn"}
+{"kind": "text_delta", "text": "ą"}
+{"kind": "text_delta", "text": "ce"}
+{"kind": "text_delta", "text": " z"}
+{"kind": "text_delta", "text": " hanze"}
+{"kind": "text_delta", "text": "aty"}
+{"kind": "text_delta", "text": "ck"}
+{"kind": "text_delta", "text": "iej"}
+{"kind": "text_delta", "text": " prz"}
+{"kind": "text_delta", "text": "esz"}
+{"kind": "text_delta", "text": "łości"}
+{"kind": "text_delta", "text": " i"}
+{"kind": "text_delta", "text": " nad"}
+{"kind": "text_delta", "text": "m"}
+{"kind": "text_delta", "text": "orsk"}
+{"kind": "text_delta", "text": "iego"}
+{"kind": "text_delta", "text": " klim"}
+{"kind": "text_delta", "text": "atu"}
+{"kind": "text_delta", "text": "."}
+{"kind": "status", "state": "idle"}
+{"kind": "run_complete", "usage": {"prompt_tokens": 492, "completion_tokens": 9, "total_tokens": 501, "prompt_tokens_details": {"cached_tokens": 0}}}

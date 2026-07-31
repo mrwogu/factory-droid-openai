@@ -1,0 +1,13 @@
+{"kind": "meta", "scenario": "tool_auto", "stream": false, "recorded_model": "gpt-5.4-mini", "expect_verdict": "pass"}
+{"kind": "session_started"}
+{"kind": "status", "state": "streaming_assistant_message"}
+{"kind": "usage", "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "usage", "usage": {"prompt_tokens": 661, "completion_tokens": 27, "total_tokens": 688, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "Cannot"}
+{"kind": "text_delta", "text": " use"}
+{"kind": "text_delta", "text": " weather"}
+{"kind": "text_delta", "text": " tool"}
+{"kind": "text_delta", "text": " here"}
+{"kind": "text_delta", "text": "."}
+{"kind": "status", "state": "idle"}
+{"kind": "run_complete", "usage": {"prompt_tokens": 661, "completion_tokens": 27, "total_tokens": 688, "prompt_tokens_details": {"cached_tokens": 0}}}
