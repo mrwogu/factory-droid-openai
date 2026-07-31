@@ -94,6 +94,28 @@ def test_build_prompt_preserves_openai_transcript_and_tools() -> None:
     assert plan.allowed_tool_names == frozenset({"weather"})
 
 
+@pytest.mark.parametrize("arguments", ['{"city":"A","city":"B"}', "[]"])
+def test_build_prompt_rejects_malformed_assistant_tool_arguments(arguments: str) -> None:
+    request = _request(
+        messages=[
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_old",
+                        "type": "function",
+                        "function": {"name": "weather", "arguments": arguments},
+                    }
+                ],
+            }
+        ]
+    )
+
+    with pytest.raises(ProtocolError, match="assistant tool-call arguments"):
+        build_prompt(request)
+
+
 def test_build_prompt_shows_a_concrete_tool_call_example() -> None:
     request = _request(
         tools=[

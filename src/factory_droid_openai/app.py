@@ -117,6 +117,7 @@ _MODEL_FAMILY_PREFIXES = (
     (("kimi",), "kimi"),
     (("deepseek",), "deepseek"),
 )
+_TOOL_CALL_DRAIN_SECONDS = 0.5
 
 CHAT_COMPLETION_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {
@@ -1483,7 +1484,25 @@ async def _collect_completion(
     stop_buffer = StopSequenceBuffer(stop_sequences)
     observed_ttft = False
     async with contextlib.aclosing(runner.run(run_request)) as events:
-        async for event in events:
+        event_iterator = events.__aiter__()
+        while True:
+            try:
+                if result.tool_calls:
+                    event = await asyncio.wait_for(
+                        event_iterator.__anext__(),
+                        timeout=_TOOL_CALL_DRAIN_SECONDS,
+                    )
+                else:
+                    event = await event_iterator.__anext__()
+            except StopAsyncIteration:
+                break
+            except TimeoutError:
+                # Droid does not always emit TurnComplete after a client-side
+                # tool call. The call is already complete and safe to return;
+                # waiting for an SDK sentinel stalls clients for the full
+                # backend timeout.
+                result.completed = True
+                break
             if isinstance(event, TextDelta):
                 observed_ttft = _observe_ttft(
                     observed_ttft,
@@ -1491,7 +1510,8 @@ async def _collect_completion(
                     request_started_at,
                 )
                 try:
-                    _apply_emissions(result, parser.feed(event.text), stop_buffer)
+                    emissions = parser.feed(event.text)
+                    _apply_emissions(result, emissions, stop_buffer)
                 except MalformedToolCallError as exc:
                     # The payload closed but no decoder could parse it, so
                     # continuing the turn would only make the model repeat the
@@ -1511,6 +1531,12 @@ async def _collect_completion(
                         payload_bytes=exc.payload_bytes,
                     )
                     break
+                if any(isinstance(emission, ToolCallEmission) for emission in emissions):
+                    result.completed = True
+                    # Keep consuming only when the SDK has already queued a
+                    # completion sentinel; otherwise the bounded drain above
+                    # closes this one-turn session promptly.
+                    continue
                 if stop_buffer.triggered:
                     # Leaving the loop closes the runner generator, which
                     # interrupts the Droid turn instead of draining it.
@@ -1531,6 +1557,7 @@ async def _collect_completion(
             elif isinstance(event, RunComplete):
                 result.usage = event.usage
                 result.completed = True
+                break
     if not result.completed:
         raise RunnerError(
             "Factory Droid ended without a completion event.",
@@ -1664,7 +1691,25 @@ async def _stream_completion(
         )
         try:
             async with contextlib.aclosing(runner.run(run_request)) as events:
-                async for event in events:
+                event_iterator = events.__aiter__()
+                while True:
+                    try:
+                        if saw_tool_call:
+                            event = await asyncio.wait_for(
+                                event_iterator.__anext__(),
+                                timeout=_TOOL_CALL_DRAIN_SECONDS,
+                            )
+                        else:
+                            event = await event_iterator.__anext__()
+                    except StopAsyncIteration:
+                        if saw_tool_call:
+                            completed = True
+                        break
+                    except TimeoutError:
+                        # A client-side tool call is a complete assistant turn,
+                        # even when Droid omits TurnComplete after emitting it.
+                        completed = True
+                        break
                     if isinstance(event, TextDelta):
                         observed_ttft = _observe_ttft(
                             observed_ttft,
@@ -1743,6 +1788,7 @@ async def _stream_completion(
                     elif isinstance(event, RunComplete):
                         usage = event.usage
                         completed = True
+                        break
 
             if not completed:
                 raise RunnerError(
@@ -2058,6 +2104,12 @@ def _validate_options(
     payload: ChatCompletionRequest,
     settings: Settings,
 ) -> JSONResponse | None:
+    if payload.max_tokens is not None or payload.max_completion_tokens is not None:
+        return _error_response(
+            "max_tokens and max_completion_tokens are not supported by this bridge.",
+            400,
+            "invalid_request_error",
+        )
     if payload.n > settings.max_choices:
         return _error_response(
             f"n must be at most {settings.max_choices} on this bridge.",

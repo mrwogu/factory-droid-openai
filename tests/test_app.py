@@ -199,6 +199,24 @@ class GateRunner(FakeRunner):
             self.closed = True
 
 
+class ToolCallBlockingRunner(FakeRunner):
+    def __init__(self, events: list[RunEvent]) -> None:
+        super().__init__(events)
+        self.started = asyncio.Event()
+
+    async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
+        self.requests.append(request)
+        self.started.set()
+        try:
+            yield TextDelta(
+                f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Hel"}}}}'
+                f"{TOOL_CALL_CLOSE}"
+            )
+            await asyncio.Event().wait()
+        finally:
+            self.closed = True
+
+
 class BlockingAdmission:
     def __init__(self) -> None:
         self.started = asyncio.Event()
@@ -689,6 +707,34 @@ async def test_non_streaming_tool_call(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_non_streaming_tool_call_does_not_need_turn_complete(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [
+            TextDelta(
+                f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Hel"}}}}'
+                f"{TOOL_CALL_CLOSE}"
+            ),
+        ]
+    )
+    payload = _payload(
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ],
+        tool_choice="required",
+    )
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["finish_reason"] == "tool_calls"
+    assert runner.closed is True
+
+
+@pytest.mark.asyncio
 async def test_streaming_recovers_tool_call_without_close_marker(tmp_path: Path) -> None:
     runner = FakeRunner(
         [
@@ -719,6 +765,70 @@ async def test_streaming_recovers_tool_call_without_close_marker(tmp_path: Path)
     assert len(tool_calls) == 1
     assert json.loads(tool_calls[0]["function"]["arguments"]) == {"city": "Hel"}
     assert events[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+@pytest.mark.asyncio
+async def test_streaming_tool_call_does_not_need_turn_complete(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [
+            TextDelta(
+                f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Hel"}}}}'
+                f"{TOOL_CALL_CLOSE}"
+            ),
+        ]
+    )
+    payload = _payload(
+        stream=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ],
+        tool_choice="required",
+    )
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    events = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and not line.endswith("[DONE]")
+    ]
+    assert events[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    assert response.text.endswith("data: [DONE]\n\n")
+    assert runner.closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_tool_call_timeout_without_turn_complete_returns_completion(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    runner = ToolCallBlockingRunner([])
+    payload = _payload(
+        stream=stream,
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ],
+        tool_choice="required",
+    )
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    if stream:
+        assert response.text.endswith("data: [DONE]\n\n")
+    else:
+        assert response.json()["choices"][0]["finish_reason"] == "tool_calls"
+    assert runner.closed is True
 
 
 @pytest.mark.asyncio
@@ -1083,6 +1193,43 @@ async def test_duplicate_request_keys_are_rejected(tmp_path: Path) -> None:
     assert response.json()["error"]["type"] == "invalid_request_error"
     assert "duplicate key" in response.json()["error"]["message"]
     assert not runner.requests
+
+
+@pytest.mark.asyncio
+async def test_invalid_tool_name_is_rejected_before_runner(tmp_path: Path) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+    payload = _payload(
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "bad.name", "parameters": {}},
+            }
+        ]
+    )
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert runner.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["max_tokens", "max_completion_tokens"])
+async def test_token_limit_fields_are_rejected_explicitly(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+    payload = _payload(**{field: 5})
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 400
+    assert "not supported" in response.json()["error"]["message"]
+    assert runner.requests == []
 
 
 @pytest.mark.asyncio

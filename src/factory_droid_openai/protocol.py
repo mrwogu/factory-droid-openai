@@ -125,6 +125,7 @@ def build_prompt(
     attachments = AttachmentSet()
     prompt_messages = _continuation_messages(request) if continuation else request.messages
     for message in prompt_messages:
+        _validate_message_tool_calls(message)
         payload = message.model_dump(mode="json", exclude_none=True)
         # Binary parts leave the transcript here and travel over the SDK's
         # native attachment channel instead of being inlined as base64 text.
@@ -237,6 +238,17 @@ def _continuation_messages(request: ChatCompletionRequest) -> list[Any]:
             # empty prompt.
             return list(delta) if delta else list(request.messages)
     return list(request.messages)
+
+
+def _validate_message_tool_calls(message: Any) -> None:
+    """Reject malformed assistant tool results before sending transcript."""
+    for tool_call in message.tool_calls or ():
+        try:
+            arguments = parse_strict_json(tool_call.function.arguments)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise ProtocolError("assistant tool-call arguments must be strict JSON") from exc
+        if not isinstance(arguments, dict):
+            raise ProtocolError("assistant tool-call arguments must be a JSON object")
 
 
 def _resolve_tool_choice(

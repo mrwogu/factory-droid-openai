@@ -60,7 +60,7 @@ _BASE_EXEC_ARGS = (
 # error, so the wording is the only signal that the model, not the bridge, is
 # at fault.
 _MODEL_DENIED_PATTERN = re.compile(
-    r"model (?:is )?not (?:allowed|available|permitted|enabled)",
+    r"(?:model (?:is )?not (?:allowed|available|permitted|enabled)|invalid model id)",
     re.IGNORECASE,
 )
 
@@ -502,6 +502,11 @@ class DroidRunner:
                             error_type="factory_native_tool_blocked",
                         )
                     elif isinstance(event, ErrorEvent):
+                        if _MODEL_DENIED_PATTERN.search(event.message or ""):
+                            raise sdk_error(
+                                DroidClientError(event.message),
+                                model=_resolve_model_id(request.model, request.model_alias),
+                            )
                         raise RunnerError(
                             event.message or "Factory Droid returned an error.",
                             error_type=event.error_type or "factory_droid_error",

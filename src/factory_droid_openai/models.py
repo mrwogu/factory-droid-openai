@@ -6,7 +6,11 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class FunctionCall(BaseModel):
-    name: str
+    name: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
     arguments: str = "{}"
 
 
@@ -31,7 +35,11 @@ class ChatMessage(BaseModel):
 class ToolFunction(BaseModel):
     model_config = ConfigDict(extra="allow")
 
-    name: str
+    name: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
     description: str = ""
     parameters: dict[str, Any] = Field(default_factory=dict)
 
@@ -153,6 +161,8 @@ class ChatCompletionRequest(BaseModel):
     factory_droid_reasoning_effort: str | None = None
     timeout: float | None = Field(default=None, gt=0)
     n: int = Field(default=1, ge=1)
+    max_tokens: int | None = Field(default=None, gt=0)
+    max_completion_tokens: int | None = Field(default=None, gt=0)
     stop: str | list[str] | None = None
     parallel_tool_calls: bool = True
     factory_droid_session_id: str | None = None
