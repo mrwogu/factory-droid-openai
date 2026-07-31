@@ -358,6 +358,11 @@ class DroidRunner:
         if deadline <= loop.time():
             raise _timeout_error(request)
 
+        # The deadline above is the request's total budget (queue wait plus the
+        # run). From here on the message reports how long the Droid run itself
+        # took before it timed out, so a 60 s model-backend timeout no longer
+        # reads as the configured 600 s ceiling.
+        started = loop.time()
         warm = request.warm_session
         if warm is not None:
             warm.consumed = True
@@ -502,7 +507,11 @@ class DroidRunner:
                             error_type=event.error_type or "factory_droid_error",
                         )
         except (TimeoutError, DroidTimeoutError) as exc:
-            raise _timeout_error(request) from exc
+            raise RunnerError(
+                f"Factory Droid timed out after {loop.time() - started:.1f} seconds.",
+                status_code=504,
+                error_type="factory_droid_timeout",
+            ) from exc
         except FileNotFoundError as exc:
             raise RunnerError(
                 f"Factory Droid executable was not found: {self._droid_path}",
@@ -679,13 +688,15 @@ class DroidRunner:
         client.set_ask_user_handler(
             lambda _params: {"cancelled": True, "answers": []},
         )
+        started = asyncio.get_running_loop().time()
         try:
             async with asyncio.timeout(timeout_seconds):
                 await client.connect()
                 return await operation(client)
         except (TimeoutError, DroidTimeoutError) as exc:
             raise RunnerError(
-                f"Factory Droid timed out after {timeout_seconds:.1f} seconds.",
+                f"Factory Droid timed out after"
+                f" {asyncio.get_running_loop().time() - started:.1f} seconds.",
                 status_code=504,
                 error_type="factory_droid_timeout",
             ) from exc
