@@ -313,6 +313,7 @@ class Observation:
 
     status: int
     error_type: str | None = None
+    error_message: str = ""
     finish_reason: str | None = None
     tool_calls: int = 0
     content_chars: int = 0
@@ -324,6 +325,30 @@ class Observation:
     transport_error: str | None = None
 
 
+# The bridge fails closed when a model ignores tool_choice=required, and it
+# reports that as a protocol error like every other unmet contract. Only the
+# message separates model non-compliance from an actual parser bug.
+_TOOL_CHOICE_IGNORED = "did not produce the required tool call"
+
+
+def _error_verdict(observation: Observation) -> tuple[str, str] | None:
+    """Bucket a bridge error by who has to fix it, or None when nobody yet."""
+    error_type = observation.error_type
+    if error_type == "model_not_found":
+        return ACCOUNT_POLICY, "model unavailable for this account"
+    if error_type == "factory_native_tool_blocked":
+        return MODEL_BEHAVIOR, "model attempted a Factory-native tool"
+    if error_type == "factory_protocol_error" and _TOOL_CHOICE_IGNORED in observation.error_message:
+        return MODEL_BEHAVIOR, "model ignored tool_choice=required"
+    if observation.status == 429:
+        return CAPACITY, "bridge queue is full"
+    if observation.status == 503:
+        return PROVIDER_UNAVAILABLE, "Droid executable or provider unavailable"
+    if observation.status == 504 or error_type == "factory_droid_timeout":
+        return BACKEND_TIMEOUT, "backend timed out"
+    return None
+
+
 def classify(scenario: Scenario, observation: Observation) -> tuple[str, str]:
     """Return the verdict bucket and a short reason for one observation."""
     if observation.timed_out:
@@ -332,21 +357,21 @@ def classify(scenario: Scenario, observation: Observation) -> tuple[str, str]:
         return BRIDGE_DEFECT, f"transport error: {observation.transport_error}"
     error_type = observation.error_type
     if observation.status not in scenario.expect_status:
-        if error_type == "model_not_found":
-            return ACCOUNT_POLICY, "model unavailable for this account"
-        if error_type == "factory_native_tool_blocked":
-            return MODEL_BEHAVIOR, "model attempted a Factory-native tool"
-        if observation.status == 429:
-            return CAPACITY, "bridge queue is full"
-        if observation.status == 503:
-            return PROVIDER_UNAVAILABLE, "Droid executable or provider unavailable"
-        if observation.status == 504:
-            return BACKEND_TIMEOUT, "backend timed out"
-        return BRIDGE_DEFECT, f"unexpected status {observation.status} ({error_type})"
+        return _error_verdict(observation) or (
+            BRIDGE_DEFECT,
+            f"unexpected status {observation.status} ({error_type})",
+        )
     if observation.status != 200:
         return SUCCESS, f"rejected with {observation.status} as expected"
     if scenario.stream and not observation.stream_done:
         return BRIDGE_DEFECT, "stream ended without [DONE]"
+    if error_type is not None:
+        # A stream that fails after its headers reports the error in a chunk,
+        # so the HTTP status alone says nothing about the outcome.
+        return _error_verdict(observation) or (
+            BRIDGE_DEFECT,
+            f"stream failed with {error_type}",
+        )
     if observation.finish_reason not in scenario.expect_finish:
         if observation.finish_reason == "tool_calls":
             return MODEL_BEHAVIOR, "model called a tool when none was required"
@@ -358,12 +383,16 @@ def classify(scenario: Scenario, observation: Observation) -> tuple[str, str]:
     return SUCCESS, "contract satisfied"
 
 
-def _error_type(body: dict[str, Any]) -> str | None:
+def _error_fields(body: dict[str, Any]) -> tuple[str | None, str]:
     error = body.get("error")
     if not isinstance(error, dict):
-        return None
-    value = error.get("type")
-    return value if isinstance(value, str) else None
+        return None, ""
+    error_type = error.get("type")
+    message = error.get("message")
+    return (
+        error_type if isinstance(error_type, str) else None,
+        message if isinstance(message, str) else "",
+    )
 
 
 def _read_json_observation(
@@ -390,9 +419,11 @@ def _read_json_observation(
     message = choice.get("message", {}) if isinstance(choice, dict) else {}
     tool_calls = message.get("tool_calls") or []
     content = message.get("content") or ""
+    error_type, error_message = _error_fields(body)
     return Observation(
         status=response.status_code,
-        error_type=_error_type(body),
+        error_type=error_type,
+        error_message=error_message,
         finish_reason=choice.get("finish_reason") if isinstance(choice, dict) else None,
         tool_calls=len(tool_calls) if isinstance(tool_calls, list) else 0,
         content_chars=len(content) if isinstance(content, str) else 0,
@@ -412,6 +443,7 @@ def _stream_observation(
     tool_calls = 0
     content_chars = 0
     error_type: str | None = None
+    error_message = ""
     stream_done = False
     ttft_ms: float | None = None
     for elapsed_ms, raw in events:
@@ -428,7 +460,9 @@ def _stream_observation(
             )
         if not isinstance(chunk, dict):
             continue
-        error_type = error_type or _error_type(chunk)
+        chunk_error_type, chunk_error_message = _error_fields(chunk)
+        error_type = error_type or chunk_error_type
+        error_message = error_message or chunk_error_message
         for choice in chunk.get("choices") or []:
             delta = choice.get("delta") or {}
             text = delta.get("content") or ""
@@ -443,6 +477,7 @@ def _stream_observation(
     return Observation(
         status=status,
         error_type=error_type,
+        error_message=error_message,
         finish_reason=finish_reason,
         tool_calls=tool_calls,
         content_chars=content_chars,
@@ -560,6 +595,7 @@ def row(model: str, scenario: Scenario, observation: Observation) -> dict[str, A
         "stream": scenario.stream,
         "status": observation.status,
         "error_type": observation.error_type,
+        "error_message": observation.error_message,
         "finish_reason": observation.finish_reason,
         "tool_calls": observation.tool_calls,
         "content_chars": observation.content_chars,
