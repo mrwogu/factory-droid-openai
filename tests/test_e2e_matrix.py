@@ -90,6 +90,14 @@ def test_expected_rejection_is_a_pass(e2e: ModuleType) -> None:
         ({"status": 503, "error_type": "factory_droid_unavailable"}, "provider_unavailable"),
         ({"status": 504, "error_type": "factory_droid_timeout"}, "backend_timeout"),
         ({"status": 502, "error_type": "factory_protocol_error"}, "bridge_defect"),
+        (
+            {
+                "status": 502,
+                "error_type": "factory_protocol_error",
+                "error_message": "the model did not produce the required tool call",
+            },
+            "model_behavior",
+        ),
         ({"finish_reason": "length"}, "bridge_defect"),
         ({"finish_reason": "tool_calls"}, "model_behavior"),
         ({"content_chars": 0}, "model_behavior"),
@@ -120,6 +128,43 @@ def test_missing_tool_call_is_model_behavior_not_a_bridge_defect(e2e: ModuleType
     )
 
     assert verdict == "model_behavior"
+
+
+def test_a_stream_that_fails_after_its_headers_is_still_judged(e2e: ModuleType) -> None:
+    scenario = _scenario(e2e, stream=True, expect_finish=("tool_calls",), expect_content=False)
+    ignored_tool_choice = _observation(
+        e2e,
+        stream_done=True,
+        finish_reason=None,
+        error_type="factory_protocol_error",
+        error_message="the model did not produce the required tool call",
+    )
+    broken = _observation(
+        e2e,
+        stream_done=True,
+        finish_reason=None,
+        error_type="factory_protocol_error",
+        error_message="tool call payload never closed",
+    )
+
+    assert e2e.classify(scenario, ignored_tool_choice)[0] == "model_behavior"
+    assert e2e.classify(scenario, broken)[0] == "bridge_defect"
+
+
+def test_a_mid_stream_backend_timeout_is_not_a_bridge_defect(e2e: ModuleType) -> None:
+    scenario = _scenario(e2e, stream=True)
+
+    verdict, _ = e2e.classify(
+        scenario,
+        _observation(
+            e2e,
+            stream_done=True,
+            finish_reason=None,
+            error_type="factory_droid_timeout",
+        ),
+    )
+
+    assert verdict == "backend_timeout"
 
 
 def test_stream_without_done_is_a_bridge_defect(e2e: ModuleType) -> None:
