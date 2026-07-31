@@ -1115,7 +1115,7 @@ Non-streaming failures use the OpenAI error object:
 |---:|---|
 | `400` | Invalid request or unsupported option |
 | `401` | Missing or invalid bearer token |
-| `404` | Unknown Factory Droid session |
+| `404` | Unknown Factory Droid session, or a model this account cannot use |
 | `413` | Request body or serialized transcript over the configured limit |
 | `429` | Droid request queue full, with a `Retry-After` header |
 | `502` | Droid SDK, process, or bridge protocol failure |
@@ -1124,6 +1124,13 @@ Non-streaming failures use the OpenAI error object:
 
 After streaming headers are sent, errors arrive as an SSE `error` object
 followed by `[DONE]`.
+
+Droid lists every model its CLI knows about, including ones a provider or
+organization policy refuses to serve. Such a refusal becomes `404` with type
+`model_not_found`, in both transports, and the model is quarantined for
+subsequent requests. Any other SDK failure reports `factory_droid_error` or
+`factory_droid_sdk_error`; SDK-internal error labels are never used as OpenAI
+error types.
 
 ## Configuration
 
