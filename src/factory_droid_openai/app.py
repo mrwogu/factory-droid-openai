@@ -528,7 +528,6 @@ class RequestSizeLimitMiddleware:
             if message["type"] == "http.response.start":
                 response_started = True
                 status_code = int(message["status"])
-                _set_request_state(scope, status_code=status_code)
             await send(message)
 
         try:
@@ -610,8 +609,9 @@ class RequestSizeLimitMiddleware:
             status_code = 499
         finally:
             elapsed = time.perf_counter() - started
+            outcome = _request_outcome(status_code, scope)
             self._metrics.record_request(
-                _request_outcome(status_code, scope),
+                outcome,
                 status_code,
                 elapsed,
                 route=_request_route(scope),
@@ -620,6 +620,7 @@ class RequestSizeLimitMiddleware:
                     scope,
                     status_code=status_code,
                     seconds=elapsed,
+                    outcome=outcome,
                 ),
             )
 
@@ -2470,10 +2471,12 @@ def _telemetry_error_category(
             "session_not_found": "session_not_found",
         }
         return categories.get(error_type, "other")
-    if outcome in {"cancelled"} or status_code == 499:
+    if outcome == "cancelled":
         return "cancelled"
     if outcome in {"malformed", "truncated"}:
         return "protocol"
+    if outcome == "timeout":
+        return "timeout"
     if outcome == "error" and status_code < 400:
         return "stream_error"
     if status_code == 413:
@@ -2498,10 +2501,10 @@ def _request_telemetry_features(
     *,
     status_code: int,
     seconds: float,
+    outcome: str,
 ) -> tuple[str, ...]:
     route = _request_route(scope)
     state = _request_state(scope)
-    outcome = _request_outcome(status_code, scope)
     features = [
         f"request_latency:{route}:{_latency_bucket(max(0.0, seconds))}",
         f"request_payload:{route}:{state.get('payload_size_bucket', 'unknown')}",

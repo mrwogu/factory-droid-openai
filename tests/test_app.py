@@ -32,6 +32,7 @@ from factory_droid_openai.app import (
     _request_route,
     _request_telemetry_features,
     _RequestPayloadLimitError,
+    _set_request_state,
     _stream_completion,
     _telemetry_error_category,
     _validation_message,
@@ -1763,6 +1764,14 @@ def test_payload_size_bucket_is_bounded(size: int, expected: str) -> None:
     assert _payload_size_bucket(size) == expected
 
 
+def test_set_request_state_merges_into_existing_state_dict() -> None:
+    scope = cast("Any", {"state": {"existing": 1}})
+
+    _set_request_state(scope, added=2)
+
+    assert scope["state"] == {"existing": 1, "added": 2}
+
+
 def test_request_telemetry_features_use_only_coarse_dimensions() -> None:
     scope = cast(
         "Any",
@@ -1775,7 +1784,12 @@ def test_request_telemetry_features_use_only_coarse_dimensions() -> None:
         },
     )
 
-    features = _request_telemetry_features(scope, status_code=504, seconds=5.0)
+    features = _request_telemetry_features(
+        scope,
+        status_code=504,
+        seconds=5.0,
+        outcome="timeout",
+    )
 
     assert features == (
         "request_latency:chat_completions:5s_30s",
@@ -1792,6 +1806,12 @@ def test_request_telemetry_features_use_only_coarse_dimensions() -> None:
         (401, "error", "authentication"),
         (404, "error", "not_found"),
         (200, "success", "other"),
+        (499, "cancelled", "cancelled"),
+        (200, "timeout", "timeout"),
+        (504, "error", "timeout"),
+        (200, "malformed", "protocol"),
+        (200, "truncated", "protocol"),
+        (200, "error", "stream_error"),
     ],
 )
 def test_telemetry_error_category_covers_status_fallbacks(
