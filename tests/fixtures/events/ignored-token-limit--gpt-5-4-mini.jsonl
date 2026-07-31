@@ -1,0 +1,7 @@
+{"kind": "meta", "scenario": "ignored_token_limit", "stream": false, "recorded_model": "gpt-5.4-mini", "expect_verdict": "pass"}
+{"kind": "session_started"}
+{"kind": "status", "state": "streaming_assistant_message"}
+{"kind": "usage", "usage": {"prompt_tokens": 460, "completion_tokens": 4, "total_tokens": 464, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "OK"}
+{"kind": "status", "state": "idle"}
+{"kind": "run_complete", "usage": {"prompt_tokens": 460, "completion_tokens": 4, "total_tokens": 464, "prompt_tokens_details": {"cached_tokens": 0}}}

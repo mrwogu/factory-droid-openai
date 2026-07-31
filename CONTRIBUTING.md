@@ -59,9 +59,16 @@ model the bridge lists:
 ```bash
 export FACTORY_DROID_OPENAI_TRACE_PAYLOADS=full
 export FACTORY_DROID_OPENAI_TRACE_FILE="$PWD/traces/trace.jsonl"
-uv run factory-droid-openai &
+env -u FACTORY_APPEND_SYSTEM_PROMPT uv run factory-droid-openai &
 uv run python scripts/e2e_matrix.py run --out traces/run-a.jsonl
 ```
+
+Run it from a plain shell. Inside a Droid session,
+`FACTORY_APPEND_SYSTEM_PROMPT` is exported and the bridge inherits it, so every
+recorded turn answers a different prompt than a user of the bridge would send.
+The operator's own `~/.factory/system-prompt.md` and enabled skills reach the
+model the same way, which is why a recording describes this machine, not
+default Droid behavior.
 
 Each request becomes one JSONL row with a verdict. Only `bridge_defect` fails
 the run; `model_behavior`, `account_policy`, `capacity`,
@@ -87,8 +94,11 @@ Each fixture in `tests/fixtures/events/` holds one recorded Droid event stream
 plus the contract it satisfied, and `tests/test_replay.py` replays all of them
 through the ASGI app on every test run. Live runs stay in `traces/`, which is
 gitignored: rows and traces carry model output and account-specific denials.
-Fixtures are committed, so review them for private prompt content before adding
-them.
+
+Reasoning deltas are dropped from fixtures, because models quote the operator's
+instructions back inside them; `--keep-reasoning` overrides that for local
+debugging only. Fixtures are committed, so read them before adding them and
+delete anything that describes your machine rather than the bridge.
 
 ## Change guidelines
 

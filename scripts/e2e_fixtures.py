@@ -72,6 +72,7 @@ def build_fixtures(
     *,
     verdicts: tuple[str, ...] = DEFAULT_VERDICTS,
     scenarios: tuple[str, ...] = (),
+    keep_reasoning: bool = False,
 ) -> dict[str, list[dict[str, Any]]]:
     """Pair matrix rows with their recorded events and stamp each with its contract."""
     fixtures: dict[str, list[dict[str, Any]]] = {}
@@ -80,6 +81,13 @@ def build_fixtures(
         recorded = events.get(request_id) if isinstance(request_id, str) else None
         if not recorded:
             continue
+        if not keep_reasoning:
+            # Droid feeds the operator's own instructions (the ~/.factory
+            # system prompt and enabled skills) into every session, and models
+            # quote them back inside reasoning. Reasoning decides nothing about
+            # the OpenAI contract, so it is dropped before a fixture can reach
+            # version control.
+            recorded = [event for event in recorded if event.get("kind") != "reasoning_delta"]
         if row.get("verdict") not in verdicts:
             continue
         if scenarios and str(row["scenario"]) not in scenarios:
@@ -118,6 +126,11 @@ def main(argv: list[str] | None = None) -> int:
     build.add_argument("--out", type=Path, default=FIXTURE_DIR)
     build.add_argument("--verdicts", default=",".join(DEFAULT_VERDICTS))
     build.add_argument("--scenarios", default="", help="comma separated; default is every one")
+    build.add_argument(
+        "--keep-reasoning",
+        action="store_true",
+        help="keep reasoning deltas, which quote the operator's own instructions",
+    )
 
     args = parser.parse_args(argv)
     fixtures = build_fixtures(
@@ -125,6 +138,7 @@ def main(argv: list[str] | None = None) -> int:
         group_events(load_jsonl(args.trace)),
         verdicts=tuple(value for value in args.verdicts.split(",") if value),
         scenarios=tuple(value for value in args.scenarios.split(",") if value),
+        keep_reasoning=args.keep_reasoning,
     )
     written = write_fixtures(fixtures, args.out)
     for path in written:

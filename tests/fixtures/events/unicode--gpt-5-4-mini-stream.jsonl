@@ -1,0 +1,35 @@
+{"kind": "meta", "scenario": "unicode", "stream": true, "recorded_model": "gpt-5.4-mini", "expect_verdict": "pass"}
+{"kind": "session_started"}
+{"kind": "status", "state": "streaming_assistant_message"}
+{"kind": "usage", "usage": {"prompt_tokens": 492, "completion_tokens": 32, "total_tokens": 524, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "G"}
+{"kind": "text_delta", "text": "da"}
+{"kind": "text_delta", "text": "ń"}
+{"kind": "text_delta", "text": "sk"}
+{"kind": "text_delta", "text": " to"}
+{"kind": "text_delta", "text": " pię"}
+{"kind": "text_delta", "text": "kne"}
+{"kind": "text_delta", "text": " nad"}
+{"kind": "text_delta", "text": "m"}
+{"kind": "text_delta", "text": "orsk"}
+{"kind": "text_delta", "text": "ie"}
+{"kind": "text_delta", "text": " mi"}
+{"kind": "text_delta", "text": "asto"}
+{"kind": "text_delta", "text": " z"}
+{"kind": "text_delta", "text": " bog"}
+{"kind": "text_delta", "text": "at"}
+{"kind": "text_delta", "text": "ą"}
+{"kind": "text_delta", "text": " histori"}
+{"kind": "text_delta", "text": "ą"}
+{"kind": "text_delta", "text": ","}
+{"kind": "text_delta", "text": " port"}
+{"kind": "text_delta", "text": "em"}
+{"kind": "text_delta", "text": " i"}
+{"kind": "text_delta", "text": " wyjątk"}
+{"kind": "text_delta", "text": "ową"}
+{"kind": "text_delta", "text": " star"}
+{"kind": "text_delta", "text": "ów"}
+{"kind": "text_delta", "text": "ką"}
+{"kind": "text_delta", "text": "."}
+{"kind": "status", "state": "idle"}
+{"kind": "run_complete", "usage": {"prompt_tokens": 492, "completion_tokens": 32, "total_tokens": 524, "prompt_tokens_details": {"cached_tokens": 0}}}

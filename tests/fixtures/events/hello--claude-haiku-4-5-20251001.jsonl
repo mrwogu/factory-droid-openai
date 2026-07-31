@@ -1,0 +1,8 @@
+{"kind": "meta", "scenario": "hello", "stream": false, "recorded_model": "claude-haiku-4-5-20251001", "expect_verdict": "pass"}
+{"kind": "session_started"}
+{"kind": "status", "state": "streaming_assistant_message"}
+{"kind": "usage", "usage": {"prompt_tokens": 460, "completion_tokens": 11, "total_tokens": 471, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "OK"}
+{"kind": "usage", "usage": {"prompt_tokens": 460, "completion_tokens": 11, "total_tokens": 471, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "status", "state": "idle"}
+{"kind": "run_complete", "usage": {"prompt_tokens": 460, "completion_tokens": 11, "total_tokens": 471, "prompt_tokens_details": {"cached_tokens": 0}}}
