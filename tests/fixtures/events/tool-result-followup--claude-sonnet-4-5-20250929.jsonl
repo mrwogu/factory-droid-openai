@@ -1,0 +1,11 @@
+{"kind": "meta", "scenario": "tool_result_followup", "stream": false, "recorded_model": "claude-sonnet-4-5-20250929", "expect_verdict": "pass"}
+{"kind": "session_started"}
+{"kind": "status", "state": "streaming_assistant_message"}
+{"kind": "usage", "usage": {"prompt_tokens": 755, "completion_tokens": 9, "total_tokens": 764, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "Temperature"}
+{"kind": "text_delta", "text": " in"}
+{"kind": "text_delta", "text": " Gdansk:"}
+{"kind": "text_delta", "text": " 20°C."}
+{"kind": "usage", "usage": {"prompt_tokens": 755, "completion_tokens": 9, "total_tokens": 764, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "status", "state": "idle"}
+{"kind": "run_complete", "usage": {"prompt_tokens": 755, "completion_tokens": 9, "total_tokens": 764, "prompt_tokens_details": {"cached_tokens": 0}}}

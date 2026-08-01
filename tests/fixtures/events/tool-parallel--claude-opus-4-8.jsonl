@@ -1,0 +1,16 @@
+{"kind": "meta", "scenario": "tool_parallel", "stream": false, "recorded_model": "claude-opus-4-8", "expect_verdict": "pass"}
+{"kind": "session_started"}
+{"kind": "status", "state": "streaming_assistant_message"}
+{"kind": "usage", "usage": {"prompt_tokens": 766, "completion_tokens": 32, "total_tokens": 798, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "<tool_call"}
+{"kind": "text_delta", "text": ">{\"name\":\"weather"}
+{"kind": "text_delta", "text": "\",\"arguments\":{\"city"}
+{"kind": "text_delta", "text": "\":\"Gdansk\""}
+{"kind": "text_delta", "text": "}}</tool_call>"}
+{"kind": "text_delta", "text": "\n<tool_call>{"}
+{"kind": "text_delta", "text": "\"name\":\"clock\",\"ar"}
+{"kind": "text_delta", "text": "guments\":{\"city\":\""}
+{"kind": "text_delta", "text": "Gdansk\"}}"}
+{"kind": "text_delta", "text": "</tool_call>"}
+{"kind": "status", "state": "idle"}
+{"kind": "run_complete", "usage": {"prompt_tokens": 766, "completion_tokens": 32, "total_tokens": 798, "prompt_tokens_details": {"cached_tokens": 0}}}

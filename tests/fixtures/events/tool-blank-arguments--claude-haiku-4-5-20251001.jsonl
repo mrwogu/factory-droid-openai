@@ -1,10 +1,9 @@
 {"kind": "meta", "scenario": "tool_blank_arguments", "stream": false, "recorded_model": "claude-haiku-4-5-20251001", "expect_verdict": "pass"}
 {"kind": "session_started"}
 {"kind": "status", "state": "streaming_assistant_message"}
-{"kind": "usage", "usage": {"prompt_tokens": 713, "completion_tokens": 32, "total_tokens": 745, "prompt_tokens_details": {"cached_tokens": 0}}}
-{"kind": "text_delta", "text": "12"}
-{"kind": "text_delta", "text": ":00 "}
-{"kind": "text_delta", "text": "in"}
-{"kind": "text_delta", "text": " Gdansk."}
+{"kind": "usage", "usage": {"prompt_tokens": 738, "completion_tokens": 27, "total_tokens": 765, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "The current time in Gdansk is"}
+{"kind": "text_delta", "text": " **"}
+{"kind": "text_delta", "text": "12:00**."}
 {"kind": "status", "state": "idle"}
-{"kind": "run_complete", "usage": {"prompt_tokens": 713, "completion_tokens": 32, "total_tokens": 745, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "run_complete", "usage": {"prompt_tokens": 738, "completion_tokens": 27, "total_tokens": 765, "prompt_tokens_details": {"cached_tokens": 0}}}

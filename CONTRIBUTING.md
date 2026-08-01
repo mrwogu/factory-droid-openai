@@ -89,7 +89,8 @@ Turn what a live run found into offline regression tests:
 
 ```bash
 uv run python scripts/e2e_fixtures.py build \
-  --trace traces/trace.jsonl --run traces/run-a.jsonl
+  --trace traces/trace.jsonl --run traces/run-a.jsonl \
+  --models kimi-k3 --scenarios tool_auto,tool_parallel
 ```
 
 Each fixture in `tests/fixtures/events/` holds one recorded Droid event stream

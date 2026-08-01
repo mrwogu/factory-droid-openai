@@ -1,0 +1,14 @@
+{"kind": "meta", "scenario": "tool_result_followup", "stream": false, "recorded_model": "nemotron-3-ultra", "expect_verdict": "pass"}
+{"kind": "session_started"}
+{"kind": "status", "state": "streaming_assistant_message"}
+{"kind": "usage", "usage": {"prompt_tokens": 755, "completion_tokens": 16, "total_tokens": 771, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "usage", "usage": {"prompt_tokens": 755, "completion_tokens": 16, "total_tokens": 771, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "usage", "usage": {"prompt_tokens": 755, "completion_tokens": 16, "total_tokens": 771, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "usage", "usage": {"prompt_tokens": 755, "completion_tokens": 16, "total_tokens": 771, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "usage", "usage": {"prompt_tokens": 755, "completion_tokens": 16, "total_tokens": 771, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "The current"}
+{"kind": "text_delta", "text": " temperature in Gdańsk"}
+{"kind": "text_delta", "text": " is "}
+{"kind": "text_delta", "text": "20°C."}
+{"kind": "status", "state": "idle"}
+{"kind": "run_complete", "usage": {"prompt_tokens": 755, "completion_tokens": 16, "total_tokens": 771, "prompt_tokens_details": {"cached_tokens": 0}}}

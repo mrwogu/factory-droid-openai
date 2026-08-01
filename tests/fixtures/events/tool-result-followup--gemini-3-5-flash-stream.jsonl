@@ -1,8 +1,8 @@
 {"kind": "meta", "scenario": "tool_result_followup", "stream": true, "recorded_model": "gemini-3.5-flash", "expect_verdict": "pass"}
 {"kind": "session_started"}
 {"kind": "status", "state": "streaming_assistant_message"}
-{"kind": "usage", "usage": {"prompt_tokens": 755, "completion_tokens": 9, "total_tokens": 764, "prompt_tokens_details": {"cached_tokens": 0}}}
-{"kind": "text_delta", "text": "Gdansk 20°C."}
+{"kind": "usage", "usage": {"prompt_tokens": 755, "completion_tokens": 29, "total_tokens": 784, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "Gdansk: 20°C."}
 {"kind": "text_delta", "text": ""}
 {"kind": "status", "state": "idle"}
-{"kind": "run_complete", "usage": {"prompt_tokens": 755, "completion_tokens": 9, "total_tokens": 764, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "run_complete", "usage": {"prompt_tokens": 755, "completion_tokens": 29, "total_tokens": 784, "prompt_tokens_details": {"cached_tokens": 0}}}

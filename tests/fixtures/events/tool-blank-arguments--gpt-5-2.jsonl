@@ -1,0 +1,55 @@
+{"kind": "meta", "scenario": "tool_blank_arguments", "stream": false, "recorded_model": "gpt-5.2", "expect_verdict": "pass"}
+{"kind": "session_started"}
+{"kind": "status", "state": "streaming_assistant_message"}
+{"kind": "usage", "usage": {"prompt_tokens": 738, "completion_tokens": 27, "total_tokens": 765, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "Can"}
+{"kind": "text_delta", "text": "’t"}
+{"kind": "text_delta", "text": " call"}
+{"kind": "text_delta", "text": " client"}
+{"kind": "text_delta", "text": " “"}
+{"kind": "text_delta", "text": "clock"}
+{"kind": "text_delta", "text": "”"}
+{"kind": "text_delta", "text": " tool"}
+{"kind": "text_delta", "text": ","}
+{"kind": "text_delta", "text": " can"}
+{"kind": "text_delta", "text": "’t"}
+{"kind": "text_delta", "text": " fetch"}
+{"kind": "text_delta", "text": " live"}
+{"kind": "text_delta", "text": " time"}
+{"kind": "text_delta", "text": ".\n\n"}
+{"kind": "text_delta", "text": "G"}
+{"kind": "text_delta", "text": "da"}
+{"kind": "text_delta", "text": "ń"}
+{"kind": "text_delta", "text": "sk"}
+{"kind": "text_delta", "text": " time"}
+{"kind": "text_delta", "text": " zone"}
+{"kind": "text_delta", "text": ":"}
+{"kind": "text_delta", "text": " Europe"}
+{"kind": "text_delta", "text": "/W"}
+{"kind": "text_delta", "text": "ars"}
+{"kind": "text_delta", "text": "aw"}
+{"kind": "text_delta", "text": " ("}
+{"kind": "text_delta", "text": "C"}
+{"kind": "text_delta", "text": "ET"}
+{"kind": "text_delta", "text": " UTC"}
+{"kind": "text_delta", "text": "+"}
+{"kind": "text_delta", "text": "1"}
+{"kind": "text_delta", "text": ","}
+{"kind": "text_delta", "text": " C"}
+{"kind": "text_delta", "text": "EST"}
+{"kind": "text_delta", "text": " UTC"}
+{"kind": "text_delta", "text": "+"}
+{"kind": "text_delta", "text": "2"}
+{"kind": "text_delta", "text": ")."}
+{"kind": "text_delta", "text": " Check"}
+{"kind": "text_delta", "text": " local"}
+{"kind": "text_delta", "text": " clock"}
+{"kind": "text_delta", "text": " or"}
+{"kind": "text_delta", "text": " `"}
+{"kind": "text_delta", "text": "date"}
+{"kind": "text_delta", "text": "`"}
+{"kind": "text_delta", "text": " with"}
+{"kind": "text_delta", "text": " TZ"}
+{"kind": "text_delta", "text": "."}
+{"kind": "status", "state": "idle"}
+{"kind": "run_complete", "usage": {"prompt_tokens": 738, "completion_tokens": 27, "total_tokens": 765, "prompt_tokens_details": {"cached_tokens": 0}}}

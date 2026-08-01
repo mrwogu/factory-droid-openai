@@ -72,6 +72,7 @@ def build_fixtures(
     *,
     verdicts: tuple[str, ...] = DEFAULT_VERDICTS,
     scenarios: tuple[str, ...] = (),
+    models: tuple[str, ...] = (),
     keep_reasoning: bool = False,
 ) -> dict[str, list[dict[str, Any]]]:
     """Pair matrix rows with their recorded events and stamp each with its contract."""
@@ -91,6 +92,8 @@ def build_fixtures(
         if row.get("verdict") not in verdicts:
             continue
         if scenarios and str(row["scenario"]) not in scenarios:
+            continue
+        if models and str(row["model"]) not in models:
             continue
         meta = {
             "kind": "meta",
@@ -126,6 +129,7 @@ def main(argv: list[str] | None = None) -> int:
     build.add_argument("--out", type=Path, default=FIXTURE_DIR)
     build.add_argument("--verdicts", default=",".join(DEFAULT_VERDICTS))
     build.add_argument("--scenarios", default="", help="comma separated; default is every one")
+    build.add_argument("--models", default="", help="comma separated; default is every one")
     build.add_argument(
         "--keep-reasoning",
         action="store_true",
@@ -138,6 +142,7 @@ def main(argv: list[str] | None = None) -> int:
         group_events(load_jsonl(args.trace)),
         verdicts=tuple(value for value in args.verdicts.split(",") if value),
         scenarios=tuple(value for value in args.scenarios.split(",") if value),
+        models=tuple(value for value in args.models.split(",") if value),
         keep_reasoning=args.keep_reasoning,
     )
     written = write_fixtures(fixtures, args.out)

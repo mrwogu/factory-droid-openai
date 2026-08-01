@@ -1,0 +1,17 @@
+{"kind": "meta", "scenario": "tool_result_followup", "stream": false, "recorded_model": "auto", "expect_verdict": "pass"}
+{"kind": "session_started"}
+{"kind": "status", "state": "streaming_assistant_message"}
+{"kind": "usage", "usage": {"prompt_tokens": 755, "completion_tokens": 25, "total_tokens": 780, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "usage", "usage": {"prompt_tokens": 8666, "completion_tokens": 347, "total_tokens": 9013, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "Weather"}
+{"kind": "text_delta", "text": " in"}
+{"kind": "text_delta", "text": " G"}
+{"kind": "text_delta", "text": "d"}
+{"kind": "text_delta", "text": "ansk"}
+{"kind": "text_delta", "text": ":"}
+{"kind": "text_delta", "text": " "}
+{"kind": "text_delta", "text": "20"}
+{"kind": "text_delta", "text": "°C"}
+{"kind": "text_delta", "text": "."}
+{"kind": "status", "state": "idle"}
+{"kind": "run_complete", "usage": {"prompt_tokens": 8666, "completion_tokens": 347, "total_tokens": 9013, "prompt_tokens_details": {"cached_tokens": 0}}}

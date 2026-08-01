@@ -1,0 +1,7 @@
+{"kind": "meta", "scenario": "tool_required", "stream": false, "recorded_model": "kimi-k2.6", "expect_verdict": "pass"}
+{"kind": "session_started"}
+{"kind": "status", "state": "streaming_assistant_message"}
+{"kind": "usage", "usage": {"prompt_tokens": 717, "completion_tokens": 27, "total_tokens": 744, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "<tool_call>{\"name\":\"weather\",\"arguments\":{\"city\":\"Gdansk\"}}</tool_call>"}
+{"kind": "status", "state": "idle"}
+{"kind": "run_complete", "usage": {"prompt_tokens": 717, "completion_tokens": 27, "total_tokens": 744, "prompt_tokens_details": {"cached_tokens": 0}}}

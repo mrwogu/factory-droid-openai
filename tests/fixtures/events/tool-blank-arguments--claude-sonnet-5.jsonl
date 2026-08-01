@@ -1,0 +1,10 @@
+{"kind": "meta", "scenario": "tool_blank_arguments", "stream": false, "recorded_model": "claude-sonnet-5", "expect_verdict": "pass"}
+{"kind": "session_started"}
+{"kind": "status", "state": "streaming_assistant_message"}
+{"kind": "usage", "usage": {"prompt_tokens": 738, "completion_tokens": 27, "total_tokens": 765, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "It"}
+{"kind": "text_delta", "text": "'s "}
+{"kind": "text_delta", "text": "12:00 in Gd"}
+{"kind": "text_delta", "text": "ansk."}
+{"kind": "status", "state": "idle"}
+{"kind": "run_complete", "usage": {"prompt_tokens": 738, "completion_tokens": 27, "total_tokens": 765, "prompt_tokens_details": {"cached_tokens": 0}}}

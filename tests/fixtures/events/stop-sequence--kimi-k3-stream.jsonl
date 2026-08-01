@@ -1,0 +1,10 @@
+{"kind": "meta", "scenario": "stop_sequence", "stream": true, "recorded_model": "kimi-k3", "expect_verdict": "pass"}
+{"kind": "session_started"}
+{"kind": "status", "state": "streaming_assistant_message"}
+{"kind": "usage", "usage": {"prompt_tokens": 461, "completion_tokens": 11, "total_tokens": 472, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "usage", "usage": {"prompt_tokens": 461, "completion_tokens": 11, "total_tokens": 472, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "usage", "usage": {"prompt_tokens": 461, "completion_tokens": 11, "total_tokens": 472, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "4"}
+{"kind": "text_delta", "text": " words:"}
+{"kind": "text_delta", "text": " one, two,"}
+{"kind": "text_delta", "text": " THREE, four."}
