@@ -1,0 +1,51 @@
+{"kind": "meta", "scenario": "tool_result_followup", "stream": false, "recorded_model": "gpt-5.2", "expect_verdict": "pass"}
+{"kind": "session_started"}
+{"kind": "status", "state": "streaming_assistant_message"}
+{"kind": "usage", "usage": {"prompt_tokens": 755, "completion_tokens": 29, "total_tokens": 784, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "Cannot"}
+{"kind": "text_delta", "text": " call"}
+{"kind": "text_delta", "text": " `"}
+{"kind": "text_delta", "text": "weather"}
+{"kind": "text_delta", "text": "`"}
+{"kind": "text_delta", "text": " tool"}
+{"kind": "text_delta", "text": " here"}
+{"kind": "text_delta", "text": "."}
+{"kind": "text_delta", "text": " Only"}
+{"kind": "text_delta", "text": " tools"}
+{"kind": "text_delta", "text": " available"}
+{"kind": "text_delta", "text": ":"}
+{"kind": "text_delta", "text": " `"}
+{"kind": "text_delta", "text": "functions"}
+{"kind": "text_delta", "text": ".Exit"}
+{"kind": "text_delta", "text": "Spec"}
+{"kind": "text_delta", "text": "Mode"}
+{"kind": "text_delta", "text": "`,"}
+{"kind": "text_delta", "text": " `"}
+{"kind": "text_delta", "text": "multi"}
+{"kind": "text_delta", "text": "_tool"}
+{"kind": "text_delta", "text": "_use"}
+{"kind": "text_delta", "text": ".parallel"}
+{"kind": "text_delta", "text": "`."}
+{"kind": "text_delta", "text": "  \n"}
+{"kind": "text_delta", "text": "If"}
+{"kind": "text_delta", "text": " you"}
+{"kind": "text_delta", "text": " want"}
+{"kind": "text_delta", "text": " G"}
+{"kind": "text_delta", "text": "d"}
+{"kind": "text_delta", "text": "ansk"}
+{"kind": "text_delta", "text": " weather"}
+{"kind": "text_delta", "text": ":"}
+{"kind": "text_delta", "text": " enable"}
+{"kind": "text_delta", "text": " weather"}
+{"kind": "text_delta", "text": " tool"}
+{"kind": "text_delta", "text": " in"}
+{"kind": "text_delta", "text": " this"}
+{"kind": "text_delta", "text": " environment"}
+{"kind": "text_delta", "text": ","}
+{"kind": "text_delta", "text": " or"}
+{"kind": "text_delta", "text": " paste"}
+{"kind": "text_delta", "text": " tool"}
+{"kind": "text_delta", "text": " output"}
+{"kind": "text_delta", "text": "."}
+{"kind": "status", "state": "idle"}
+{"kind": "run_complete", "usage": {"prompt_tokens": 755, "completion_tokens": 29, "total_tokens": 784, "prompt_tokens_details": {"cached_tokens": 0}}}

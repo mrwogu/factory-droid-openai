@@ -1,0 +1,20 @@
+{"kind": "meta", "scenario": "tool_blank_arguments", "stream": true, "recorded_model": "auto", "expect_verdict": "pass"}
+{"kind": "session_started"}
+{"kind": "status", "state": "streaming_assistant_message"}
+{"kind": "usage", "usage": {"prompt_tokens": 738, "completion_tokens": 27, "total_tokens": 765, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "usage", "usage": {"prompt_tokens": 738, "completion_tokens": 27, "total_tokens": 765, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "usage", "usage": {"prompt_tokens": 1211, "completion_tokens": 345, "total_tokens": 1556, "prompt_tokens_details": {"cached_tokens": 7424}}}
+{"kind": "text_delta", "text": "It"}
+{"kind": "text_delta", "text": "’s"}
+{"kind": "text_delta", "text": " "}
+{"kind": "text_delta", "text": "12"}
+{"kind": "text_delta", "text": ":"}
+{"kind": "text_delta", "text": "00"}
+{"kind": "text_delta", "text": " in"}
+{"kind": "text_delta", "text": " G"}
+{"kind": "text_delta", "text": "d"}
+{"kind": "text_delta", "text": "ansk"}
+{"kind": "text_delta", "text": "."}
+{"kind": "usage", "usage": {"prompt_tokens": 1211, "completion_tokens": 345, "total_tokens": 1556, "prompt_tokens_details": {"cached_tokens": 7424}}}
+{"kind": "status", "state": "idle"}
+{"kind": "run_complete", "usage": {"prompt_tokens": 1211, "completion_tokens": 345, "total_tokens": 1556, "prompt_tokens_details": {"cached_tokens": 7424}}}

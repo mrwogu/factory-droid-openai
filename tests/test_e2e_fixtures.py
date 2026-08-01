@@ -98,6 +98,18 @@ def test_only_selected_rows_with_recorded_events_become_fixtures(
     }
 
 
+def test_fixtures_can_be_limited_to_one_model(fixtures_script: ModuleType) -> None:
+    rows = [_row(), _row(request_id="req-2", model="kimi-k3")]
+    events = {
+        "req-1": [{"kind": "text_delta", "text": "a"}],
+        "req-2": [{"kind": "text_delta", "text": "b"}],
+    }
+
+    built = fixtures_script.build_fixtures(rows, events, models=("kimi-k3",))
+
+    assert list(built) == ["tool-required--kimi-k3.jsonl"]
+
+
 def test_reasoning_is_dropped_unless_it_is_asked_for(fixtures_script: ModuleType) -> None:
     rows = [_row()]
     events = {

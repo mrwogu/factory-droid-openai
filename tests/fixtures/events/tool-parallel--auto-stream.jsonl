@@ -1,0 +1,47 @@
+{"kind": "meta", "scenario": "tool_parallel", "stream": true, "recorded_model": "auto", "expect_verdict": "pass"}
+{"kind": "session_started"}
+{"kind": "status", "state": "streaming_assistant_message"}
+{"kind": "usage", "usage": {"prompt_tokens": 766, "completion_tokens": 32, "total_tokens": 798, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "usage", "usage": {"prompt_tokens": 1267, "completion_tokens": 295, "total_tokens": 1562, "prompt_tokens_details": {"cached_tokens": 7424}}}
+{"kind": "text_delta", "text": "<"}
+{"kind": "text_delta", "text": "tool"}
+{"kind": "text_delta", "text": "_call"}
+{"kind": "text_delta", "text": ">{\""}
+{"kind": "text_delta", "text": "name"}
+{"kind": "text_delta", "text": "\":\""}
+{"kind": "text_delta", "text": "weather"}
+{"kind": "text_delta", "text": "\",\""}
+{"kind": "text_delta", "text": "arguments"}
+{"kind": "text_delta", "text": "\":{\""}
+{"kind": "text_delta", "text": "city"}
+{"kind": "text_delta", "text": "\":\""}
+{"kind": "text_delta", "text": "G"}
+{"kind": "text_delta", "text": "d"}
+{"kind": "text_delta", "text": "ansk"}
+{"kind": "text_delta", "text": "\""}
+{"kind": "text_delta", "text": "}}</"}
+{"kind": "text_delta", "text": "tool"}
+{"kind": "text_delta", "text": "_call"}
+{"kind": "text_delta", "text": ">\n"}
+{"kind": "text_delta", "text": "<"}
+{"kind": "text_delta", "text": "tool"}
+{"kind": "text_delta", "text": "_call"}
+{"kind": "text_delta", "text": ">{\""}
+{"kind": "text_delta", "text": "name"}
+{"kind": "text_delta", "text": "\":\""}
+{"kind": "text_delta", "text": "clock"}
+{"kind": "text_delta", "text": "\",\""}
+{"kind": "text_delta", "text": "arguments"}
+{"kind": "text_delta", "text": "\":{\""}
+{"kind": "text_delta", "text": "city"}
+{"kind": "text_delta", "text": "\":\""}
+{"kind": "text_delta", "text": "G"}
+{"kind": "text_delta", "text": "d"}
+{"kind": "text_delta", "text": "ansk"}
+{"kind": "text_delta", "text": "\""}
+{"kind": "text_delta", "text": "}}</"}
+{"kind": "text_delta", "text": "tool"}
+{"kind": "text_delta", "text": "_call"}
+{"kind": "text_delta", "text": ">"}
+{"kind": "status", "state": "idle"}
+{"kind": "run_complete", "usage": {"prompt_tokens": 1267, "completion_tokens": 295, "total_tokens": 1562, "prompt_tokens_details": {"cached_tokens": 7424}}}

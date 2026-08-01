@@ -1,0 +1,9 @@
+{"kind": "meta", "scenario": "tool_result_followup", "stream": false, "recorded_model": "gemini-3.1-pro-preview", "expect_verdict": "pass"}
+{"kind": "session_started"}
+{"kind": "status", "state": "streaming_assistant_message"}
+{"kind": "usage", "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "usage", "usage": {"prompt_tokens": 755, "completion_tokens": 16, "total_tokens": 771, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "Gdansk: 20°C."}
+{"kind": "text_delta", "text": ""}
+{"kind": "status", "state": "idle"}
+{"kind": "run_complete", "usage": {"prompt_tokens": 755, "completion_tokens": 16, "total_tokens": 771, "prompt_tokens_details": {"cached_tokens": 0}}}

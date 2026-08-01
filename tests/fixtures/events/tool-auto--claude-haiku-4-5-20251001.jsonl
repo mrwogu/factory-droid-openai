@@ -1,11 +1,11 @@
 {"kind": "meta", "scenario": "tool_auto", "stream": false, "recorded_model": "claude-haiku-4-5-20251001", "expect_verdict": "pass"}
 {"kind": "session_started"}
 {"kind": "status", "state": "streaming_assistant_message"}
-{"kind": "usage", "usage": {"prompt_tokens": 661, "completion_tokens": 9, "total_tokens": 670, "prompt_tokens_details": {"cached_tokens": 0}}}
-{"kind": "text_delta", "text": "<tool_call>{\"name\":\""}
+{"kind": "usage", "usage": {"prompt_tokens": 686, "completion_tokens": 27, "total_tokens": 713, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "<tool_call>"}
+{"kind": "text_delta", "text": "{\""}
+{"kind": "text_delta", "text": "name\":\""}
 {"kind": "text_delta", "text": "weather\",\"arguments\":{\"city\":\""}
-{"kind": "text_delta", "text": "Gdansk\"}"}
-{"kind": "text_delta", "text": "}</tool_call>"}
-{"kind": "usage", "usage": {"prompt_tokens": 661, "completion_tokens": 9, "total_tokens": 670, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "Gdansk\"}}</tool_call>"}
 {"kind": "status", "state": "idle"}
-{"kind": "run_complete", "usage": {"prompt_tokens": 661, "completion_tokens": 9, "total_tokens": 670, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "run_complete", "usage": {"prompt_tokens": 686, "completion_tokens": 27, "total_tokens": 713, "prompt_tokens_details": {"cached_tokens": 0}}}

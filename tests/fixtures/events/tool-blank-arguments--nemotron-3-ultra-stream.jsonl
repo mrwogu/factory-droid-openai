@@ -1,0 +1,14 @@
+{"kind": "meta", "scenario": "tool_blank_arguments", "stream": true, "recorded_model": "nemotron-3-ultra", "expect_verdict": "pass"}
+{"kind": "session_started"}
+{"kind": "status", "state": "streaming_assistant_message"}
+{"kind": "usage", "usage": {"prompt_tokens": 738, "completion_tokens": 27, "total_tokens": 765, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "\n"}
+{"kind": "text_delta", "text": "\n"}
+{"kind": "usage", "usage": {"prompt_tokens": 5310, "completion_tokens": 77, "total_tokens": 5387, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "\n"}
+{"kind": "text_delta", "text": "\n"}
+{"kind": "usage", "usage": {"prompt_tokens": 9900, "completion_tokens": 126, "total_tokens": 10026, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "It's 12:0"}
+{"kind": "text_delta", "text": "0 in Gdansk."}
+{"kind": "status", "state": "idle"}
+{"kind": "run_complete", "usage": {"prompt_tokens": 9900, "completion_tokens": 126, "total_tokens": 10026, "prompt_tokens_details": {"cached_tokens": 0}}}
