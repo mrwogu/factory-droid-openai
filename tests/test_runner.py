@@ -17,6 +17,7 @@ from droid_sdk import (
     ErrorEvent,
     ThinkingTextDelta,
     TokenUsageUpdate,
+    ToolResult,
     ToolUse,
     TurnComplete,
     WorkingStateChanged,
@@ -257,11 +258,51 @@ async def test_runner_blocks_factory_native_tools(tmp_path: Path) -> None:
         client_factory=cast("Any", lambda _path, _cwd: client),
     )
 
-    with pytest.raises(RunnerError, match="native tool"):
+    with pytest.raises(RunnerError, match="native tool 'terminal'"):
         _ = [event async for event in runner.run(_request())]
 
     assert client.interrupted is True
     assert client.closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["ToolSearch", "ExitSpecMode", "exit-spec-mode"])
+async def test_runner_lets_droid_meta_tools_pass(tmp_path: Path, tool_name: str) -> None:
+    client = FakeClient(
+        [
+            ToolUse(
+                tool_name=tool_name,
+                tool_input={"query": "select:weather"},
+                tool_use_id="meta-call",
+            ),
+            # Droid answers a tolerated call without naming the tool again.
+            ToolResult(tool_name="", content="tool disabled", is_error=True),
+            AssistantTextDelta("done"),
+            TurnComplete(token_usage=None),
+        ]
+    )
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    events = [event async for event in runner.run(_request())]
+
+    assert [type(event).__name__ for event in events][-2:] == ["TextDelta", "RunComplete"]
+
+
+@pytest.mark.asyncio
+async def test_runner_blocks_an_unattributed_tool_result(tmp_path: Path) -> None:
+    client = FakeClient([ToolResult(tool_name="", content="", is_error=False)])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    with pytest.raises(RunnerError, match="native tool ''"):
+        _ = [event async for event in runner.run(_request())]
 
 
 @pytest.mark.asyncio
@@ -288,6 +329,8 @@ async def test_runner_maps_sdk_error_event(tmp_path: Path) -> None:
         # Verbatim from a provider that lists a model it cannot serve.
         '404 {"error":{"message":"Model not found, inaccessible, and/or not deployed",'
         '"param":"model","code":"NOT_FOUND","type":"error"}}',
+        # The same provider words the same refusal differently on other days.
+        "Requested model was not found on the API provider",
     ],
 )
 async def test_runner_maps_unusable_model_error_event(tmp_path: Path, message: str) -> None:

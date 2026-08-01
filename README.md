@@ -1464,7 +1464,11 @@ For every Droid session, the bridge:
 6. Disables every discovered tool ID and verifies no unexpected tool remains.
    Tools that appear after this point stay denied, because Droid defaults to
    deny once a disabled set has been sent.
-7. Rejects any Factory-native tool event as a second line of defense.
+7. Rejects any Factory-native tool event as a second line of defense, naming the
+   tool in the error. Droid keeps two of its own meta tools callable whatever a
+   session disables, `exit-spec-mode` and the deferred-tool loader; weaker
+   models spend part of a turn reaching for them, so those two events are
+   ignored rather than failing a turn Droid never executed.
 8. Validates generated tool names against the request schema.
 9. Requires tool arguments to be a JSON object with unique keys.
 10. Caps the number of tool calls accepted in one turn.

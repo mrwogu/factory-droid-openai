@@ -60,11 +60,23 @@ _BASE_EXEC_ARGS = (
 # error, so the wording is the only signal that the model, not the bridge, is
 # at fault.
 _MODEL_DENIED_PATTERN = re.compile(
-    r"(?:model (?:is )?not (?:allowed|available|permitted|enabled|found|deployed)"
-    r"|model (?:is )?inaccessible"
+    r"(?:model (?:is |was )?not (?:allowed|available|permitted|enabled|found|deployed)"
+    r"|model (?:is |was )?inaccessible"
     r"|invalid model id)",
     re.IGNORECASE,
 )
+# Droid keeps two of its own meta tools callable whatever a session disables:
+# exit-spec-mode, and the loader that would fetch a deferred tool. Neither
+# touches the machine, and Droid refuses to run them in a session with every
+# tool disabled, so the model only wastes its own turn reaching for them.
+# Weaker models do exactly that before answering, which is worth tolerating;
+# every other native tool still fails the turn closed.
+_IGNORED_NATIVE_TOOLS = frozenset({"exitspecmode", "toolsearch"})
+
+
+def _is_ignorable_native_tool(tool_name: str) -> bool:
+    """Report whether an event names a Droid meta tool the bridge tolerates."""
+    return tool_name.replace("-", "").replace("_", "").casefold() in _IGNORED_NATIVE_TOOLS
 
 
 class RunnerError(RuntimeError):
@@ -377,6 +389,7 @@ class DroidRunner:
             )
         initialized = warm is not None
         completed = False
+        ignored_native_tool = False
         usage = Usage()
 
         try:
@@ -498,8 +511,21 @@ class DroidRunner:
                         )
                         yield RunComplete(usage)
                     elif isinstance(event, (ToolUse, ToolResult, ToolProgress)):
+                        if _is_ignorable_native_tool(event.tool_name):
+                            ignored_native_tool = True
+                            log_debug("droid.native_tool_ignored", tool=event.tool_name)
+                            continue
+                        # Droid answers a tolerated call with a result that
+                        # carries no tool name, so provenance is what decides:
+                        # nameless events belong to the call just ignored, and
+                        # anything else is a native tool this bridge refuses.
+                        if not event.tool_name and ignored_native_tool:
+                            continue
+                        # Naming the tool is what tells an operator whether the
+                        # model reached for Droid's own toolset or answered a
+                        # client tool in Droid's dialect instead of the markers.
                         raise RunnerError(
-                            "Factory Droid attempted to use a native tool. "
+                            f"Factory Droid attempted to use native tool {event.tool_name!r}. "
                             "The bridge only permits tools supplied by the OpenAI client.",
                             error_type="factory_native_tool_blocked",
                         )
