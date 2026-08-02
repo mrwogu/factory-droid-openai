@@ -33,7 +33,7 @@ body:
     id: bridge-version
     attributes:
       label: Bridge version
-      placeholder: 1.6.2
+      placeholder: 1.6.3
     validations:
       required: true
   - type: input
@@ -55,8 +55,8 @@ body:
     attributes:
       label: Model
       description: >-
-        Model id sent in the request. Tool-call behavior differs per model, so
-        a report without it is hard to reproduce.
+        Model id sent in the request. Tool-call behavior differs per model, so a
+        report without it is hard to reproduce.
       placeholder: claude-sonnet-4-5
     validations:
       required: true
@@ -82,13 +82,12 @@ body:
       label: Recorded Droid events (optional, most useful)
       description: >-
         A recorded event stream turns this report into an offline regression
-        test. Restart the bridge with
-        `FACTORY_DROID_OPENAI_TRACE_PAYLOADS=full` and
-        `FACTORY_DROID_OPENAI_TRACE_FILE=/path/trace.jsonl`, reproduce once,
-        then paste the `droid.event` lines of that request:
-        `grep '"event": "droid.event"' /path/trace.jsonl`. Every line contains
-        the model output verbatim, so read it before pasting and remove
-        anything private. See the payload tracing section of the README.
+        test. Restart the bridge with `FACTORY_DROID_OPENAI_TRACE_PAYLOADS=full`
+        and `FACTORY_DROID_OPENAI_TRACE_FILE=/path/trace.jsonl`, reproduce once,
+        then paste the `droid.event` lines of that request: `grep '"event":
+        "droid.event"' /path/trace.jsonl`. Every line contains the model output
+        verbatim, so read it before pasting and remove anything private. See the
+        payload tracing section of the README.
       render: json
   - type: checkboxes
     id: checks

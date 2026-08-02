@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.6.3](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.2...v1.6.3) (2026-08-02)
+
+
+### Bug Fixes
+
+* **protocol:** name the callable tools in the prompt ([d9ba819](https://github.com/mrwogu/factory-droid-openai/commit/d9ba8197cc5c4f4b6a167fa5c04720f6e9a2fa72))
+* **runner:** map upstream model refusals to 404 ([4afb298](https://github.com/mrwogu/factory-droid-openai/commit/4afb298d35457cd2e1d3e42a337e2e84ac73035f))
+* **runner:** tolerate the two tools Droid keeps callable ([46c5627](https://github.com/mrwogu/factory-droid-openai/commit/46c562769eb7cfc2d557982bbe8de8ef344fedb1))
+
 ## [1.6.2](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.1...v1.6.2) (2026-07-31)
 
 
