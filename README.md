@@ -1396,10 +1396,32 @@ IDs, and session IDs only.
 Prompts and malformed tool-call payloads stay out of the log stream. When a
 protocol bug needs the actual bytes, opt into a separate JSONL trace file:
 
+**Local Python:**
+
 ```bash
+mkdir -p "$HOME/.cache/factory-droid-openai"
 export FACTORY_DROID_OPENAI_TRACE_PAYLOADS=heads
 export FACTORY_DROID_OPENAI_TRACE_FILE="$HOME/.cache/factory-droid-openai/trace.jsonl"
 factory-droid-openai
+```
+
+**Docker:**
+
+For Docker, `-v` is a bind mount, not a named volume. If the source
+`$PWD/traces` does not exist, Docker may create it as `root:root`, while the
+container runs as uid 1000. Run `mkdir -p "$PWD/traces"` on the host before
+`docker run` to preserve the correct owner.
+
+```bash
+mkdir -p "$PWD/traces"
+docker run -d --rm --pull=always --name droid-bridge \
+  -p 127.0.0.1:8787:8787 \
+  -e FACTORY_API_KEY="$FACTORY_API_KEY" \
+  -e FACTORY_DROID_OPENAI_API_KEY="$FACTORY_DROID_OPENAI_API_KEY" \
+  -e FACTORY_DROID_OPENAI_TRACE_PAYLOADS=full \
+  -e FACTORY_DROID_OPENAI_TRACE_FILE=/work/traces/session.log \
+  -v "$PWD/traces:/work/traces" \
+  ghcr.io/mrwogu/factory-droid-openai:latest
 ```
 
 | Mode | Recorded per event |
