@@ -344,8 +344,11 @@ def _runtime_metadata(app_version: str) -> dict[str, object]:
     }.get(platform.machine().lower(), "other")
     return {
         "schema": 1,
+        "app": "factory_droid_openai",
+        "event_schema": 1,
         "app_version": app_version,
-        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
+        "runtime": "python",
+        "runtime_version": f"{sys.version_info.major}.{sys.version_info.minor}",
         "os": operating_system,
         "arch": architecture,
     }
