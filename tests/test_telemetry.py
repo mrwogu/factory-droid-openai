@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import threading
 import time
 from typing import Any, cast
@@ -123,8 +124,11 @@ async def test_reporter_sends_startup_and_metric_deltas(
     assert 0 < timeout <= DEFAULT_TELEMETRY_TIMEOUT_SECONDS
     assert startup == {
         "schema": 1,
+        "app": "factory_droid_openai",
+        "event_schema": 1,
         "app_version": "1.5.0",
-        "python_version": _runtime_metadata("unused")["python_version"],
+        "runtime": "python",
+        "runtime_version": _runtime_metadata("unused")["runtime_version"],
         "os": "darwin",
         "arch": "arm64",
         "events": [{"name": "bridge_started", "count": 1}],
@@ -620,6 +624,12 @@ def test_runtime_metadata_normalizes_platform(
 
     metadata = _runtime_metadata("1.5.0")
 
+    assert metadata["schema"] == 1
+    assert metadata["app"] == "factory_droid_openai"
+    assert metadata["event_schema"] == 1
+    assert metadata["app_version"] == "1.5.0"
+    assert metadata["runtime"] == "python"
+    assert metadata["runtime_version"] == f"{sys.version_info.major}.{sys.version_info.minor}"
     assert metadata["os"] == expected_os
     assert metadata["arch"] == expected_arch
 

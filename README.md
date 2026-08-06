@@ -1207,8 +1207,9 @@ disk, and never fails a client request.
 
 Collected fields:
 
-- bridge version, Python major and minor version, operating system family, and
-  CPU architecture
+- fixed application identifier (`factory_droid_openai`), telemetry event schema
+  version, bridge version, runtime family (`python`), Python major and minor
+  version, operating system family, and CPU architecture
 - route category, streaming mode, outcome category, request count, and aggregate
   duration
 - coarse latency buckets by route, payload-size buckets by route, and normalized
