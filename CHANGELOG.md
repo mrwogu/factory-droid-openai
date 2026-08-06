@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.4](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.3...v1.6.4) (2026-08-06)
+
+
+### Bug Fixes
+
+* **telemetry:** send unified collector envelope ([436f2d0](https://github.com/mrwogu/factory-droid-openai/commit/436f2d06e691d149ad844e826a083a4db631dbf1))
+
 ## [1.6.3](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.2...v1.6.3) (2026-08-02)
 
 
