@@ -335,6 +335,8 @@ class Observation:
 # reports that as a protocol error like every other unmet contract. Only the
 # message separates model non-compliance from an actual parser bug.
 _TOOL_CHOICE_IGNORED = "did not produce the required tool call"
+_UNAVAILABLE_TOOL = " is not available"
+_TRAILING_TOOL_TEXT = "unexpected text after tool call"
 
 
 def _content_semantic_error(content: str) -> str | None:
@@ -366,8 +368,14 @@ def _error_verdict(observation: Observation) -> tuple[str, str] | None:
         return ACCOUNT_POLICY, "model unavailable for this account"
     if error_type == "factory_native_tool_blocked":
         return MODEL_BEHAVIOR, "model attempted a Factory-native tool"
-    if error_type == "factory_protocol_error" and _TOOL_CHOICE_IGNORED in observation.error_message:
-        return MODEL_BEHAVIOR, "model ignored tool_choice=required"
+    if error_type == "factory_protocol_error":
+        if _TOOL_CHOICE_IGNORED in observation.error_message:
+            return MODEL_BEHAVIOR, "model ignored tool_choice=required"
+        if (
+            _UNAVAILABLE_TOOL in observation.error_message
+            or _TRAILING_TOOL_TEXT in observation.error_message
+        ):
+            return MODEL_BEHAVIOR, "model emitted an invalid tool-call response"
     if observation.status == 429:
         return CAPACITY, "bridge queue is full"
     if observation.status == 503:
@@ -405,6 +413,8 @@ def classify(scenario: Scenario, observation: Observation) -> tuple[str, str]:
     if observation.finish_reason not in scenario.expect_finish:
         if observation.finish_reason == "tool_calls":
             return MODEL_BEHAVIOR, "model called a tool when none was required"
+        if observation.finish_reason == "length" and scenario.expect_tool_call:
+            return MODEL_BEHAVIOR, "model truncated its tool-call response"
         return BRIDGE_DEFECT, f"unexpected finish_reason {observation.finish_reason}"
     if scenario.expect_tool_call and observation.tool_calls == 0:
         return MODEL_BEHAVIOR, "model produced no client tool call"

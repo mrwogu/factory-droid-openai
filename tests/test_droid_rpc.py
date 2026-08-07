@@ -132,6 +132,39 @@ async def test_disable_native_tools_verifies_exec_and_mcp_catalogs() -> None:
 
 
 @pytest.mark.asyncio
+async def test_disable_native_tools_retries_catalog_settlement() -> None:
+    catalog_reads = 0
+    updates = 0
+
+    def handler(method: str, _params: dict[str, Any]) -> dict[str, Any]:
+        nonlocal catalog_reads, updates
+        if method == "droid.list_mcp_servers":
+            return {"result": {"servers": []}}
+        if method == "droid.list_tools":
+            catalog_reads += 1
+            return {
+                "result": {
+                    "tools": [
+                        {
+                            "id": "read-cli",
+                            "currentlyAllowed": catalog_reads < 3,
+                        },
+                    ]
+                }
+            }
+        if method == "droid.update_session_settings":
+            updates += 1
+            return {"result": {}}
+        raise AssertionError(method)
+
+    protocol = FakeProtocol(handler)
+
+    await DroidRpcExtension().disable_native_tools(_client(protocol))
+
+    assert updates == 2
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("tools", "message"),
     [
