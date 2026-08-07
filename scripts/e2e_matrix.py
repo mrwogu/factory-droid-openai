@@ -29,6 +29,8 @@ from typing import Any
 
 import httpx
 
+from factory_droid_openai.dialects import strip_code_fence
+
 DEFAULT_BASE_URL = "http://127.0.0.1:8787"
 _WEATHER_TOOL: dict[str, Any] = {
     "type": "function",
@@ -337,7 +339,7 @@ _TOOL_CHOICE_IGNORED = "did not produce the required tool call"
 
 def _content_semantic_error(content: str) -> str | None:
     """Reject serialized OpenAI transcript objects returned as final text."""
-    stripped = content.strip()
+    stripped = strip_code_fence(content.strip())
     try:
         payload = json.loads(stripped)
     except ValueError:

@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from factory_droid_openai import logs
+from factory_droid_openai import logs, protocol
 from factory_droid_openai.models import ChatCompletionRequest
 from factory_droid_openai.protocol import (
     _MAX_TOOL_PAYLOAD_BYTES,
@@ -20,7 +20,6 @@ from factory_droid_openai.protocol import (
     TextEmission,
     ToolCallEmission,
     ToolCallStreamParser,
-    _decode_json_prefix,
     build_prompt,
     parse_strict_json,
 )
@@ -798,21 +797,139 @@ def test_stream_parser_rejects_an_oversized_transcript_message() -> None:
 
     with pytest.raises(MalformedToolCallError, match="echoed an OpenAI transcript"):
         parser.feed('{"role":"assistant","content":"' + ("x" * 1_000_001))
+    assert parser.finish() == []
 
 
-def test_stream_parser_accepts_assistant_message_content_without_tool_calls() -> None:
+def test_stream_parser_preserves_assistant_message_content_without_tool_calls() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    message = '{"role":"assistant","content":"done"}'
+
+    emissions = parser.feed(message)
+
+    assert emissions == [TextEmission(message)]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        (
+            '{ "role" : "assistant", "tool_calls": '
+            '[{"function":{"name":"weather","arguments":"{}"}}]}'
+        ),
+        (
+            '{"content":null,"tool_calls":'
+            '[{"function":{"name":"weather","arguments":"{}"}}],"role":"assistant"}'
+        ),
+    ],
+)
+def test_stream_parser_recognizes_message_json_across_layouts(message: str) -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    emissions: list[object] = []
+
+    for char in message:
+        emissions.extend(parser.feed(char))
+    emissions.extend(parser.finish())
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert emissions[0].name == "weather"
+
+
+def test_stream_parser_preserves_prose_that_quotes_an_assistant_message() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    text = 'Example: {"role":"assistant","content":"done"}'
+
+    emissions = parser.feed(text)
+    emissions.extend(parser.finish())
+
+    assert "".join(item.text for item in emissions if isinstance(item, TextEmission)) == text
+
+
+def test_stream_parser_rejects_incomplete_reordered_message_json() -> None:
     parser = ToolCallStreamParser(frozenset({"weather"}))
 
-    emissions = parser.feed('{"role":"assistant","content":"done"}')
+    assert parser.feed('{ "content":') == []
+    with pytest.raises(MalformedToolCallError, match="echoed an OpenAI transcript"):
+        parser.finish()
 
-    assert emissions == [TextEmission("done")]
 
-
-def test_stream_parser_holds_a_split_transcript_prefix() -> None:
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{ "answer": invalid}',
+        '{"role":"assistant","content":"done"} trailing',
+    ],
+)
+def test_stream_parser_preserves_plain_json_candidates(text: str) -> None:
     parser = ToolCallStreamParser(frozenset({"weather"}))
 
-    assert parser.feed('{"rol') == []
-    assert parser.feed('e":"assistant","content":"done"}') == [TextEmission("done")]
+    emissions = parser.feed(text)
+    emissions.extend(parser.finish())
+
+    assert "".join(item.text for item in emissions if isinstance(item, TextEmission)) == text
+
+
+def test_stream_parser_preserves_nested_message_fields() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    text = '{"content":"ok","metadata":{"role":"tool","tool_calls":[]}}'
+
+    assert parser.feed(text) == [TextEmission(text)]
+
+
+def test_stream_parser_handles_many_adjacent_json_objects_iteratively() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    text = '{"role":"assistant","content":"ok"}' + '{"x":1}' * 1_500
+
+    emissions = parser.feed(text)
+    emissions.extend(parser.finish())
+
+    assert "".join(item.text for item in emissions if isinstance(item, TextEmission)) == text
+
+
+def test_stream_parser_keeps_a_bounded_partial_message_prefix() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    emissions: list[object] = []
+    widest_tail = 0
+
+    for _ in range(1_000):
+        emissions.extend(parser.feed("{ "))
+        widest_tail = max(widest_tail, len(parser._text_tail))
+    emissions.extend(parser.finish())
+
+    assert widest_tail <= 64
+    assert (
+        "".join(item.text for item in emissions if isinstance(item, TextEmission)) == "{ " * 1_000
+    )
+
+
+def test_stream_parser_releases_non_message_object_prefix() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    assert parser.feed("{x") == [TextEmission("{x")]
+
+
+def test_stream_parser_decodes_message_json_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original = protocol.parse_strict_json
+
+    def counted_parse(value: str) -> Any:
+        nonlocal calls
+        calls += 1
+        return original(value)
+
+    monkeypatch.setattr(protocol, "parse_strict_json", counted_parse)
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    message = (
+        '{"content":null,"tool_calls":'
+        '[{"function":{"name":"weather","arguments":{}}}],"role":"assistant"}'
+    )
+
+    for char in message:
+        parser.feed(char)
+
+    assert calls == 1
 
 
 def test_stream_parser_drops_copied_tool_messages_after_assistant_json() -> None:
@@ -838,7 +955,6 @@ def test_stream_parser_drops_copied_tool_messages_after_assistant_json() -> None
         '{"role":"tool","content":"copied","tool_call_id":"call_model"}',
         '{"role":"assistant","tool_calls":[{"function":{"name":"weather","arguments":"[]"}}]}',
         '{"role":"assistant","tool_calls":"not a list"}',
-        '{"role":"assistant"}',
         '{"role":"assistant","tool_calls":[7]}',
         '{"role":"assistant","tool_calls":[{"function":"bad"}]}',
         '{"role":"assistant","tool_calls":[{"function":{"name":7}}]}',
@@ -902,29 +1018,19 @@ def test_stream_parser_rejects_non_finite_assistant_arguments(payload: str) -> N
         parser.feed(payload)
 
 
-def test_decode_json_prefix_skips_leading_whitespace() -> None:
-    values, remainder = _decode_json_prefix('  {"role":"assistant","content":"done"}')
-
-    assert values == [
-        (
-            {"role": "assistant", "content": "done"},
-            '{"role":"assistant","content":"done"}',
-        )
-    ]
-    assert remainder == ""
-
-
 @pytest.mark.parametrize("payload", ['{"role":NaN}', '{"role":1e999}'])
-def test_decode_json_prefix_rejects_non_finite_values(payload: str) -> None:
-    with pytest.raises(ValueError, match=r"non-JSON numeric constant|non-finite number"):
-        _decode_json_prefix(payload)
+def test_stream_parser_rejects_non_finite_message_values(payload: str) -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    with pytest.raises(MalformedToolCallError, match="echoed an OpenAI transcript"):
+        parser.feed(payload)
 
 
-def test_decode_json_prefix_keeps_finite_float() -> None:
-    values, remainder = _decode_json_prefix('{"role":1.5}')
+def test_stream_parser_preserves_non_message_json() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    payload = '{"role":1.5}'
 
-    assert values == [({"role": 1.5}, '{"role":1.5}')]
-    assert remainder == ""
+    assert parser.feed(payload) == [TextEmission(payload)]
 
 
 def test_stream_parser_repairs_lost_prefix_wrapped_form() -> None:

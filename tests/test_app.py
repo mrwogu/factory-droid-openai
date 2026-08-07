@@ -1786,6 +1786,32 @@ async def test_non_streaming_malformed_tool_call_stops_with_note(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_non_streaming_incomplete_message_json_stops_with_note(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [
+            TextDelta('{"role":"assistant","tool_calls":'),
+            RunComplete(Usage()),
+        ]
+    )
+    payload = _payload(
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ]
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "stop"
+    assert choice["message"]["content"].startswith("[bridge notice: dropped a malformed tool call")
+    assert "tool_calls" not in choice["message"]
+
+
+@pytest.mark.asyncio
 async def test_streaming_malformed_tool_call_without_prior_text(tmp_path: Path) -> None:
     runner = FakeRunner(
         [
@@ -2962,6 +2988,57 @@ async def test_json_schema_response_format_is_enforced_and_forwarded(
         "type": "json_schema",
         "schema": schema,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_response_format_preserves_message_shaped_json(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    message = '{"role":"assistant","content":"done"}'
+    runner = FakeRunner(
+        [
+            TextDelta(message[:12]),
+            TextDelta(message[12:]),
+            RunComplete(Usage()),
+        ]
+    )
+    schema = {
+        "type": "object",
+        "properties": {
+            "role": {"const": "assistant"},
+            "content": {"type": "string"},
+        },
+        "required": ["role", "content"],
+        "additionalProperties": False,
+    }
+    payload = _payload(
+        stream=stream,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {"name": "message", "schema": schema},
+        },
+    )
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    if stream:
+        chunks = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith('data: {"')
+        ]
+        content = "".join(
+            choice["delta"].get("content") or ""
+            for chunk in chunks
+            for choice in chunk.get("choices", [])
+        )
+    else:
+        content = response.json()["choices"][0]["message"]["content"]
+    assert content == message
 
 
 @pytest.mark.asyncio

@@ -1287,21 +1287,25 @@ def create_app(
                 metrics.record_features(("warm_session",))
                 run_request = replace(run_request, warm_session=warm_session)
 
+        def message_parser() -> ToolCallStreamParser:
+            return ToolCallStreamParser(
+                plan.allowed_tool_names,
+                require_tool_call=plan.require_tool_call,
+                max_tool_calls=(
+                    resolved_settings.max_tool_calls if payload.parallel_tool_calls else 1
+                ),
+                repair_lost_prefix=resolved_settings.repair_lost_prefix,
+                parse_message_json=structured is None,
+                trace_payload=payload_tracer.trace,
+            )
+
         if payload.stream:
             request.state.stream_outcome = "pending"
             event_stream = _stream_completion(
                 request_id=request_id,
                 created=created,
                 model=payload.model,
-                parser=ToolCallStreamParser(
-                    plan.allowed_tool_names,
-                    require_tool_call=plan.require_tool_call,
-                    max_tool_calls=(
-                        resolved_settings.max_tool_calls if payload.parallel_tool_calls else 1
-                    ),
-                    repair_lost_prefix=resolved_settings.repair_lost_prefix,
-                    trace_payload=payload_tracer.trace,
-                ),
+                parser=message_parser(),
                 runner=runner,
                 run_request=run_request,
                 lease=lease,
@@ -1358,17 +1362,7 @@ def create_app(
                         request=request,
                         runner=choice_runner,
                         run_request=choice_request,
-                        parser=ToolCallStreamParser(
-                            plan.allowed_tool_names,
-                            require_tool_call=plan.require_tool_call,
-                            max_tool_calls=(
-                                resolved_settings.max_tool_calls
-                                if payload.parallel_tool_calls
-                                else 1
-                            ),
-                            repair_lost_prefix=resolved_settings.repair_lost_prefix,
-                            trace_payload=payload_tracer.trace,
-                        ),
+                        parser=message_parser(),
                         metrics=metrics,
                         request_started_at=request_started_at,
                         stop_sequences=payload.stop_sequences,
@@ -1554,6 +1548,19 @@ async def _collect_completion(
     result = CollectedCompletion()
     stop_buffer = StopSequenceBuffer(stop_sequences)
     observed_ttft = False
+
+    def record_malformed(exc: MalformedToolCallError) -> None:
+        result.malformed_note = _malformed_tool_call_note(exc)
+        result.completed = True
+        log_warning(
+            "chat.malformed",
+            stream=False,
+            error_type="factory_protocol_error",
+            reason=str(exc),
+            tool_name=exc.tool_name,
+            payload_bytes=exc.payload_bytes,
+        )
+
     async with contextlib.aclosing(
         _run_events(
             runner,
@@ -1581,16 +1588,7 @@ async def _collect_completion(
                     # client stops auto-continuing, and a resubmitted
                     # transcript tells the model how to re-emit the call. The
                     # malformed call is dropped, never executed.
-                    result.malformed_note = _malformed_tool_call_note(exc)
-                    result.completed = True
-                    log_warning(
-                        "chat.malformed",
-                        stream=False,
-                        error_type="factory_protocol_error",
-                        reason=str(exc),
-                        tool_name=exc.tool_name,
-                        payload_bytes=exc.payload_bytes,
-                    )
+                    record_malformed(exc)
                     break
                 if stop_buffer.triggered:
                     # Leaving the loop closes the runner generator, which
@@ -1628,6 +1626,8 @@ async def _collect_completion(
             # finish would re-raise on the same garbage.
             try:
                 _apply_emissions(result, parser.finish(), stop_buffer)
+            except MalformedToolCallError as exc:
+                record_malformed(exc)
             except IncompleteToolCallError as exc:
                 # Same contract as the streaming path: a turn that died inside
                 # a tool-call payload returns completed output with
