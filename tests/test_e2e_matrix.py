@@ -149,6 +149,22 @@ def test_expected_rejection_is_a_pass(e2e: ModuleType) -> None:
             },
             "model_behavior",
         ),
+        (
+            {
+                "status": 502,
+                "error_type": "factory_protocol_error",
+                "error_message": "tool 'assistant' is not available",
+            },
+            "model_behavior",
+        ),
+        (
+            {
+                "status": 502,
+                "error_type": "factory_protocol_error",
+                "error_message": "unexpected text after tool call (native dialect)",
+            },
+            "model_behavior",
+        ),
         ({"finish_reason": "length"}, "bridge_defect"),
         ({"finish_reason": "tool_calls"}, "model_behavior"),
         ({"content_chars": 0}, "model_behavior"),
@@ -176,6 +192,22 @@ def test_missing_tool_call_is_model_behavior_not_a_bridge_defect(e2e: ModuleType
     verdict, _ = e2e.classify(
         scenario,
         _observation(e2e, finish_reason="tool_calls", tool_calls=0, content_chars=0),
+    )
+
+    assert verdict == "model_behavior"
+
+
+def test_truncated_expected_tool_call_is_model_behavior(e2e: ModuleType) -> None:
+    scenario = _scenario(
+        e2e,
+        expect_finish=("tool_calls",),
+        expect_tool_call=True,
+        expect_content=False,
+    )
+
+    verdict, _ = e2e.classify(
+        scenario,
+        _observation(e2e, finish_reason="length", tool_calls=0, content_chars=0),
     )
 
     assert verdict == "model_behavior"

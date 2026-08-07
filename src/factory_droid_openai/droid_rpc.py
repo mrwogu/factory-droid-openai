@@ -19,6 +19,8 @@ _RPC_TIMEOUT_SECONDS = 30.0
 # metadata RPCs. The caller's own timeout still bounds the operation.
 _COMPACTION_TIMEOUT_SECONDS = 300.0
 _MCP_POLL_SECONDS = 0.1
+_TOOL_DISABLE_RETRIES = 3
+_TOOL_DISABLE_RETRY_SECONDS = 0.1
 _UNAVOIDABLE_TOOL_IDS = frozenset({"exit-spec-mode"})
 
 
@@ -121,25 +123,31 @@ class DroidRpcExtension:
         if not tools:
             raise DroidClientError("Droid returned an empty native tool catalog")
         tool_ids = sorted({_required_str(tool, "id") for tool in tools})
-        await self._request(
-            client,
-            DroidServerMethod.UPDATE_SESSION_SETTINGS.value,
-            {
-                "interactionMode": DroidInteractionMode.Auto.value,
-                "autonomyLevel": AutonomyLevel.Off.value,
-                "enabledToolIds": [],
-                "disabledToolIds": tool_ids,
-            },
-        )
-        remaining = {
-            _required_str(tool, "id")
-            for tool in await self._list_tools(client)
-            if _required_bool(tool, "currentlyAllowed")
+        settings = {
+            "interactionMode": DroidInteractionMode.Auto.value,
+            "autonomyLevel": AutonomyLevel.Off.value,
+            "enabledToolIds": [],
+            "disabledToolIds": tool_ids,
         }
-        unexpected = remaining - _UNAVOIDABLE_TOOL_IDS
-        if unexpected:
-            rendered = ", ".join(sorted(unexpected))
-            raise DroidClientError(f"Failed to disable native Droid tools: {rendered}")
+        unexpected: set[str] = set()
+        for attempt in range(_TOOL_DISABLE_RETRIES):
+            await self._request(
+                client,
+                DroidServerMethod.UPDATE_SESSION_SETTINGS.value,
+                settings,
+            )
+            remaining = {
+                _required_str(tool, "id")
+                for tool in await self._list_tools(client)
+                if _required_bool(tool, "currentlyAllowed")
+            }
+            unexpected = remaining - _UNAVOIDABLE_TOOL_IDS
+            if not unexpected:
+                return
+            if attempt + 1 < _TOOL_DISABLE_RETRIES:
+                await asyncio.sleep(_TOOL_DISABLE_RETRY_SECONDS)
+        rendered = ", ".join(sorted(unexpected))
+        raise DroidClientError(f"Failed to disable native Droid tools: {rendered}")
 
     async def _wait_for_mcp_catalog(self, client: DroidClient) -> None:
         # Off by default: MCP servers that never leave "connecting" would
