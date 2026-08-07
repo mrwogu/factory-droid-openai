@@ -267,6 +267,7 @@ text. Every accepted form lives in one table in
 | Accepted form | Observed on |
 |---|---|
 | `<tool_call>{"name":...,"arguments":...}</tool_call>` | this bridge's contract, Hermes-style output |
+| `{"role":"assistant","tool_calls":[...]}` | OpenAI/Kimi message-shaped output |
 | `<tool_call><function=name><parameter=key>value</parameter></function></tool_call>` | Qwen3 Coder XML |
 | `<\|tool_calls_section_begin\|>` … `<\|tool_calls_section_end\|>` | Kimi K2 |
 | `<\|open\|>tools<\|sep\|>` … `<\|close\|>tools` | Kimi K3 |
