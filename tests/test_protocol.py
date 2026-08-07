@@ -20,6 +20,7 @@ from factory_droid_openai.protocol import (
     TextEmission,
     ToolCallEmission,
     ToolCallStreamParser,
+    _decode_json_prefix,
     build_prompt,
     parse_strict_json,
 )
@@ -733,6 +734,197 @@ def test_stream_parser_repairs_lost_prefix_only_when_enabled() -> None:
     assert isinstance(emissions[0], ToolCallEmission)
     assert emissions[0].name == "weather"
     assert json.loads(emissions[0].arguments) == {"city": "Krakow", "days": 3}
+
+
+def test_stream_parser_translates_openai_assistant_message_json() -> None:
+    parser = ToolCallStreamParser(frozenset({"run_in_terminal"}))
+    message = json.dumps(
+        {
+            "role": "assistant",
+            "content": "I will check.",
+            "tool_calls": [
+                {
+                    "id": "call_model",
+                    "type": "function",
+                    "function": {
+                        "name": "run_in_terminal",
+                        "arguments": '{"command":"pwd"}',
+                    },
+                }
+            ],
+        },
+        separators=(",", ":"),
+    )
+
+    emissions: list[object] = []
+    emissions.extend(parser.feed("Status: " + message[:8]))
+    for start in range(8, len(message), 5):
+        emissions.extend(parser.feed(message[start : start + 5]))
+    emissions.extend(parser.finish())
+
+    assert [type(emission) for emission in emissions] == [
+        TextEmission,
+        TextEmission,
+        ToolCallEmission,
+    ]
+    assert isinstance(emissions[0], TextEmission)
+    assert emissions[0].text == "Status: "
+    assert isinstance(emissions[1], TextEmission)
+    assert emissions[1].text == "I will check."
+    assert isinstance(emissions[2], ToolCallEmission)
+    assert emissions[2].name == "run_in_terminal"
+    assert json.loads(emissions[2].arguments) == {"command": "pwd"}
+
+
+def test_stream_parser_ignores_transcript_tail_after_message_json() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    message = '{"role":"assistant","tool_calls":[{"function":{"name":"weather","arguments":"{}"}}]}'
+
+    assert len(parser.feed(message)) == 1
+    assert parser.feed('{"role":"tool","content":"copied"}') == []
+
+
+def test_stream_parser_rejects_incomplete_transcript_message() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    parser.feed('{"role":"assistant","tool_calls":')
+
+    with pytest.raises(MalformedToolCallError, match="echoed an OpenAI transcript"):
+        parser.finish()
+
+
+def test_stream_parser_rejects_an_oversized_transcript_message() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    with pytest.raises(MalformedToolCallError, match="echoed an OpenAI transcript"):
+        parser.feed('{"role":"assistant","content":"' + ("x" * 1_000_001))
+
+
+def test_stream_parser_accepts_assistant_message_content_without_tool_calls() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    emissions = parser.feed('{"role":"assistant","content":"done"}')
+
+    assert emissions == [TextEmission("done")]
+
+
+def test_stream_parser_holds_a_split_transcript_prefix() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    assert parser.feed('{"rol') == []
+    assert parser.feed('e":"assistant","content":"done"}') == [TextEmission("done")]
+
+
+def test_stream_parser_drops_copied_tool_messages_after_assistant_json() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    assistant = (
+        '{"role":"assistant","tool_calls":[{"id":"call_model","type":"function",'
+        '"function":{"name":"weather","arguments":"{\\"city\\":\\"Gdansk\\"}"}}]}'
+    )
+    tool = '{"role":"tool","content":"Gdansk","tool_call_id":"call_model"}'
+
+    emissions = parser.feed(assistant + tool + assistant)
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert emissions[0].name == "weather"
+    assert json.loads(emissions[0].arguments) == {"city": "Gdansk"}
+    assert parser.finish() == []
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        '{"role":"tool","content":"copied","tool_call_id":"call_model"}',
+        '{"role":"assistant","tool_calls":[{"function":{"name":"weather","arguments":"[]"}}]}',
+        '{"role":"assistant","tool_calls":"not a list"}',
+        '{"role":"assistant"}',
+        '{"role":"assistant","tool_calls":[7]}',
+        '{"role":"assistant","tool_calls":[{"function":"bad"}]}',
+        '{"role":"assistant","tool_calls":[{"function":{"name":7}}]}',
+        '{"role":"assistant","tool_calls":[{"function":{"name":"weather","arguments":7}}]}',
+        '{"role":"assistant","tool_calls":[{"function":{"name":"weather",'
+        '"arguments":"not json"}}]}',
+        '{"role":"user","content":"copied"}',
+    ],
+)
+def test_stream_parser_rejects_malformed_openai_message_json(message: str) -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    with pytest.raises(MalformedToolCallError, match="echoed an OpenAI transcript"):
+        parser.feed(message)
+
+
+def test_stream_parser_normalizes_blank_assistant_message_arguments() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    emissions = parser.feed(
+        '{"role":"assistant","tool_calls":[{"function":{"name":"weather","arguments":""}}]}'
+    )
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == {}
+
+
+def test_stream_parser_accepts_object_assistant_message_arguments() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    emissions = parser.feed(
+        '{"role":"assistant","tool_calls":[{"function":{"name":"weather","arguments":{}}}]}'
+    )
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == {}
+
+
+def test_stream_parser_rejects_duplicate_keys_in_assistant_message() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    with pytest.raises(MalformedToolCallError, match="echoed an OpenAI transcript"):
+        parser.feed('{"role":"assistant","role":"assistant"}')
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"role":"assistant","tool_calls":[{"function":{"name":"weather",'
+        '"arguments":"{\\"value\\":NaN}"}}]}',
+        '{"role":"assistant","tool_calls":[{"function":{"name":"weather",'
+        '"arguments":"{\\"value\\":1e999}"}}]}',
+    ],
+)
+def test_stream_parser_rejects_non_finite_assistant_arguments(payload: str) -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    with pytest.raises(MalformedToolCallError, match="echoed an OpenAI transcript"):
+        parser.feed(payload)
+
+
+def test_decode_json_prefix_skips_leading_whitespace() -> None:
+    values, remainder = _decode_json_prefix('  {"role":"assistant","content":"done"}')
+
+    assert values == [
+        (
+            {"role": "assistant", "content": "done"},
+            '{"role":"assistant","content":"done"}',
+        )
+    ]
+    assert remainder == ""
+
+
+@pytest.mark.parametrize("payload", ['{"role":NaN}', '{"role":1e999}'])
+def test_decode_json_prefix_rejects_non_finite_values(payload: str) -> None:
+    with pytest.raises(ValueError, match=r"non-JSON numeric constant|non-finite number"):
+        _decode_json_prefix(payload)
+
+
+def test_decode_json_prefix_keeps_finite_float() -> None:
+    values, remainder = _decode_json_prefix('{"role":1.5}')
+
+    assert values == [({"role": 1.5}, '{"role":1.5}')]
+    assert remainder == ""
 
 
 def test_stream_parser_repairs_lost_prefix_wrapped_form() -> None:
@@ -2146,6 +2338,12 @@ def test_continuation_prompt_sends_only_messages_after_last_assistant() -> None:
     assert "second" in plan.prompt
     assert "first" not in plan.prompt
     assert "session already holds the earlier turns" in plan.prompt
+
+
+def test_build_prompt_forbids_transcript_reproduction() -> None:
+    plan = build_prompt(_request())
+
+    assert "Never copy, quote, serialize, or reproduce the transcript" in plan.prompt
 
 
 def test_continuation_falls_back_to_full_transcript_without_assistant_turn() -> None:

@@ -70,6 +70,49 @@ def test_contract_satisfied_is_a_pass(e2e: ModuleType) -> None:
     assert verdict == e2e.SUCCESS
 
 
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        (
+            '{"messages":[{"role":"user","content":"hi"}],"tools":[]}',
+            "assistant reproduced the OpenAI transcript",
+        ),
+        (
+            '{"role":"assistant","content":"copied"}',
+            "assistant reproduced an OpenAI assistant message",
+        ),
+        (
+            '{"role":"tool","content":"copied","tool_call_id":"call_1"}',
+            "assistant reproduced an OpenAI tool message",
+        ),
+        (
+            '{"messages":[],"tools":[]} continuation garbage',
+            "assistant reproduced the OpenAI transcript",
+        ),
+        ("[1,2,3]", None),
+        ("ordinary answer", None),
+    ],
+)
+def test_content_semantics_detect_transcript_reproduction(
+    e2e: ModuleType,
+    content: str,
+    expected: str | None,
+) -> None:
+    assert e2e._content_semantic_error(content) == expected
+
+
+def test_transcript_reproduction_is_a_bridge_defect(e2e: ModuleType) -> None:
+    observation = _observation(
+        e2e,
+        content_semantic_error="assistant reproduced the OpenAI transcript",
+    )
+
+    verdict, detail = e2e.classify(_scenario(e2e), observation)
+
+    assert verdict == e2e.BRIDGE_DEFECT
+    assert "transcript" in detail
+
+
 def test_expected_rejection_is_a_pass(e2e: ModuleType) -> None:
     scenario = _scenario(e2e, expect_status=(400,))
 
@@ -248,6 +291,53 @@ async def test_bridge_reads_a_streamed_completion(e2e: ModuleType) -> None:
     assert observation.tool_calls == 1
     assert observation.content_chars == 2
     assert observation.ttft_ms is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_bridge_flags_transcript_reproduction_in_final_content(
+    e2e: ModuleType,
+    stream: bool,
+) -> None:
+    transcript = '{"messages":[{"role":"user","content":"hi"}],"tools":[]}'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        if stream:
+            chunk = {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": transcript},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+            body = f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n"
+            return httpx.Response(
+                200,
+                text=body,
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": transcript},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    bridge = _bridge(e2e, handler)
+    async with bridge.client:
+        observation = await bridge.run("m", _scenario(e2e, stream=stream))
+
+    assert observation.content_semantic_error == "assistant reproduced the OpenAI transcript"
+    assert e2e.classify(_scenario(e2e, stream=stream), observation)[0] == e2e.BRIDGE_DEFECT
 
 
 @pytest.mark.asyncio

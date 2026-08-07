@@ -317,6 +317,7 @@ class Observation:
     status: int
     error_type: str | None = None
     error_message: str = ""
+    content_semantic_error: str | None = None
     finish_reason: str | None = None
     tool_calls: int = 0
     content_chars: int = 0
@@ -332,6 +333,28 @@ class Observation:
 # reports that as a protocol error like every other unmet contract. Only the
 # message separates model non-compliance from an actual parser bug.
 _TOOL_CHOICE_IGNORED = "did not produce the required tool call"
+
+
+def _content_semantic_error(content: str) -> str | None:
+    """Reject serialized OpenAI transcript objects returned as final text."""
+    stripped = content.strip()
+    try:
+        payload = json.loads(stripped)
+    except ValueError:
+        try:
+            payload, _ = json.JSONDecoder().raw_decode(stripped)
+        except ValueError:
+            return None
+    if not isinstance(payload, dict):
+        return None
+    if isinstance(payload.get("messages"), list) and isinstance(payload.get("tools"), list):
+        return "assistant reproduced the OpenAI transcript"
+    role = payload.get("role")
+    if role == "assistant" and ("content" in payload or "tool_calls" in payload):
+        return "assistant reproduced an OpenAI assistant message"
+    if role == "tool" and ("content" in payload or "tool_call_id" in payload):
+        return "assistant reproduced an OpenAI tool message"
+    return None
 
 
 def _error_verdict(observation: Observation) -> tuple[str, str] | None:
@@ -375,6 +398,8 @@ def classify(scenario: Scenario, observation: Observation) -> tuple[str, str]:
             BRIDGE_DEFECT,
             f"stream failed with {error_type}",
         )
+    if observation.content_semantic_error is not None:
+        return BRIDGE_DEFECT, observation.content_semantic_error
     if observation.finish_reason not in scenario.expect_finish:
         if observation.finish_reason == "tool_calls":
             return MODEL_BEHAVIOR, "model called a tool when none was required"
@@ -432,10 +457,12 @@ def _completion_observation(
     tool_calls = message.get("tool_calls") or []
     content = message.get("content") or ""
     error_type, error_message = _error_fields(body)
+    semantic_error = _content_semantic_error(content) if isinstance(content, str) else None
     return Observation(
         status=status,
         error_type=error_type,
         error_message=error_message,
+        content_semantic_error=semantic_error,
         finish_reason=choice.get("finish_reason") if isinstance(choice, dict) else None,
         tool_calls=len(tool_calls) if isinstance(tool_calls, list) else 0,
         content_chars=len(content) if isinstance(content, str) else 0,
@@ -454,6 +481,7 @@ def _stream_observation(
     finish_reason: str | None = None
     tool_calls = 0
     content_chars = 0
+    content_parts: list[str] = []
     error_type: str | None = None
     error_message = ""
     stream_done = False
@@ -480,6 +508,7 @@ def _stream_observation(
             text = delta.get("content") or ""
             if text:
                 content_chars += len(text)
+                content_parts.append(text)
                 ttft_ms = elapsed_ms if ttft_ms is None else ttft_ms
             calls = delta.get("tool_calls") or []
             if calls:
@@ -490,6 +519,7 @@ def _stream_observation(
         status=status,
         error_type=error_type,
         error_message=error_message,
+        content_semantic_error=_content_semantic_error("".join(content_parts)),
         finish_reason=finish_reason,
         tool_calls=tool_calls,
         content_chars=content_chars,
@@ -617,6 +647,7 @@ def row(model: str, scenario: Scenario, observation: Observation) -> dict[str, A
         "status": observation.status,
         "error_type": observation.error_type,
         "error_message": observation.error_message,
+        "content_semantic_error": observation.content_semantic_error,
         "finish_reason": observation.finish_reason,
         "tool_calls": observation.tool_calls,
         "content_chars": observation.content_chars,
