@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 import re
 import uuid
 from dataclasses import dataclass, field
@@ -42,8 +41,9 @@ if TYPE_CHECKING:
 _MAX_TOOL_PAYLOAD_BYTES = 1_000_000
 _ARGUMENT_KEYS = ("arguments", "parameters", "args", "input")
 _UNPARSED_HEAD_CHARS = 64
-_TRANSCRIPT_MESSAGE_PATTERN = re.compile(r'\{\s*"role"\s*:')
-_TRANSCRIPT_PREFIX = '{"role":'
+_MESSAGE_JSON_PATTERN = re.compile(r'\{\s*"(?:role|content|tool_calls|id|type)"\s*:')
+_MESSAGE_JSON_KEYS = ("role", "content", "tool_calls", "id", "type")
+_MAX_MESSAGE_JSON_PREFIX_CHARS = 64
 
 __all__ = [
     "TOOL_CALL_CLOSE",
@@ -308,6 +308,7 @@ class ToolCallStreamParser:
         require_tool_call: bool = False,
         max_tool_calls: int = 1,
         repair_lost_prefix: bool = False,
+        parse_message_json: bool = True,
         trace_payload: PayloadTrace | None = None,
     ) -> None:
         self._allowed_tool_names = allowed_tool_names
@@ -317,13 +318,18 @@ class ToolCallStreamParser:
         if repair_lost_prefix:
             self._payload_decoders = (*PAYLOAD_DECODERS, LOST_PREFIX_DECODER)
         self._trace_payload: PayloadTrace = trace_payload or NULL_PAYLOAD_TRACER.trace
+        self._parse_message_json = parse_message_json
         self._text_tail = ""
         self._payload_chunks: list[str] = []
         self._payload_bytes = 0
         self._close_tail = ""
-        self._transcript_buffer = ""
+        self._message_json_chunks: list[str] = []
+        self._message_json_bytes = 0
+        self._message_json_depth = 0
+        self._message_json_in_string = False
+        self._message_json_escaped = False
         self._capturing = False
-        self._capturing_transcript = False
+        self._capturing_message_json = False
         self._ignore_transcript_tail = False
         self._done = False
         self._saw_tool_call = False
@@ -345,8 +351,8 @@ class ToolCallStreamParser:
             return []
         if self._capturing:
             return self._consume_tool_payload(chunk)
-        if self._capturing_transcript:
-            return self._consume_transcript_json(chunk)
+        if self._capturing_message_json:
+            return self._consume_message_json(chunk)
         return self._consume_text(chunk)
 
     def finish(self) -> list[ProtocolEmission]:
@@ -361,10 +367,9 @@ class ToolCallStreamParser:
                     payload_bytes=len(payload.encode("utf-8")),
                 )
             emissions.extend(self._emit_tool_calls(recovered))
-        if self._capturing_transcript:
-            payload = self._transcript_buffer
-            self._transcript_buffer = ""
-            self._capturing_transcript = False
+        if self._capturing_message_json:
+            payload = "".join(self._message_json_chunks)
+            self._reset_message_json()
             raise self._transcript_error(payload)
         if self._text_tail:
             # After a tool call only whitespace may separate further calls; any
@@ -379,18 +384,26 @@ class ToolCallStreamParser:
             raise ProtocolError("the model did not produce the required tool call")
         return emissions
 
-    def _consume_text(self, chunk: str) -> list[ProtocolEmission]:
+    def _consume_text(
+        self,
+        chunk: str,
+        *,
+        parse_message_json: bool | None = None,
+    ) -> list[ProtocolEmission]:
+        detect_message_json = (
+            self._parse_message_json if parse_message_json is None else parse_message_json
+        )
         value = self._text_tail + chunk
         self._text_tail = ""
         found = find_open_marker(value)
-        transcript_match = _TRANSCRIPT_MESSAGE_PATTERN.search(value)
+        message_match = _MESSAGE_JSON_PATTERN.search(value) if detect_message_json else None
         emissions: list[ProtocolEmission] = []
-        if transcript_match is not None and (found is None or transcript_match.start() < found[0]):
-            prefix = value[: transcript_match.start()]
+        if message_match is not None and (found is None or message_match.start() < found[0]):
+            prefix = value[: message_match.start()]
             if prefix:
                 emissions.extend(self._emit_text_before_marker(prefix))
-            self._capturing_transcript = True
-            emissions.extend(self._consume_transcript_json(value[transcript_match.start() :]))
+            self._capturing_message_json = True
+            emissions.extend(self._consume_message_json(value[message_match.start() :]))
             return emissions
 
         if found is not None:
@@ -408,8 +421,9 @@ class ToolCallStreamParser:
         held = max(
             _partial_marker_suffix_length(value, dialect.open_marker) for dialect in MARKER_DIALECTS
         )
-        partial_transcript = _partial_transcript_prefix_length(value)
-        held = max(held, partial_transcript)
+        if detect_message_json:
+            partial_message = _partial_message_json_prefix_length(value)
+            held = max(held, partial_message)
         if self._saw_tool_call:
             held = max(held, len(self._trailing_partial(value)))
         emit_length = len(value) - held
@@ -420,37 +434,72 @@ class ToolCallStreamParser:
         self._text_tail = value[emit_length:]
         return self._emit_text_before_marker(text)
 
-    def _consume_transcript_json(self, chunk: str) -> list[ProtocolEmission]:
-        value = self._transcript_buffer + chunk
-        self._transcript_buffer = ""
-        payload_bytes = len(value.encode("utf-8"))
-        if payload_bytes > _MAX_TOOL_PAYLOAD_BYTES:
-            raise self._transcript_error(value)
+    def _consume_message_json(self, chunk: str) -> list[ProtocolEmission]:
+        end = self._message_json_end(chunk)
+        committed = chunk if end is None else chunk[:end]
+        self._append_message_json(committed)
+        if end is None:
+            return []
 
+        raw = "".join(self._message_json_chunks)
+        trailing = chunk[end:]
+        self._reset_message_json()
         try:
-            values, remainder = _decode_json_prefix(value)
-        except ValueError as exc:
-            raise self._transcript_error(value) from exc
-        emissions: list[ProtocolEmission] = []
-        for parsed, raw in values:
-            if isinstance(parsed, dict) and parsed.get("role") == "tool":
-                raise self._transcript_error(raw)
-            if isinstance(parsed, dict) and parsed.get("role") == "assistant":
-                if parsed.get("tool_calls"):
-                    emissions.extend(self._assistant_message_tool_calls(parsed, raw))
-                elif isinstance(parsed.get("content"), str):
-                    emissions.append(TextEmission(parsed["content"]))
-                else:
-                    raise self._transcript_error(raw)
-                self._transcript_buffer = ""
-                self._capturing_transcript = False
-                self._ignore_transcript_tail = True
-                self._done = True
-                return emissions
-            raise self._transcript_error(raw)
+            parsed = parse_strict_json(raw)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise self._transcript_error(raw) from exc
 
-        self._transcript_buffer = remainder
-        self._capturing_transcript = bool(remainder)
+        role = parsed.get("role")
+        if role in {"tool", "user"}:
+            raise self._transcript_error(raw)
+        if role != "assistant" or not parsed.get("tool_calls"):
+            return self._emit_plain_json(raw, trailing)
+
+        emissions = self._assistant_message_tool_calls(parsed, raw)
+        self._ignore_transcript_tail = True
+        self._done = True
+        return emissions
+
+    def _message_json_end(self, chunk: str) -> int | None:
+        for index, char in enumerate(chunk):
+            if self._message_json_in_string:
+                if self._message_json_escaped:
+                    self._message_json_escaped = False
+                elif char == "\\":
+                    self._message_json_escaped = True
+                elif char == '"':
+                    self._message_json_in_string = False
+                continue
+            if char == '"':
+                self._message_json_in_string = True
+            elif char in "{[":
+                self._message_json_depth += 1
+            elif char in "}]":
+                self._message_json_depth -= 1
+                if self._message_json_depth == 0:
+                    return index + 1
+        return None
+
+    def _append_message_json(self, value: str) -> None:
+        self._message_json_bytes += len(value.encode("utf-8"))
+        if self._message_json_bytes > _MAX_TOOL_PAYLOAD_BYTES:
+            payload_bytes = self._message_json_bytes
+            self._reset_message_json()
+            raise self._transcript_error("", payload_bytes=payload_bytes)
+        self._message_json_chunks.append(value)
+
+    def _reset_message_json(self) -> None:
+        self._message_json_chunks.clear()
+        self._message_json_bytes = 0
+        self._message_json_depth = 0
+        self._message_json_in_string = False
+        self._message_json_escaped = False
+        self._capturing_message_json = False
+
+    def _emit_plain_json(self, raw: str, trailing: str) -> list[ProtocolEmission]:
+        emissions = self._emit_text_before_marker(raw)
+        if trailing:
+            emissions.extend(self._consume_text(trailing, parse_message_json=False))
         return emissions
 
     def _assistant_message_tool_calls(
@@ -492,11 +541,16 @@ class ToolCallStreamParser:
             )
         return emissions
 
-    def _transcript_error(self, payload: str) -> MalformedToolCallError:
+    def _transcript_error(
+        self,
+        payload: str,
+        *,
+        payload_bytes: int | None = None,
+    ) -> MalformedToolCallError:
         return MalformedToolCallError(
             "model echoed an OpenAI transcript instead of emitting a tool call",
             tool_name=None,
-            payload_bytes=len(payload.encode("utf-8")),
+            payload_bytes=len(payload.encode("utf-8")) if payload_bytes is None else payload_bytes,
         )
 
     def _emit_text_before_marker(self, text: str) -> list[ProtocolEmission]:
@@ -795,50 +849,31 @@ def _partial_marker_suffix_length(value: str, marker: str) -> int:
     return 0
 
 
-def _partial_transcript_prefix_length(value: str) -> int:
-    limit = min(len(value), len(_TRANSCRIPT_PREFIX) - 1)
-    for length in range(limit, 0, -1):
-        if value.endswith(_TRANSCRIPT_PREFIX[:length]):
-            return length
-    return 0
+def _partial_message_json_prefix_length(value: str) -> int:
+    start = value.rfind("{", max(0, len(value) - _MAX_MESSAGE_JSON_PREFIX_CHARS))
+    if start < 0:
+        return 0
+    candidate = value[start:]
 
+    index = 1
+    while index < len(candidate) and candidate[index].isspace():
+        index += 1
+    if index == len(candidate):
+        return len(candidate)
+    if candidate[index] != '"':
+        return 0
 
-def _decode_json_prefix(value: str) -> tuple[list[tuple[Any, str]], str]:
-    decoder = json.JSONDecoder(
-        object_pairs_hook=_strict_object,
-        parse_constant=_strict_constant,
-        parse_float=lambda raw: _strict_float(raw),
-    )
-    values: list[tuple[Any, str]] = []
-    index = 0
-    while True:
-        while index < len(value) and value[index].isspace():
-            index += 1
-        if index >= len(value):
-            return values, ""
-        try:
-            parsed, end = decoder.raw_decode(value, index)
-        except json.JSONDecodeError:
-            return values, value[index:]
-        values.append((parsed, value[index:end]))
-        index = end
+    index += 1
+    closing_quote = candidate.find('"', index)
+    if closing_quote < 0:
+        key_prefix = candidate[index:]
+        return (
+            len(candidate) if any(key.startswith(key_prefix) for key in _MESSAGE_JSON_KEYS) else 0
+        )
+    if candidate[index:closing_quote] not in _MESSAGE_JSON_KEYS:
+        return 0
 
-
-def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate key '{key}'")
-        result[key] = value
-    return result
-
-
-def _strict_constant(value: str) -> None:
-    raise ValueError(f"non-JSON numeric constant '{value}'")
-
-
-def _strict_float(raw: str) -> float:
-    parsed = float(raw)
-    if not math.isfinite(parsed):
-        raise ValueError(f"non-finite number '{raw}'")
-    return parsed
+    index = closing_quote + 1
+    while index < len(candidate) and candidate[index].isspace():
+        index += 1
+    return len(candidate) if index == len(candidate) else 0

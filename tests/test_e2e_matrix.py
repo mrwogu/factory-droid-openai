@@ -89,6 +89,14 @@ def test_contract_satisfied_is_a_pass(e2e: ModuleType) -> None:
             '{"messages":[],"tools":[]} continuation garbage',
             "assistant reproduced the OpenAI transcript",
         ),
+        (
+            '```json\n{"messages":[{"role":"user","content":"hi"}],"tools":[]}\n```',
+            "assistant reproduced the OpenAI transcript",
+        ),
+        (
+            '```\n{"role":"assistant","content":"copied"}\n```',
+            "assistant reproduced an OpenAI assistant message",
+        ),
         ("[1,2,3]", None),
         ("ordinary answer", None),
     ],
