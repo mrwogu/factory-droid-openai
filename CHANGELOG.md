@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.6.5](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.4...v1.6.5) (2026-08-08)
+
+
+### Bug Fixes
+
+* harden tool settlement and matrix verdicts ([472d5dc](https://github.com/mrwogu/factory-droid-openai/commit/472d5dc0a2e1846ec57574e9c3d7b2bf00e2dd0d))
+* **protocol:** harden message JSON recovery ([f294026](https://github.com/mrwogu/factory-droid-openai/commit/f294026ce8abb516c3123a8611cfd4c5677beddb))
+* **protocol:** reject echoed OpenAI transcripts ([381d1e0](https://github.com/mrwogu/factory-droid-openai/commit/381d1e03f8cbb90dc23c3a73952bf3acafdd65cb))
+* retry native tool disable settlement ([0dce6f7](https://github.com/mrwogu/factory-droid-openai/commit/0dce6f79c3aaf3cc1f09f5908cc63e17e7a7c4f9))
+
 ## [1.6.4](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.3...v1.6.4) (2026-08-06)
 
 
