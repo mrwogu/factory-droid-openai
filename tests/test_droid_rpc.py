@@ -165,6 +165,43 @@ async def test_disable_native_tools_retries_catalog_settlement() -> None:
 
 
 @pytest.mark.asyncio
+async def test_disable_native_tools_disables_tools_added_during_settlement() -> None:
+    disabled: set[str] = set()
+    catalog_reads = 0
+
+    def handler(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        nonlocal catalog_reads
+        if method == "droid.list_tools":
+            catalog_reads += 1
+            tool_ids = ["read-cli"] if catalog_reads == 1 else ["read-cli", "write-cli"]
+            return {
+                "result": {
+                    "tools": [
+                        {
+                            "id": tool_id,
+                            "currentlyAllowed": tool_id not in disabled,
+                        }
+                        for tool_id in tool_ids
+                    ]
+                }
+            }
+        if method == "droid.update_session_settings":
+            disabled.update(params["disabledToolIds"])
+            return {"result": {}}
+        raise AssertionError(method)
+
+    protocol = FakeProtocol(handler)
+
+    await DroidRpcExtension().disable_native_tools(_client(protocol))
+
+    updates = [
+        params for method, params, _ in protocol.calls if method == "droid.update_session_settings"
+    ]
+    assert updates[0]["disabledToolIds"] == ["read-cli"]
+    assert updates[1]["disabledToolIds"] == ["read-cli", "write-cli"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("tools", "message"),
     [
