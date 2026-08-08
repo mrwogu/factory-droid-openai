@@ -181,7 +181,21 @@ def test_failures_land_in_their_own_bucket(
     assert detail
 
 
-def test_missing_tool_call_is_model_behavior_not_a_bridge_defect(e2e: ModuleType) -> None:
+@pytest.mark.parametrize(
+    ("finish_reason", "tool_calls", "expected"),
+    [
+        ("tool_calls", 0, "model_behavior"),
+        ("stop", 0, "model_behavior"),
+        ("length", 0, "model_behavior"),
+        ("length", 1, "bridge_defect"),
+    ],
+)
+def test_tool_call_outcomes_are_classified_by_model_responsibility(
+    e2e: ModuleType,
+    finish_reason: str,
+    tool_calls: int,
+    expected: str,
+) -> None:
     scenario = _scenario(
         e2e,
         expect_finish=("tool_calls",),
@@ -191,26 +205,15 @@ def test_missing_tool_call_is_model_behavior_not_a_bridge_defect(e2e: ModuleType
 
     verdict, _ = e2e.classify(
         scenario,
-        _observation(e2e, finish_reason="tool_calls", tool_calls=0, content_chars=0),
+        _observation(
+            e2e,
+            finish_reason=finish_reason,
+            tool_calls=tool_calls,
+            content_chars=0,
+        ),
     )
 
-    assert verdict == "model_behavior"
-
-
-def test_truncated_expected_tool_call_is_model_behavior(e2e: ModuleType) -> None:
-    scenario = _scenario(
-        e2e,
-        expect_finish=("tool_calls",),
-        expect_tool_call=True,
-        expect_content=False,
-    )
-
-    verdict, _ = e2e.classify(
-        scenario,
-        _observation(e2e, finish_reason="length", tool_calls=0, content_chars=0),
-    )
-
-    assert verdict == "model_behavior"
+    assert verdict == expected
 
 
 def test_a_stream_that_fails_after_its_headers_is_still_judged(e2e: ModuleType) -> None:

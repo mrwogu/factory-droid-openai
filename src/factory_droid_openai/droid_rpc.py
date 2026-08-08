@@ -122,25 +122,25 @@ class DroidRpcExtension:
         tools = await self._list_tools(client)
         if not tools:
             raise DroidClientError("Droid returned an empty native tool catalog")
-        tool_ids = sorted({_required_str(tool, "id") for tool in tools})
-        settings = {
-            "interactionMode": DroidInteractionMode.Auto.value,
-            "autonomyLevel": AutonomyLevel.Off.value,
-            "enabledToolIds": [],
-            "disabledToolIds": tool_ids,
-        }
+        tool_ids = {_required_str(tool, "id") for tool in tools}
         unexpected: set[str] = set()
         for attempt in range(_TOOL_DISABLE_RETRIES):
             await self._request(
                 client,
                 DroidServerMethod.UPDATE_SESSION_SETTINGS.value,
-                settings,
+                {
+                    "interactionMode": DroidInteractionMode.Auto.value,
+                    "autonomyLevel": AutonomyLevel.Off.value,
+                    "enabledToolIds": [],
+                    "disabledToolIds": sorted(tool_ids),
+                },
             )
-            remaining = {
-                _required_str(tool, "id")
-                for tool in await self._list_tools(client)
-                if _required_bool(tool, "currentlyAllowed")
-            }
+            remaining: set[str] = set()
+            for tool in await self._list_tools(client):
+                tool_id = _required_str(tool, "id")
+                tool_ids.add(tool_id)
+                if _required_bool(tool, "currentlyAllowed"):
+                    remaining.add(tool_id)
             unexpected = remaining - _UNAVOIDABLE_TOOL_IDS
             if not unexpected:
                 return

@@ -413,8 +413,11 @@ def classify(scenario: Scenario, observation: Observation) -> tuple[str, str]:
     if observation.finish_reason not in scenario.expect_finish:
         if observation.finish_reason == "tool_calls":
             return MODEL_BEHAVIOR, "model called a tool when none was required"
-        if observation.finish_reason == "length" and scenario.expect_tool_call:
-            return MODEL_BEHAVIOR, "model truncated its tool-call response"
+        if scenario.expect_tool_call and observation.tool_calls == 0:
+            if observation.finish_reason == "length":
+                return MODEL_BEHAVIOR, "model truncated its tool-call response"
+            if observation.finish_reason == "stop":
+                return MODEL_BEHAVIOR, "model produced no client tool call"
         return BRIDGE_DEFECT, f"unexpected finish_reason {observation.finish_reason}"
     if scenario.expect_tool_call and observation.tool_calls == 0:
         return MODEL_BEHAVIOR, "model produced no client tool call"
