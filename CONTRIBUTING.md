@@ -77,6 +77,13 @@ the run; `model_behavior`, `account_policy`, `capacity`,
 `provider_unavailable`, and `backend_timeout` describe the environment, not the
 code. Re-render a report or diff two runs after a change:
 
+After the parallel per-model cases, the harness runs a serialized model-switch
+ring against the same bridge process. Each pair primes the warm pool with one
+model, waits five seconds for refill, then sends a required tool-call request
+to the next model in both transport modes. Use
+`--switch-settle-seconds SECONDS` when the bridge needs a different refill
+window. Switch rows include `source_model` and prime-request diagnostics.
+
 ```bash
 uv run python scripts/e2e_matrix.py report traces/run-a.jsonl
 uv run python scripts/e2e_matrix.py compare traces/run-a.jsonl traces/run-b.jsonl

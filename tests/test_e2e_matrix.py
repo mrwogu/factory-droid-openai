@@ -53,6 +53,7 @@ def _scenario(e2e: ModuleType, **overrides: Any) -> Any:
 
 def test_scenarios_cover_both_transports_and_run_hostile_cases_once(e2e: ModuleType) -> None:
     plan = e2e.scenarios()
+    switch_plan = e2e.switch_scenarios()
 
     streamed = {scenario.name for scenario in plan if scenario.stream}
     hostile = [scenario for scenario in plan if not scenario.per_model]
@@ -62,6 +63,8 @@ def test_scenarios_cover_both_transports_and_run_hostile_cases_once(e2e: ModuleT
     assert all(scenario.expect_status != (200,) for scenario in hostile)
     assert all(not scenario.stream for scenario in hostile)
     assert len(e2e.scenarios(streaming=False)) < len(plan)
+    assert {scenario.stream for scenario in switch_plan} == {False, True}
+    assert len(e2e.switch_scenarios(streaming=False)) == 1
 
 
 def test_contract_satisfied_is_a_pass(e2e: ModuleType) -> None:
@@ -96,6 +99,14 @@ def test_contract_satisfied_is_a_pass(e2e: ModuleType) -> None:
         (
             '```\n{"role":"assistant","content":"copied"}\n```',
             "assistant reproduced an OpenAI assistant message",
+        ),
+        (
+            '"tool calls": "id": "call_123"',
+            "assistant exposed malformed OpenAI tool-call output",
+        ),
+        (
+            '"tool_calls":"call_123"',
+            "assistant exposed malformed OpenAI tool-call output",
         ),
         ("[1,2,3]", None),
         ("ordinary answer", None),
@@ -530,6 +541,84 @@ async def test_matrix_without_models_still_runs_hostile_cases(e2e: ModuleType) -
     assert rows[0]["verdict"] == e2e.SUCCESS
 
 
+@pytest.mark.asyncio
+async def test_switch_matrix_runs_a_serial_model_ring(e2e: ModuleType) -> None:
+    seen_models: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_models.append(json.loads(request.content)["model"])
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    written: list[dict[str, Any]] = []
+    bridge = _bridge(e2e, handler)
+    plan = [_scenario(e2e, name="model_switch")]
+    async with bridge.client:
+        rows = await e2e.run_switch_matrix(
+            bridge,
+            ["m1", "m2", "m3"],
+            plan,
+            settle_seconds=0,
+            on_row=written.append,
+        )
+
+    assert seen_models == ["m1", "m2", "m2", "m3", "m3", "m1"]
+    assert [(row["source_model"], row["model"]) for row in rows] == [
+        ("m1", "m2"),
+        ("m2", "m3"),
+        ("m3", "m1"),
+    ]
+    assert all(row["prime_verdict"] == e2e.SUCCESS for row in rows)
+    assert written == rows
+
+
+@pytest.mark.asyncio
+async def test_switch_matrix_skips_one_model_and_supports_no_callback(e2e: ModuleType) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    bridge = _bridge(e2e, handler)
+    plan = [_scenario(e2e, name="model_switch")]
+    async with bridge.client:
+        assert (
+            await e2e.run_switch_matrix(
+                bridge,
+                ["m1"],
+                plan,
+                settle_seconds=0,
+            )
+            == []
+        )
+        rows = await e2e.run_switch_matrix(
+            bridge,
+            ["m1", "m2"],
+            plan,
+            settle_seconds=0,
+        )
+
+    assert len(rows) == 2
+
+
 def _rows(e2e: ModuleType) -> list[dict[str, Any]]:
     return [
         e2e.row("m1", _scenario(e2e), _observation(e2e)),
@@ -593,8 +682,8 @@ def test_compare_reports_regressions_and_fixes(e2e: ModuleType) -> None:
     rendered = e2e.render_comparison(result)
 
     assert result["shared"] == 2
-    assert [entry["key"] for entry in result["regressions"]] == [("m1", "hello", False)]
-    assert [entry["key"] for entry in result["fixes"]] == [("m2", "hello", False)]
+    assert [entry["key"] for entry in result["regressions"]] == [("", "m1", "hello", False)]
+    assert [entry["key"] for entry in result["fixes"]] == [("", "m2", "hello", False)]
     assert result["only_before"]
     assert result["only_after"]
     assert "## Regressions" in rendered
