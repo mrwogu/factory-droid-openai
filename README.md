@@ -279,13 +279,15 @@ text. Every accepted form lives in one table in
 | `name","key":"value"...}` with the opening `{"name":"` bytes lost | GLM, only with `FACTORY_DROID_OPENAI_REPAIR_LOST_PREFIX=true` |
 
 Translation never widens validation. An unknown tool name, a duplicate
-argument key, or prose after a call still fails the turn. A truncated payload,
-or one no decoder can parse, ends the turn with `finish_reason="length"`
-instead; the partial or malformed call is dropped, never executed. When an
-earlier call in the same turn did complete, the turn keeps
-`finish_reason="tool_calls"` so the client runs the call it already received. Qwen3's
-XML form declares no argument types, so a scalar value stays the string the
-model wrote unless it wrote a JSON object or array.
+argument key, or prose after a call still fails the turn. A payload truncated
+before its close marker ends with `finish_reason="length"`. A closed malformed
+call or a mangled OpenAI `tool_calls` fragment ends with `finish_reason="stop"`
+and a plain-text bridge notice. The malformed JSON and the call are dropped,
+never executed or returned to the client. When an earlier call in the same
+turn did complete, the turn keeps `finish_reason="tool_calls"` so the client
+runs the call it already received. Qwen3's XML form declares no argument
+types, so a scalar value stays the string the model wrote unless it wrote a
+JSON object or array.
 
 Two forms are not supported:
 
@@ -1279,7 +1281,7 @@ surface.
 | `factory_droid_openai_model_quarantines_total` | Models withheld after Droid refused them |
 | `factory_droid_openai_warm_sessions` | Warm Droid sessions ready now |
 | `factory_droid_openai_warm_session_hits_total` | Requests served from a warm session |
-| `factory_droid_openai_warm_session_retunes_total` | Warm sessions repointed at another model |
+| `factory_droid_openai_warm_session_retunes_total` | Warm sessions repointed at another model or effort |
 | `factory_droid_openai_warm_session_misses_total` | Requests that had to start their own session |
 | `factory_droid_openai_warm_session_failures_total` | Failed warm-up attempts |
 | `factory_droid_openai_pending_reaps` | Droid teardowns still running in the background |
@@ -1317,13 +1319,14 @@ refills.
 
 Warm sessions are keyed by the model and reasoning effort they were
 initialized with. An exact match serves a turn with no extra round trip.
-Otherwise the bridge repoints a session warmed for another model at the
-requested one, which takes 4-18 ms instead of a 2.4-3.2 s startup, and logs
-`pool.retune` plus `droid.session_retuned`. Requests that ask for the model
-alias, or for the model's default reasoning effort on a session that carries
-an explicit one, cannot be expressed as an update and still log `pool.miss`.
-The pool tracks the settings recent traffic used, so repeat traffic converges
-on exact matches.
+A compatible session can be repointed at another model or explicit reasoning
+effort, which takes 4-18 ms instead of a 2.4-3.2 s startup, and logs
+`pool.retune` plus `droid.session_retuned`. Kimi model switches always use a
+fresh or exact-match warm session so Kimi-specific protocol state cannot cross
+the boundary. Requests that ask for the model alias, or for the model's
+default reasoning effort on a session that carries an explicit one, also log
+`pool.miss`. The pool tracks the settings recent traffic used, so repeat
+traffic converges on exact matches.
 
 Teardown runs after the response is finished, so session close and the second
 `droid exec` needs to exit no longer delay the last token. Set
@@ -1365,9 +1368,9 @@ DEBUG    2026-07-27T14:10:12+0200 event=droid.cleanup request_id=chatcmpl-8f2a c
 ```
 
 `droid.connected` and `droid_startup_ms` only appear on a cold session,
-`pool.retune` and `droid.session_retuned` only when a session warmed for
-another model is reused, and cleanup is logged after the response because it
-is detached.
+`pool.retune` and `droid.session_retuned` only when a compatible session is
+reused with other settings, and cleanup is logged after the response because
+it is detached.
 
 Phase fields, in the order they occur:
 
@@ -1376,7 +1379,7 @@ Phase fields, in the order they occur:
 | `prompt_ms` | Transcript and tool-schema serialization in the bridge |
 | `queue_ms` | Waiting for a Droid concurrency slot |
 | `droid_startup_ms` | `droid exec` process spawn and SDK handshake |
-| `retune_ms` | Repointing a warm session at the requested model |
+| `retune_ms` | Repointing a warm session at the requested settings |
 | `session_ready_ms` | Elapsed until the Droid session accepts a prompt |
 | `prompt_sent_ms` | Elapsed until the prompt was handed to Droid |
 | `ttft_ms` | Elapsed until the first text or reasoning delta |
@@ -1559,11 +1562,11 @@ request timeout, and bridge logs.
 ### One slow request after switching models
 
 The warm pool holds sessions for the model and reasoning effort recent traffic
-used. A session warmed for another model is repointed in milliseconds and logs
-`pool.retune`, so only requests that cannot be expressed as a settings
-update - the model alias, or a model default effort on a session with an
-explicit one - pay full startup and log `pool.miss` with a multi-second
-`session_ready_ms`. Raise `FACTORY_DROID_OPENAI_WARM_SESSIONS` when clients
+used. Most compatible model switches log `pool.retune` and complete in
+milliseconds. Kimi switches intentionally start a fresh session when no exact
+warm session exists, then log `pool.miss` with a multi-second
+`session_ready_ms`; this prevents Kimi-specific protocol state from leaking
+across the switch. Raise `FACTORY_DROID_OPENAI_WARM_SESSIONS` when clients
 alternate between models faster than the pool refills.
 
 ### Every request logs a forced kill

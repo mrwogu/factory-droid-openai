@@ -72,6 +72,7 @@ _MODEL_DENIED_PATTERN = re.compile(
 # Weaker models do exactly that before answering, which is worth tolerating;
 # every other native tool still fails the turn closed.
 _IGNORED_NATIVE_TOOLS = frozenset({"exitspecmode", "toolsearch"})
+_FRESH_SESSION_MODEL_PREFIXES = ("kimi-",)
 
 
 def _is_ignorable_native_tool(tool_name: str) -> bool:
@@ -102,11 +103,20 @@ class SessionKey:
     def can_retune_from(self, other: SessionKey) -> bool:
         """Whether a session warmed for ``other`` can be repointed at ``self``.
 
-        ``None`` means "whatever Droid defaults to", which cannot be restored
-        on a session that already carries an explicit value, so those keys are
-        only reusable for an exact match.
+        Kimi model changes need a fresh session because its protocol state can
+        survive a retune. Other model changes and explicit effort changes keep
+        using Droid's fast settings update.
         """
         if self.model_id is None:
+            return False
+        model_changed = self.model_id != other.model_id
+        if model_changed and (
+            self.model_id.startswith(_FRESH_SESSION_MODEL_PREFIXES)
+            or (
+                other.model_id is not None
+                and other.model_id.startswith(_FRESH_SESSION_MODEL_PREFIXES)
+            )
+        ):
             return False
         return not (self.reasoning_effort is None and other.reasoning_effort is not None)
 
@@ -336,7 +346,7 @@ class DroidRunner:
         model_id = key.model_id
         if model_id is None or not key.can_retune_from(warm.key):
             raise RunnerError(
-                "Warm Droid session cannot be repointed at the requested model.",
+                "Warm Droid session cannot be repointed at the requested settings.",
             )
         started = time.perf_counter()
         effort = _resolve_reasoning_effort(key.reasoning_effort)

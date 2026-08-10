@@ -80,10 +80,11 @@ class WarmSessionPool:
     """Keeps initialized Droid sessions ready so requests skip session startup.
 
     Sessions are keyed by the settings they were initialized with. An exact
-    key match serves a turn with no extra round trip; otherwise a session
-    warmed for another model is handed over and the runner repoints it, which
-    costs milliseconds instead of a fresh process. A session serves at most
-    one turn, which keeps the bridge stateless.
+    key match serves a turn with no extra round trip; otherwise a compatible
+    session may be repointed at another model or explicit reasoning effort.
+    Kimi model switches wait for a fresh session so its protocol state cannot
+    cross the boundary. A session serves at most one turn, which keeps the
+    bridge stateless.
     """
 
     def __init__(
@@ -194,7 +195,7 @@ class WarmSessionPool:
         return None
 
     def _take_retunable(self, key: SessionKey) -> WarmSession | None:
-        """Borrow a session warmed for other settings the runner can repoint."""
+        """Borrow a session the runner can safely repoint."""
         for warmed_key, queue in self._sessions.items():
             if warmed_key == key or not key.can_retune_from(warmed_key):
                 continue
