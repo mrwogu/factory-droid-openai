@@ -100,6 +100,19 @@ class SessionKey:
     model_id: str | None
     reasoning_effort: str | None
 
+    @classmethod
+    def from_request(
+        cls,
+        *,
+        model: str,
+        model_alias: str,
+        reasoning_effort: str | None,
+    ) -> SessionKey:
+        return cls(
+            model_id=_resolve_model_id(model, model_alias),
+            reasoning_effort=reasoning_effort,
+        )
+
     def can_retune_from(self, other: SessionKey) -> bool:
         """Whether a session warmed for ``other`` can be repointed at ``self``.
 
@@ -149,8 +162,9 @@ class RunRequest:
     warm_session: WarmSession | None = None
 
     def session_key(self) -> SessionKey:
-        return SessionKey(
-            model_id=_resolve_model_id(self.model, self.model_alias),
+        return SessionKey.from_request(
+            model=self.model,
+            model_alias=self.model_alias,
             reasoning_effort=self.reasoning_effort,
         )
 
