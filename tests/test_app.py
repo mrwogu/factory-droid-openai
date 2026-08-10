@@ -669,7 +669,7 @@ async def test_overloaded_bridge_rejects_model_and_session_operations(
         session_continuity=True,
         retry_after_seconds=3,
     )
-    app.state.sessions.remember("session-9")
+    app.state.sessions.remember("session-9", "factory-droid")
     async with _client(app) as client:
         active = asyncio.create_task(client.post("/v1/chat/completions", json=_payload()))
         await runner.started.wait()
@@ -700,7 +700,7 @@ async def test_session_operations_time_out_when_the_queue_eats_the_budget(
         max_queue_size=1,
         session_continuity=True,
     )
-    app.state.sessions.remember("session-9")
+    app.state.sessions.remember("session-9", "factory-droid")
     async with _client(app) as client:
         active = asyncio.create_task(client.post("/v1/chat/completions", json=_payload()))
         await runner.started.wait()
@@ -2845,6 +2845,36 @@ async def test_session_id_round_trips_and_drives_a_continuation(
 
 
 @pytest.mark.asyncio
+async def test_session_continuation_rejects_a_model_switch(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [
+            SessionStarted("session-77"),
+            TextDelta("first reply"),
+            RunComplete(Usage()),
+        ]
+    )
+    app = _feature_app(tmp_path, runner, session_continuity=True)
+    async with _client(app) as client:
+        first = await client.post(
+            "/v1/chat/completions",
+            json=_payload(model="model-a"),
+        )
+        switched = await client.post(
+            "/v1/chat/completions",
+            json=_payload(
+                model="model-b",
+                factory_droid_session_id="session-77",
+            ),
+        )
+
+    assert first.status_code == 200
+    assert switched.status_code == 400
+    assert switched.json()["error"]["type"] == "invalid_request_error"
+    assert "Start a new session to switch models" in switched.json()["error"]["message"]
+    assert len(runner.requests) == 1
+
+
+@pytest.mark.asyncio
 async def test_multiple_choices_cannot_continue_a_session(tmp_path: Path) -> None:
     runner = FakeRunner([SessionStarted("session-9"), RunComplete(Usage())])
     app = _feature_app(tmp_path, runner, session_continuity=True)
@@ -3294,7 +3324,12 @@ async def test_guarded_factory_session_operations(tmp_path: Path) -> None:
     )
     app = _feature_app(tmp_path, runner, session_continuity=True)
     async with _client(app) as client:
-        assert (await client.post("/v1/chat/completions", json=_payload())).status_code == 200
+        assert (
+            await client.post(
+                "/v1/chat/completions",
+                json=_payload(model="model-a"),
+            )
+        ).status_code == 200
         context = await client.get("/v1/factory/sessions/session-77/context")
         compact = await client.post(
             "/v1/factory/sessions/session-77/compact",
@@ -3315,6 +3350,8 @@ async def test_guarded_factory_session_operations(tmp_path: Path) -> None:
     assert rename.json()["status"] == "renamed"
     assert close.json()["status"] == "closed"
     assert missing.status_code == 404
+    assert app.state.sessions.model("session-compact") == "model-a"
+    assert app.state.sessions.model("session-fork") == "model-a"
     assert runner.session_operations == [
         ("context", "session-77", None),
         ("compact", "session-77", "Keep decisions."),
@@ -3409,7 +3446,7 @@ async def test_request_limits_cover_the_factory_session_endpoints(tmp_path: Path
         session_continuity=True,
         max_request_bytes=256,
     )
-    app.state.sessions.remember("session-9")
+    app.state.sessions.remember("session-9", "factory-droid")
     async with _client(app) as client:
         oversized = await client.post(
             "/v1/factory/sessions/session-9/compact",
@@ -3441,11 +3478,11 @@ async def test_factory_session_operations_require_continuity(tmp_path: Path) -> 
 def test_session_registry_evicts_the_oldest_entries() -> None:
     registry = SessionRegistry(2)
 
-    registry.remember("a")
-    registry.remember("b")
+    registry.remember("a", "model-a")
+    registry.remember("b", "model-b")
     assert registry.knows("a") is True
 
-    registry.remember("c")
+    registry.remember("c", "model-c")
 
     assert registry.knows("b") is False
     assert registry.knows("a") is True
@@ -3455,12 +3492,14 @@ def test_session_registry_evicts_the_oldest_entries() -> None:
 def test_session_registry_ignores_duplicate_entries() -> None:
     registry = SessionRegistry(2)
 
-    registry.remember("a")
-    registry.remember("a")
-    registry.remember("b")
+    registry.remember("a", "model-a")
+    registry.remember("a", "model-b")
+    registry.remember("b", "model-b")
 
     assert registry.knows("a") is True
+    assert registry.model("a") == "model-b"
     assert registry.knows("b") is True
+    assert registry.model("missing") is None
 
 
 @pytest.mark.asyncio

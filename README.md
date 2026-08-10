@@ -1052,7 +1052,10 @@ header, and announced in the first streaming chunk.
 Only sessions this bridge process created can be continued. Session IDs
 stored by the local Droid CLI - including your own interactive sessions - are
 rejected with HTTP `404`, so a client cannot read back conversations it does
-not own. Restarting the bridge clears the set of continuable sessions.
+not own. A continuation must use the model that created the session; selecting
+another model returns HTTP `400`. Start a new session and resend the transcript
+when switching models. Restarting the bridge clears the set of continuable
+sessions.
 
 The same guard applies to the Factory session extension endpoints. They are
 available only when continuity is enabled and only for IDs created by the

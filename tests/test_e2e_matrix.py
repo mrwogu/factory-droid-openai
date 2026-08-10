@@ -54,6 +54,7 @@ def _scenario(e2e: ModuleType, **overrides: Any) -> Any:
 def test_scenarios_cover_both_transports_and_run_hostile_cases_once(e2e: ModuleType) -> None:
     plan = e2e.scenarios()
     switch_plan = e2e.switch_scenarios()
+    continuation_plan = e2e.continuation_switch_scenarios()
 
     streamed = {scenario.name for scenario in plan if scenario.stream}
     hostile = [scenario for scenario in plan if not scenario.per_model]
@@ -65,6 +66,8 @@ def test_scenarios_cover_both_transports_and_run_hostile_cases_once(e2e: ModuleT
     assert len(e2e.scenarios(streaming=False)) < len(plan)
     assert {scenario.stream for scenario in switch_plan} == {False, True}
     assert len(e2e.switch_scenarios(streaming=False)) == 1
+    assert {scenario.stream for scenario in continuation_plan} == {False, True}
+    assert len(e2e.continuation_switch_scenarios(streaming=False)) == 1
 
 
 def test_contract_satisfied_is_a_pass(e2e: ModuleType) -> None:
@@ -285,6 +288,7 @@ async def test_bridge_reads_a_json_completion(e2e: ModuleType) -> None:
         return httpx.Response(
             200,
             json={
+                "factory_droid_session_id": "session-json",
                 "choices": [
                     {
                         "index": 0,
@@ -295,7 +299,7 @@ async def test_bridge_reads_a_json_completion(e2e: ModuleType) -> None:
                         },
                         "finish_reason": "tool_calls",
                     }
-                ]
+                ],
             },
             headers={"x-request-id": "req-1"},
         )
@@ -309,12 +313,24 @@ async def test_bridge_reads_a_json_completion(e2e: ModuleType) -> None:
     assert observation.tool_calls == 1
     assert observation.content_chars == 5
     assert observation.request_id == "req-1"
+    assert observation.session_id == "session-json"
 
 
 @pytest.mark.asyncio
 async def test_bridge_reads_a_streamed_completion(e2e: ModuleType) -> None:
     chunks = [
-        {"choices": [{"index": 0, "delta": {"content": "he"}, "finish_reason": None}]},
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "content": "he",
+                        "factory_droid_session_id": "session-stream",
+                    },
+                    "finish_reason": None,
+                }
+            ]
+        },
         {
             "choices": [
                 {
@@ -345,6 +361,7 @@ async def test_bridge_reads_a_streamed_completion(e2e: ModuleType) -> None:
     assert observation.tool_calls == 1
     assert observation.content_chars == 2
     assert observation.ttft_ms is not None
+    assert observation.session_id == "session-stream"
 
 
 @pytest.mark.asyncio
@@ -619,6 +636,99 @@ async def test_switch_matrix_skips_one_model_and_supports_no_callback(e2e: Modul
     assert len(rows) == 2
 
 
+@pytest.mark.asyncio
+async def test_continuation_switch_matrix_rejects_a_model_ring(e2e: ModuleType) -> None:
+    seen: list[tuple[str, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        model = body["model"]
+        session_id = body.get("factory_droid_session_id")
+        seen.append((model, session_id))
+        if session_id is not None:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "start a new session",
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "factory_droid_session_id": f"session-{model}",
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "ready"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+        )
+
+    written: list[dict[str, Any]] = []
+    bridge = _bridge(e2e, handler)
+    plan = e2e.continuation_switch_scenarios(streaming=False)
+    async with bridge.client:
+        rows = await e2e.run_continuation_switch_matrix(
+            bridge,
+            ["m1", "m2"],
+            plan,
+            on_row=written.append,
+        )
+
+    assert seen == [
+        ("m1", None),
+        ("m2", "session-m1"),
+        ("m2", None),
+        ("m1", "session-m2"),
+    ]
+    assert all(row["verdict"] == e2e.SUCCESS for row in rows)
+    assert written == rows
+
+
+@pytest.mark.asyncio
+async def test_continuation_switch_matrix_reports_missing_session_ids(
+    e2e: ModuleType,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "ready"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    bridge = _bridge(e2e, handler)
+    plan = e2e.continuation_switch_scenarios(streaming=False)
+    async with bridge.client:
+        assert (
+            await e2e.run_continuation_switch_matrix(
+                bridge,
+                ["m1"],
+                plan,
+            )
+            == []
+        )
+        rows = await e2e.run_continuation_switch_matrix(
+            bridge,
+            ["m1", "m2"],
+            plan,
+        )
+
+    assert len(rows) == 2
+    assert all(row["verdict"] == e2e.BRIDGE_DEFECT for row in rows)
+    assert all("no session id" in row["detail"] for row in rows)
+
+
 def _rows(e2e: ModuleType) -> list[dict[str, Any]]:
     return [
         e2e.row("m1", _scenario(e2e), _observation(e2e)),
@@ -699,6 +809,15 @@ def test_comparison_without_changes_stays_quiet(e2e: ModuleType) -> None:
     assert "## Fixes" not in rendered
 
 
+def test_comparison_keeps_transition_sources_distinct(e2e: ModuleType) -> None:
+    first = e2e.row("target", _scenario(e2e), _observation(e2e))
+    first["source_model"] = "source-a"
+    second = e2e.row("target", _scenario(e2e), _observation(e2e))
+    second["source_model"] = "source-b"
+
+    assert e2e.compare([first, second], [first, second])["shared"] == 2
+
+
 def test_report_command_reads_a_jsonl_run(
     e2e: ModuleType,
     tmp_path: Path,
@@ -742,11 +861,13 @@ def test_compare_command_fails_on_regressions(
     assert "Regressions" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("test_continuity", [False, True])
 def test_run_command_writes_rows_and_reports_blocking_findings(
     e2e: ModuleType,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    test_continuity: bool,
 ) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/models":
@@ -760,8 +881,11 @@ def test_run_command_writes_rows_and_reports_blocking_findings(
     monkeypatch.setattr(e2e.httpx, "AsyncClient", MockClient)
     monkeypatch.delenv("FACTORY_DROID_OPENAI_API_KEY", raising=False)
     out = tmp_path / "nested" / "run.jsonl"
+    args = ["run", "--no-stream", "--concurrency", "4", "--out", str(out)]
+    if test_continuity:
+        args.append("--test-session-continuity")
 
-    code = e2e.main(["run", "--no-stream", "--concurrency", "4", "--out", str(out)])
+    code = e2e.main(args)
 
     rows = e2e.load_rows(out)
     assert code == 1
