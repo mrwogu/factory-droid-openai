@@ -4,6 +4,12 @@ import threading
 from collections import Counter
 from dataclasses import dataclass
 
+# The only settings change a warm session can absorb, since a model change
+# waits for a fresh session. The label is rendered even at zero so a dashboard
+# keeps its series between restarts.
+WARM_RETUNE_EFFORT = "effort"
+_WARM_RETUNE_REASONS = (WARM_RETUNE_EFFORT,)
+
 
 @dataclass(frozen=True, slots=True)
 class RequestMetric:
@@ -42,7 +48,7 @@ class BridgeMetrics:
         self._model_quarantines = 0
         self._warm_sessions = 0
         self._warm_hits = 0
-        self._warm_retunes = 0
+        self._warm_retunes: Counter[str] = Counter()
         self._warm_misses = 0
         self._warm_failures = 0
         self._pending_reaps = 0
@@ -123,9 +129,9 @@ class BridgeMetrics:
         with self._lock:
             self._warm_hits += 1
 
-    def increment_warm_retunes(self) -> None:
+    def increment_warm_retunes(self, reason: str) -> None:
         with self._lock:
-            self._warm_retunes += 1
+            self._warm_retunes[reason] += 1
 
     def increment_warm_misses(self) -> None:
         with self._lock:
@@ -162,7 +168,7 @@ class BridgeMetrics:
                         "model_quarantine": self._model_quarantines,
                         "warm_hit": self._warm_hits,
                         "warm_miss": self._warm_misses,
-                        "warm_retune": self._warm_retunes,
+                        "warm_retune": self._warm_retunes.total(),
                         "warm_failure": self._warm_failures,
                     }.items()
                 )
@@ -172,6 +178,10 @@ class BridgeMetrics:
     def render(self) -> str:
         with self._lock:
             request_totals = sorted(self._request_totals.items())
+            warm_retunes = [
+                (reason, self._warm_retunes[reason])
+                for reason in sorted({*_WARM_RETUNE_REASONS, *self._warm_retunes})
+            ]
             values = {
                 "request_duration_sum": self._request_duration_sum,
                 "request_duration_count": self._request_duration_count,
@@ -190,7 +200,6 @@ class BridgeMetrics:
                 "model_quarantines": self._model_quarantines,
                 "warm_sessions": self._warm_sessions,
                 "warm_hits": self._warm_hits,
-                "warm_retunes": self._warm_retunes,
                 "warm_misses": self._warm_misses,
                 "warm_failures": self._warm_failures,
                 "pending_reaps": self._pending_reaps,
@@ -242,7 +251,10 @@ class BridgeMetrics:
             "# TYPE factory_droid_openai_warm_session_hits_total counter",
             f"factory_droid_openai_warm_session_hits_total {values['warm_hits']}",
             "# TYPE factory_droid_openai_warm_session_retunes_total counter",
-            f"factory_droid_openai_warm_session_retunes_total {values['warm_retunes']}",
+            *[
+                f'factory_droid_openai_warm_session_retunes_total{{reason="{reason}"}} {count}'
+                for reason, count in warm_retunes
+            ],
             "# TYPE factory_droid_openai_warm_session_misses_total counter",
             f"factory_droid_openai_warm_session_misses_total {values['warm_misses']}",
             "# TYPE factory_droid_openai_warm_session_failures_total counter",

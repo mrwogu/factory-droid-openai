@@ -56,7 +56,7 @@ def test_metrics_snapshot_contains_only_telemetry_dimensions() -> None:
     metrics.increment_model_quarantines()
     metrics.increment_warm_hits()
     metrics.increment_warm_misses()
-    metrics.increment_warm_retunes()
+    metrics.increment_warm_retunes("effort")
     metrics.increment_warm_failures()
 
     snapshot = metrics.telemetry_snapshot()

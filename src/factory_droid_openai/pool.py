@@ -6,6 +6,7 @@ from typing import Any, Protocol
 
 from factory_droid_openai.logs import debug as log_debug
 from factory_droid_openai.logs import warning as log_warning
+from factory_droid_openai.metrics import WARM_RETUNE_EFFORT
 from factory_droid_openai.runner import DroidRunner, SessionKey, WarmSession
 
 RunnerFactory = Callable[[], DroidRunner]
@@ -19,7 +20,7 @@ class PoolMetrics(Protocol):
 
     def increment_warm_hits(self) -> None: ...
 
-    def increment_warm_retunes(self) -> None: ...
+    def increment_warm_retunes(self, reason: str) -> None: ...
 
     def increment_warm_misses(self) -> None: ...
 
@@ -80,11 +81,11 @@ class WarmSessionPool:
     """Keeps initialized Droid sessions ready so requests skip session startup.
 
     Sessions are keyed by the settings they were initialized with. An exact
-    key match serves a turn with no extra round trip; otherwise a compatible
-    session may be repointed at another model or explicit reasoning effort.
-    Model families whose tool-call template survives a retune wait for a fresh
-    session instead, so that template cannot cross the boundary. A session
-    serves at most one turn, which keeps the bridge stateless.
+    key match serves a turn with no extra round trip; otherwise a session
+    warmed for the same model can be repointed at another explicit reasoning
+    effort. A model change waits for a fresh or exact-match session, because
+    the tool-call template Droid installed at session start survives a retune.
+    A session serves at most one turn, which keeps the bridge stateless.
     """
 
     def __init__(
@@ -171,11 +172,12 @@ class WarmSessionPool:
             self._publish()
             if self._metrics is not None:
                 self._metrics.increment_warm_hits()
-                self._metrics.increment_warm_retunes()
+                self._metrics.increment_warm_retunes(WARM_RETUNE_EFFORT)
             log_debug(
                 "pool.retune",
                 model=key.model_id,
-                warmed_for=session.key.model_id,
+                reason=WARM_RETUNE_EFFORT,
+                warmed_for_effort=session.key.reasoning_effort,
                 warm_sessions=self._total(),
             )
             return session
