@@ -1,5 +1,28 @@
 # Changelog
 
+## [1.6.6](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.5...v1.6.6) (2026-08-10)
+
+
+### Bug Fixes
+
+* **ci:** compare OpenAPI schemas semantically ([6b65f25](https://github.com/mrwogu/factory-droid-openai/commit/6b65f25c8e0b705283954c7736f2aa004af0943f))
+* **ci:** verify the OpenAPI contract is regenerated ([aa7f27e](https://github.com/mrwogu/factory-droid-openai/commit/aa7f27efef40bebd766b31617a39883c6fa000b5))
+* **docker:** support settings file mount ([b27d304](https://github.com/mrwogu/factory-droid-openai/commit/b27d3048151e324c3292047bba5ede23434bd97b))
+* **docs:** correct notice, retune, and settings scope ([144dcbe](https://github.com/mrwogu/factory-droid-openai/commit/144dcbee601ed75cd406561c9644d45be4244150))
+* **docs:** rewrap the retune and malformed-notice paragraphs ([852561a](https://github.com/mrwogu/factory-droid-openai/commit/852561afb8ecd4f43fb99e813a8728f7f9b375bc))
+* **e2e:** cover warm-pool model switches ([61ff592](https://github.com/mrwogu/factory-droid-openai/commit/61ff5924e595896b7ba5b795b70fecc2a44352cc))
+* **e2e:** harden model transition verdicts ([77f4aaf](https://github.com/mrwogu/factory-droid-openai/commit/77f4aaf640794bbbc627559096b40d69588dd77b))
+* **e2e:** skip the opted-out continuation phase ([35e9975](https://github.com/mrwogu/factory-droid-openai/commit/35e9975ab701e4a940e60c2b41487a636f64ca5b))
+* **openapi:** regenerate the spec for locked dependencies ([5b64856](https://github.com/mrwogu/factory-droid-openai/commit/5b648560cd0895f9527c737980cb3b83e2ba5d05))
+* **pool:** require a fresh session for every model change ([aad67da](https://github.com/mrwogu/factory-droid-openai/commit/aad67da5f65208664cd5549662768eac25da4304))
+* **protocol:** contain malformed Kimi tool calls ([51d39dd](https://github.com/mrwogu/factory-droid-openai/commit/51d39dd616211fa94951af531837fd34eabe9d9c))
+* **protocol:** contain mangled tool calls without a call id ([7e4de3f](https://github.com/mrwogu/factory-droid-openai/commit/7e4de3f7d8ebe85619edb9af555ed2f8d0f840bf))
+* **protocol:** keep mangled tool-call detection active after plain JSON ([105fd04](https://github.com/mrwogu/factory-droid-openai/commit/105fd0404901b72a75b924839eca7334d6b5daf2))
+* **runner:** match fresh-session models by family ([01444bc](https://github.com/mrwogu/factory-droid-openai/commit/01444bc77f35e98c417364d1ad2574ad207eaf88))
+* **sessions:** preserve continuation settings ([29d70ff](https://github.com/mrwogu/factory-droid-openai/commit/29d70ff5bff0e966fa19b9db9737153221256863))
+* **sessions:** reject continuation model switches ([19fe33d](https://github.com/mrwogu/factory-droid-openai/commit/19fe33def51a586d9f290ad57bd3915bbcfc53b0))
+* **sessions:** settle continuation mismatch before prompt work ([a7476f4](https://github.com/mrwogu/factory-droid-openai/commit/a7476f4aecc6d75f96284b866ca9d0860edcef04))
+
 ## [1.6.5](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.4...v1.6.5) (2026-08-08)
 
 
