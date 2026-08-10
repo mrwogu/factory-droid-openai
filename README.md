@@ -286,11 +286,10 @@ and a plain-text bridge notice. The malformed JSON and the call are dropped,
 never executed or returned to the client. The notice names no tool-call
 format, because anything it named would itself be tool-call-shaped text in
 assistant content: recovery is the client's retry, not the model's next turn.
-When an earlier call in the same
-turn did complete, the turn keeps `finish_reason="tool_calls"` so the client
-runs the call it already received. Qwen3's XML form declares no argument
-types, so a scalar value stays the string the model wrote unless it wrote a
-JSON object or array.
+When an earlier call in the same turn did complete, the turn keeps
+`finish_reason="tool_calls"` so the client runs the call it already received.
+Qwen3's XML form declares no argument types, so a scalar value stays the
+string the model wrote unless it wrote a JSON object or array.
 
 Two forms are not supported:
 
@@ -1363,10 +1362,10 @@ effort, which takes 4-18 ms instead of a 2.4-3.2 s startup, and logs
 so the tool-call template the session was initialized with survives it: model
 families that frame calls in their own special tokens always use a fresh or
 exact-match warm session instead. Kimi is the one such family today, matched
-by the same family table telemetry labels use. Requests that ask for the model alias, or for the model's
-default reasoning effort on a session that carries an explicit one, also log
-`pool.miss`. The pool tracks the settings recent traffic used, so repeat
-traffic converges on exact matches.
+by the same family table telemetry labels use. Requests that ask for the
+model alias, or for the model's default reasoning effort on a session that
+carries an explicit one, also log `pool.miss`. The pool tracks the settings
+recent traffic used, so repeat traffic converges on exact matches.
 
 Teardown runs after the response is finished, so session close and the second
 `droid exec` needs to exit no longer delay the last token. Set
