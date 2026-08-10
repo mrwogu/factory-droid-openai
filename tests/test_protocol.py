@@ -54,6 +54,16 @@ def _request(**overrides: object) -> ChatCompletionRequest:
     return ChatCompletionRequest.model_validate(payload)
 
 
+def _feed_parser_to_finish(
+    parser: ToolCallStreamParser,
+    emissions: list[object],
+    *chunks: str,
+) -> None:
+    for chunk in chunks:
+        emissions.extend(parser.feed(chunk))
+    emissions.extend(parser.finish())
+
+
 def test_build_prompt_preserves_openai_transcript_and_tools() -> None:
     request = _request(
         messages=[
@@ -392,9 +402,8 @@ def test_stream_parser_handles_every_marker_split() -> None:
 
     for split in range(1, len(value)):
         parser = ToolCallStreamParser(frozenset({"weather"}))
-        emissions = parser.feed(value[:split])
-        emissions.extend(parser.feed(value[split:]))
-        emissions.extend(parser.finish())
+        emissions: list[object] = []
+        _feed_parser_to_finish(parser, emissions, value[:split], value[split:])
 
         text = "".join(
             emission.text for emission in emissions if isinstance(emission, TextEmission)
@@ -437,9 +446,13 @@ def test_stream_parser_handles_every_close_marker_split() -> None:
 
     for split in range(1, len(TOOL_CALL_CLOSE)):
         parser = ToolCallStreamParser(frozenset({"weather"}))
-        emissions = parser.feed(f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE[:split]}")
-        emissions.extend(parser.feed(TOOL_CALL_CLOSE[split:]))
-        emissions.extend(parser.finish())
+        emissions: list[object] = []
+        _feed_parser_to_finish(
+            parser,
+            emissions,
+            f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE[:split]}",
+            TOOL_CALL_CLOSE[split:],
+        )
 
         assert len(emissions) == 1
         assert isinstance(emissions[0], ToolCallEmission)
@@ -851,6 +864,50 @@ def test_stream_parser_rejects_incomplete_reordered_message_json() -> None:
     assert parser.feed('{ "content":') == []
     with pytest.raises(MalformedToolCallError, match="echoed an OpenAI transcript"):
         parser.finish()
+
+
+@pytest.mark.parametrize("separator", [" ", "  ", "\t\n", "_"])
+def test_stream_parser_stops_mangled_openai_tool_calls_before_they_leak(
+    separator: str,
+) -> None:
+    prefix = 'safe answer (reset|", '
+    value = (
+        prefix + f'"tool{separator}calls":"id":"call_1","type":"function","function":'
+        '("name":"weather","arguments":("city":"Gdansk"))'
+    )
+
+    for split in range(1, len(value)):
+        parser = ToolCallStreamParser(frozenset({"weather"}))
+        emissions: list[object] = []
+
+        with pytest.raises(MalformedToolCallError, match="echoed an OpenAI transcript"):
+            _feed_parser_to_finish(parser, emissions, value[:split], value[split:])
+
+        assert "".join(item.text for item in emissions if isinstance(item, TextEmission)) == prefix
+
+
+def test_stream_parser_preserves_tool_calls_phrase_without_json_separator() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    text = 'The label "tool calls": remains ordinary prose.'
+
+    emissions: list[object] = []
+    for char in text:
+        emissions.extend(parser.feed(char))
+    emissions.extend(parser.finish())
+
+    assert "".join(item.text for item in emissions if isinstance(item, TextEmission)) == text
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        '"toolX',
+        '"tool_bad',
+        '"tool calls":"id":"call_x',
+    ],
+)
+def test_mangled_tool_calls_prefix_rejects_non_prefixes(value: str) -> None:
+    assert protocol._is_mangled_tool_calls_prefix(value) is False
 
 
 @pytest.mark.parametrize(

@@ -1749,8 +1749,55 @@ async def test_streaming_malformed_tool_call_stops_with_note(tmp_path: Path) -> 
     )
     assert content.startswith("checking \n\n[bridge notice: dropped a malformed tool call")
     assert 'for tool "weather"' in content
-    assert "<tool_call>" in content
+    assert "Retry the request" in content
+    assert "<tool_call>" not in content
     assert 'outcome="malformed",status="200"} 1' in metrics.text
+
+
+@pytest.mark.asyncio
+async def test_streaming_mangled_openai_tool_calls_do_not_leak_json(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [
+            TextDelta(
+                'checking (reset|", "tool calls":"id":"call_1","type":"function",'
+                '"function":("name":"weather","arguments":("city":"Gdansk"))'
+            ),
+            RunComplete(Usage()),
+        ]
+    )
+    payload = _payload(
+        stream=True,
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ],
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    chunks = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith('data: {"')
+    ]
+    content = "".join(
+        choice["delta"].get("content") or ""
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+    )
+    assert content.startswith('checking (reset|", \n\n[bridge notice:')
+    assert '"tool calls"' not in content
+    assert '"function"' not in content
+    assert '"arguments"' not in content
+    assert "<tool_call>" not in content
+    finish_chunk = next(
+        chunk
+        for chunk in chunks
+        if chunk["choices"] and chunk["choices"][0]["finish_reason"] is not None
+    )
+    assert finish_chunk["choices"][0]["finish_reason"] == "stop"
 
 
 @pytest.mark.asyncio
@@ -1841,7 +1888,7 @@ async def test_streaming_malformed_tool_call_without_prior_text(tmp_path: Path) 
         for chunk in chunks
         for choice in chunk.get("choices", [])
     )
-    assert content.startswith("[bridge notice: dropped a malformed tool call (")
+    assert content.startswith("[bridge notice: dropped a malformed tool call.")
     assert "for tool" not in content
     finish_chunk = next(
         chunk

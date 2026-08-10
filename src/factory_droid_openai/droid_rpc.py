@@ -97,12 +97,10 @@ class DroidRpcExtension:
         model_id: str,
         reasoning_effort: str | None,
     ) -> None:
-        """Repoint an initialized session at another model and effort.
+        """Apply a model id and optional reasoning effort to a session.
 
-        Droid applies this without restarting the process, so a warm session
-        can serve a model it was not initialized with. Interaction mode and
-        autonomy level are resent so the bridge invariants stay pinned; the
-        disabled native tool list is preserved by Droid.
+        Interaction mode and autonomy level are resent so bridge invariants
+        stay pinned; the disabled native tool list is preserved by Droid.
         """
         params: dict[str, Any] = {
             "modelId": model_id,

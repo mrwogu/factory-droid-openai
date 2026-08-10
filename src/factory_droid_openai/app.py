@@ -1581,13 +1581,10 @@ async def _collect_completion(
                     emissions = parser.feed(event.text)
                     _apply_emissions(result, emissions, stop_buffer)
                 except MalformedToolCallError as exc:
-                    # The payload closed but no decoder could parse it, so
-                    # continuing the turn would only make the model repeat the
-                    # same garbage. Answer with finish_reason="stop" plus a
-                    # visible note naming the expected format instead: the
-                    # client stops auto-continuing, and a resubmitted
-                    # transcript tells the model how to re-emit the call. The
-                    # malformed call is dropped, never executed.
+                    # The parser found a malformed call or transcript fragment,
+                    # so continuing would only expose or repeat garbage. A
+                    # plain-text note plus finish_reason="stop" prevents client
+                    # continuation loops. The call is dropped, never executed.
                     record_malformed(exc)
                     break
                 if stop_buffer.triggered:
@@ -1942,11 +1939,10 @@ async def _stream_completion(
             if include_usage:
                 yield _sse(_usage_chunk(request_id, created, model, usage))
         except MalformedToolCallError as exc:
-            # The payload closed but no decoder could parse it. A length
-            # finish would make the client ask the model to "continue", which
-            # only repeats the same garbage in a loop, so answer with
-            # finish_reason="stop" plus a visible note naming the expected
-            # format. The malformed call is dropped, never executed.
+            # The parser found a malformed call or transcript fragment. A
+            # length finish would make the client ask the model to continue,
+            # exposing or repeating garbage. Return a plain-text note with
+            # finish_reason="stop"; the call is dropped, never executed.
             outcome = "malformed"
             log_warning(
                 "chat.malformed",
@@ -2312,18 +2308,15 @@ def _reject_remote_schema_refs(value: Any) -> None:
 
 
 def _malformed_tool_call_note(exc: MalformedToolCallError) -> str:
-    """Client- and model-readable explanation for a dropped malformed call.
+    """Client-readable explanation for a dropped malformed call.
 
-    The note becomes assistant content, so a client that resubmits the
-    transcript hands the model the exact format to re-emit instead of
-    repeating the payload no decoder could parse.
+    The note becomes assistant content, so it must not contain tool-call JSON
+    that clients may render or models may copy into the next turn.
     """
     tool = f' for tool "{exc.tool_name}"' if exc.tool_name else ""
     return (
-        f"[bridge notice: dropped a malformed tool call{tool} "
-        f"({exc.payload_bytes} bytes, undecodable payload). To call a tool, emit "
-        '<tool_call>{"name":"<tool_name>","arguments":{...}}</tool_call> '
-        "with exactly one JSON object between the markers.]"
+        f"[bridge notice: dropped a malformed tool call{tool}. "
+        "Retry the request if a tool call is still needed.]"
     )
 
 

@@ -44,6 +44,8 @@ _UNPARSED_HEAD_CHARS = 64
 _MESSAGE_JSON_PATTERN = re.compile(r'\{\s*"(?:role|content|tool_calls|id|type)"\s*:')
 _MESSAGE_JSON_KEYS = ("role", "content", "tool_calls", "id", "type")
 _MAX_MESSAGE_JSON_PREFIX_CHARS = 64
+_MANGLED_TOOL_CALLS_PATTERN = re.compile(r'"tool(?:_|\s+)calls"\s*:\s*"id"\s*:\s*"call_')
+_MANGLED_TOOL_CALLS_START = '"tool'
 
 __all__ = [
     "TOOL_CALL_CLOSE",
@@ -335,10 +337,15 @@ class ToolCallStreamParser:
         self._saw_tool_call = False
         self._tool_call_count = 0
         self._dialect = NATIVE_DIALECT
+        self._pending_transcript_error: MalformedToolCallError | None = None
 
     def feed(self, chunk: str) -> list[ProtocolEmission]:
         if not chunk:
             return []
+        if self._pending_transcript_error is not None:
+            error = self._pending_transcript_error
+            self._pending_transcript_error = None
+            raise error
         if self._done:
             if self._ignore_transcript_tail:
                 return []
@@ -358,6 +365,10 @@ class ToolCallStreamParser:
     def finish(self) -> list[ProtocolEmission]:
         """Flushes buffered text and any tool call left without a close marker."""
         emissions: list[ProtocolEmission] = []
+        if self._pending_transcript_error is not None:
+            error = self._pending_transcript_error
+            self._pending_transcript_error = None
+            raise error
         if self._capturing:
             recovered = self._recover_unclosed_tool_call()
             if recovered is None:
@@ -397,13 +408,32 @@ class ToolCallStreamParser:
         self._text_tail = ""
         found = find_open_marker(value)
         message_match = _MESSAGE_JSON_PATTERN.search(value) if detect_message_json else None
+        mangled_match = _MANGLED_TOOL_CALLS_PATTERN.search(value) if detect_message_json else None
         emissions: list[ProtocolEmission] = []
-        if message_match is not None and (found is None or message_match.start() < found[0]):
+        if (
+            message_match is not None
+            and (found is None or message_match.start() < found[0])
+            and (mangled_match is None or message_match.start() < mangled_match.start())
+        ):
             prefix = value[: message_match.start()]
             if prefix:
                 emissions.extend(self._emit_text_before_marker(prefix))
             self._capturing_message_json = True
             emissions.extend(self._consume_message_json(value[message_match.start() :]))
+            return emissions
+
+        if (
+            mangled_match is not None
+            and (found is None or mangled_match.start() < found[0])
+            and (message_match is None or mangled_match.start() < message_match.start())
+        ):
+            prefix = value[: mangled_match.start()]
+            if prefix:
+                emissions.extend(self._emit_text_before_marker(prefix))
+            payload = value[mangled_match.start() :]
+            # Return already verified prose first. The next chunk or finish()
+            # raises before any transcript-shaped tail reaches the client.
+            self._pending_transcript_error = self._transcript_error(payload)
             return emissions
 
         if found is not None:
@@ -424,6 +454,7 @@ class ToolCallStreamParser:
         if detect_message_json:
             partial_message = _partial_message_json_prefix_length(value)
             held = max(held, partial_message)
+            held = max(held, _partial_mangled_tool_calls_prefix_length(value))
         if self._saw_tool_call:
             held = max(held, len(self._trailing_partial(value)))
         emit_length = len(value) - held
@@ -877,3 +908,66 @@ def _partial_message_json_prefix_length(value: str) -> int:
     while index < len(candidate) and candidate[index].isspace():
         index += 1
     return len(candidate) if index == len(candidate) else 0
+
+
+def _partial_mangled_tool_calls_prefix_length(value: str) -> int:
+    window_start = max(0, len(value) - _MAX_MESSAGE_JSON_PREFIX_CHARS)
+    held = 0
+    for start in range(window_start, len(value)):
+        if value[start] != '"':
+            continue
+        candidate = value[start:]
+        if _is_mangled_tool_calls_prefix(candidate):
+            held = max(held, len(candidate))
+    return held
+
+
+def _is_mangled_tool_calls_prefix(value: str) -> bool:
+    consumed = _consume_literal_prefix(value, 0, _MANGLED_TOOL_CALLS_START)
+    if consumed is None:
+        return False
+    index, ended = consumed
+    if ended:
+        return True
+
+    if value[index] == "_":
+        consumed = _consume_literal_prefix(value, index, '_calls"')
+    elif value[index].isspace():
+        while index < len(value) and value[index].isspace():
+            index += 1
+        if index == len(value):
+            return True
+        consumed = _consume_literal_prefix(value, index, 'calls"')
+    else:
+        return False
+    if consumed is None:
+        return False
+    index, ended = consumed
+    if ended:
+        return True
+
+    for literal in (":", '"id"', ":", '"call_'):
+        while index < len(value) and value[index].isspace():
+            index += 1
+        if index == len(value):
+            return True
+        consumed = _consume_literal_prefix(value, index, literal)
+        if consumed is None:
+            return False
+        index, ended = consumed
+        if ended:
+            return True
+    return False
+
+
+def _consume_literal_prefix(
+    value: str,
+    start: int,
+    literal: str,
+) -> tuple[int, bool] | None:
+    remainder = value[start:]
+    if literal.startswith(remainder):
+        return len(value), True
+    if not remainder.startswith(literal):
+        return None
+    return start + len(literal), False

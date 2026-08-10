@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 KEY = SessionKey(model_id="model-a", reasoning_effort="high")
 OTHER_KEY = SessionKey(model_id="model-b", reasoning_effort=None)
 RETUNE_KEY = SessionKey(model_id="model-b", reasoning_effort="high")
+KIMI_KEY = SessionKey(model_id="kimi-k3", reasoning_effort="high")
 
 
 class FakeTransport:
@@ -384,6 +385,19 @@ async def test_pool_hands_over_a_retunable_session_without_metrics() -> None:
     pool.offer(_session(created_at=asyncio.get_running_loop().time()))
 
     assert pool.acquire(RETUNE_KEY) is not None
+
+
+@pytest.mark.asyncio
+async def test_pool_does_not_retune_a_session_to_kimi() -> None:
+    metrics = BridgeMetrics()
+    pool = _pool(FakeRunner(), size=2, metrics=metrics)
+    pool.note(KEY)
+    pool.offer(_session(created_at=asyncio.get_running_loop().time()))
+
+    assert pool.acquire(KIMI_KEY) is None
+    rendered = metrics.render()
+    assert "factory_droid_openai_warm_session_retunes_total 0" in rendered
+    assert "factory_droid_openai_warm_session_misses_total 1" in rendered
 
 
 @pytest.mark.asyncio

@@ -1304,7 +1304,7 @@ async def test_runner_retunes_a_warm_session_to_the_requested_model(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_runner_retune_keeps_the_droid_default_effort(tmp_path: Path) -> None:
+async def test_runner_rejects_a_cross_model_warm_session_for_kimi(tmp_path: Path) -> None:
     client = FakeClient([TurnComplete()])
     runner = DroidRunner(
         droid_path="droid",
@@ -1312,26 +1312,23 @@ async def test_runner_retune_keeps_the_droid_default_effort(tmp_path: Path) -> N
         client_factory=cast("Any", lambda _path, _cwd: client),
     )
     warm = WarmSession(
-        key=SessionKey(model_id=None, reasoning_effort=None),
+        key=SessionKey(model_id="gpt-5.4", reasoning_effort="high"),
         client=cast("Any", client),
         transport=None,
         session_id="session-1",
         created_at=0.0,
     )
 
-    events = [
-        event
-        async for event in runner.run(
-            _request(model="glm-5.2", reasoning_effort=None, warm_session=warm),
-        )
-    ]
+    with pytest.raises(RunnerError, match="cannot be repointed"):
+        _ = [
+            event
+            async for event in runner.run(
+                _request(model="kimi-k3", reasoning_effort="high", warm_session=warm),
+            )
+        ]
 
-    assert isinstance(events[-1], RunComplete)
-    assert client.rpc_requests[0][1] == {
-        "modelId": "glm-5.2",
-        "interactionMode": "auto",
-        "autonomyLevel": "off",
-    }
+    assert client.rpc_requests == []
+    assert client.closed is True
 
 
 @pytest.mark.asyncio
@@ -1417,11 +1414,15 @@ async def test_runner_keeps_other_sdk_failures_as_bridge_errors(tmp_path: Path) 
 def test_session_key_retuning_requires_an_expressible_target() -> None:
     default = SessionKey(model_id=None, reasoning_effort=None)
     explicit = SessionKey(model_id="gpt-5.4", reasoning_effort="high")
+    kimi = SessionKey(model_id="kimi-k3", reasoning_effort="high")
 
     assert explicit.can_retune_from(default) is True
-    assert SessionKey(model_id="glm-5.2", reasoning_effort=None).can_retune_from(default) is True
+    assert explicit.can_retune_from(SessionKey(model_id="gpt-5.4", reasoning_effort="low")) is True
+    assert SessionKey(model_id="gpt-5.4", reasoning_effort=None).can_retune_from(explicit) is False
     assert default.can_retune_from(explicit) is False
-    assert SessionKey(model_id="glm-5.2", reasoning_effort=None).can_retune_from(explicit) is False
+    assert SessionKey(model_id="glm-5.2", reasoning_effort="high").can_retune_from(explicit) is True
+    assert kimi.can_retune_from(explicit) is False
+    assert explicit.can_retune_from(kimi) is False
 
 
 @pytest.mark.asyncio
