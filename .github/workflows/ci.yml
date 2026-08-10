@@ -73,12 +73,25 @@ jobs:
       - name: Validate OpenAPI contract
         run: uv run openapi-spec-validator openapi.json
 
-      # Validating the committed file cannot catch a file that no longer
-      # matches the routes and schemas that produced it.
+      # Release Please rewrites JSON while updating info.version, so compare
+      # parsed documents instead of serializer-specific formatting.
       - name: Verify OpenAPI contract is regenerated
         run: |
+          export COMMITTED_OPENAPI="$RUNNER_TEMP/openapi-committed.json"
+          cp openapi.json "$COMMITTED_OPENAPI"
           uv run python scripts/generate_openapi.py
-          git diff --exit-code openapi.json
+          uv run python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          committed = json.loads(
+              Path(os.environ["COMMITTED_OPENAPI"]).read_text(encoding="utf-8")
+          )
+          generated = json.loads(Path("openapi.json").read_text(encoding="utf-8"))
+          if committed != generated:
+              raise SystemExit("Committed OpenAPI document differs from generated schema.")
+          PY
 
       - name: Validate PromptScript targets
         run: |
