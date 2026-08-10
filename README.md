@@ -283,7 +283,10 @@ argument key, or prose after a call still fails the turn. A payload truncated
 before its close marker ends with `finish_reason="length"`. A closed malformed
 call or a mangled OpenAI `tool_calls` fragment ends with `finish_reason="stop"`
 and a plain-text bridge notice. The malformed JSON and the call are dropped,
-never executed or returned to the client. When an earlier call in the same
+never executed or returned to the client. The notice names no tool-call
+format, because anything it named would itself be tool-call-shaped text in
+assistant content: recovery is the client's retry, not the model's next turn.
+When an earlier call in the same
 turn did complete, the turn keeps `finish_reason="tool_calls"` so the client
 runs the call it already received. Qwen3's XML form declares no argument
 types, so a scalar value stays the string the model wrote unless it wrote a
@@ -463,10 +466,15 @@ docker compose up -d
 
 The file must be readable by container user `uid 1000`. Keep it outside the
 repository when it contains custom-model credentials. Request model,
-reasoning effort, Auto interaction mode, autonomy Off, and disabled Droid
-tools are pinned by the bridge and override matching session defaults.
-Mounting this file does not mount other profile files such as
-`system-prompt.md`, skills, or hooks.
+reasoning effort, Auto interaction mode, autonomy Off, disabled Droid tools,
+and disabled MCP servers are pinned by the bridge and override matching
+session defaults. Mounting this file does not mount other profile files such
+as `system-prompt.md`, skills, or hooks.
+
+Everything else the file declares still applies to the Droid subprocess. The
+bridge pins the tool and autonomy surface, not every setting, so review the
+file before mounting it and prefer a reduced copy that carries only the
+custom-model entries the bridge needs.
 
 Never publish the bridge port to a non-loopback interface without a
 configured `FACTORY_DROID_OPENAI_API_KEY`. See
@@ -1351,9 +1359,11 @@ Warm sessions are keyed by the model and reasoning effort they were
 initialized with. An exact match serves a turn with no extra round trip.
 A compatible session can be repointed at another model or explicit reasoning
 effort, which takes 4-18 ms instead of a 2.4-3.2 s startup, and logs
-`pool.retune` plus `droid.session_retuned`. Kimi model switches always use a
-fresh or exact-match warm session so Kimi-specific protocol state cannot cross
-the boundary. Requests that ask for the model alias, or for the model's
+`pool.retune` plus `droid.session_retuned`. A retune only swaps the model id,
+so the tool-call template the session was initialized with survives it: model
+families that frame calls in their own special tokens always use a fresh or
+exact-match warm session instead. Kimi is the one such family today, matched
+by the same family table telemetry labels use. Requests that ask for the model alias, or for the model's
 default reasoning effort on a session that carries an explicit one, also log
 `pool.miss`. The pool tracks the settings recent traffic used, so repeat
 traffic converges on exact matches.
