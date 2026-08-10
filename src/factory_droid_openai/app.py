@@ -308,19 +308,23 @@ class SessionRegistry:
 
     def __init__(self, max_entries: int) -> None:
         self._max_entries = max_entries
-        self._sessions: OrderedDict[str, None] = OrderedDict()
+        self._sessions: OrderedDict[str, str] = OrderedDict()
 
-    def remember(self, session_id: str) -> None:
+    def remember(self, session_id: str, model: str) -> None:
         self._sessions.pop(session_id, None)
-        self._sessions[session_id] = None
+        self._sessions[session_id] = model
         while len(self._sessions) > self._max_entries:
             self._sessions.popitem(last=False)
 
-    def knows(self, session_id: str) -> bool:
-        if session_id not in self._sessions:
-            return False
+    def model(self, session_id: str) -> str | None:
+        model = self._sessions.get(session_id)
+        if model is None:
+            return None
         self._sessions.move_to_end(session_id)
-        return True
+        return model
+
+    def knows(self, session_id: str) -> bool:
+        return self.model(session_id) is not None
 
     def forget(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)
@@ -871,20 +875,22 @@ def create_app(
                 ttl_seconds=resolved_settings.model_quarantine_seconds,
             )
 
-    def require_known_session(session_id: str) -> None:
+    def require_known_session(session_id: str) -> str:
         if not resolved_settings.session_continuity:
             raise BridgeHTTPError(
                 "Session continuity is disabled on this bridge.",
                 status_code=400,
                 error_type="invalid_request_error",
             )
-        if not sessions.knows(session_id):
+        model = sessions.model(session_id)
+        if model is None:
             raise BridgeHTTPError(
                 "Unknown Factory Droid session. Only sessions created by this "
                 "bridge process can be managed.",
                 status_code=404,
                 error_type="session_not_found",
             )
+        return model
 
     @application.get(
         "/health",
@@ -1027,7 +1033,7 @@ def create_app(
         session_id: str,
         payload: CompactSessionRequest,
     ) -> CompactSessionResponse:
-        require_known_session(session_id)
+        model = require_known_session(session_id)
         result = await run_factory_operation(
             lambda runner, remaining: runner.compact_session(
                 session_id,
@@ -1035,7 +1041,7 @@ def create_app(
                 timeout_seconds=remaining,
             )
         )
-        sessions.remember(result.new_session_id)
+        sessions.remember(result.new_session_id, model)
         return CompactSessionResponse(
             session_id=result.new_session_id,
             removed_count=result.removed_count,
@@ -1050,14 +1056,14 @@ def create_app(
         summary="Fork a Factory Droid session",
     )
     async def fork_session(session_id: str) -> ForkSessionResponse:
-        require_known_session(session_id)
+        model = require_known_session(session_id)
         new_session_id = await run_factory_operation(
             lambda runner, remaining: runner.fork_session(
                 session_id,
                 timeout_seconds=remaining,
             )
         )
-        sessions.remember(new_session_id)
+        sessions.remember(new_session_id, model)
         return ForkSessionResponse(session_id=new_session_id)
 
     @application.patch(
@@ -1153,13 +1159,23 @@ def create_app(
                     400,
                     "invalid_request_error",
                 )
-            if not sessions.knows(payload.factory_droid_session_id):
+            session_model = sessions.model(payload.factory_droid_session_id)
+            if session_model is None:
                 request.state.telemetry_error_type = "session_not_found"
                 return _error_response(
                     "Unknown Factory Droid session. Only sessions created by this "
                     "bridge process can be continued.",
                     404,
                     "session_not_found",
+                )
+            if session_model != payload.model:
+                request.state.telemetry_error_type = "invalid_request_error"
+                return _error_response(
+                    f"Factory Droid session uses model '{session_model}', but the "
+                    f"request selected '{payload.model}'. Start a new session to "
+                    "switch models.",
+                    400,
+                    "invalid_request_error",
                 )
             session_id = payload.factory_droid_session_id
 
@@ -1319,7 +1335,10 @@ def create_app(
                 include_usage=bool(payload.stream_options and payload.stream_options.include_usage),
                 stop_sequences=payload.stop_sequences,
                 emit_status=payload.factory_droid_status,
-                session_callback=sessions.remember,
+                session_callback=lambda started_id: sessions.remember(
+                    started_id,
+                    payload.model,
+                ),
                 expose_session=resolved_settings.session_continuity,
                 structured=structured,
                 failure_callback=note_runner_failure,
@@ -1381,7 +1400,7 @@ def create_app(
                     elif result.malformed_note is not None:
                         request.state.stream_outcome = "malformed"
                     if result.session_id is not None:
-                        sessions.remember(result.session_id)
+                        sessions.remember(result.session_id, payload.model)
                         started_session = result.session_id
                     if structured is not None:
                         _validate_structured_output(result.text, structured)

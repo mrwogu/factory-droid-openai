@@ -84,6 +84,12 @@ to the next model in both transport modes. Use
 `--switch-settle-seconds SECONDS` when the bridge needs a different refill
 window. Switch rows include `source_model` and prime-request diagnostics.
 
+To verify explicit session continuity as well, start the bridge with
+`FACTORY_DROID_OPENAI_SESSION_CONTINUITY=true` and add
+`--test-session-continuity` to the matrix command. That phase creates a session
+with one model and confirms that continuing its ID with the next model is
+rejected instead of silently running under mismatched settings.
+
 ```bash
 uv run python scripts/e2e_matrix.py report traces/run-a.jsonl
 uv run python scripts/e2e_matrix.py compare traces/run-a.jsonl traces/run-b.jsonl

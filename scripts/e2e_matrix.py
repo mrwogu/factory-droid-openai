@@ -344,6 +344,18 @@ def switch_scenarios(*, streaming: bool = True) -> list[Scenario]:
     return [scenario, replace(scenario, stream=True)] if streaming else [scenario]
 
 
+def continuation_switch_scenarios(*, streaming: bool = True) -> list[Scenario]:
+    """Rejected model changes on an explicit session continuation."""
+    scenario = Scenario(
+        name="session_model_switch",
+        body={"messages": [{"role": "user", "content": "Reply with exactly: CONTINUED"}]},
+        expect_status=(400,),
+        expect_finish=(),
+        expect_content=False,
+    )
+    return [scenario, replace(scenario, stream=True)] if streaming else [scenario]
+
+
 @dataclass(frozen=True, slots=True)
 class Observation:
     """What one request produced, before it is judged."""
@@ -356,6 +368,7 @@ class Observation:
     tool_calls: int = 0
     content_chars: int = 0
     request_id: str | None = None
+    session_id: str | None = None
     duration_ms: float = 0.0
     ttft_ms: float | None = None
     stream_done: bool = False
@@ -507,6 +520,7 @@ def _completion_observation(
     content = message.get("content") or ""
     error_type, error_message = _error_fields(body)
     semantic_error = _content_semantic_error(content) if isinstance(content, str) else None
+    session_id = body.get("factory_droid_session_id")
     return Observation(
         status=status,
         error_type=error_type,
@@ -516,6 +530,7 @@ def _completion_observation(
         tool_calls=len(tool_calls) if isinstance(tool_calls, list) else 0,
         content_chars=len(content) if isinstance(content, str) else 0,
         request_id=headers.get("x-request-id"),
+        session_id=session_id if isinstance(session_id, str) else None,
         duration_ms=duration_ms,
     )
 
@@ -535,6 +550,7 @@ def _stream_observation(
     error_message = ""
     stream_done = False
     ttft_ms: float | None = None
+    session_id: str | None = None
     for elapsed_ms, raw in events:
         if raw == "[DONE]":
             stream_done = True
@@ -554,6 +570,9 @@ def _stream_observation(
         error_message = error_message or chunk_error_message
         for choice in chunk.get("choices") or []:
             delta = choice.get("delta") or {}
+            announced_session = delta.get("factory_droid_session_id")
+            if isinstance(announced_session, str):
+                session_id = announced_session
             text = delta.get("content") or ""
             if text:
                 content_chars += len(text)
@@ -573,6 +592,7 @@ def _stream_observation(
         tool_calls=tool_calls,
         content_chars=content_chars,
         request_id=headers.get("x-request-id"),
+        session_id=session_id,
         duration_ms=duration_ms,
         ttft_ms=ttft_ms,
         stream_done=stream_done,
@@ -701,11 +721,32 @@ def row(model: str, scenario: Scenario, observation: Observation) -> dict[str, A
         "tool_calls": observation.tool_calls,
         "content_chars": observation.content_chars,
         "request_id": observation.request_id,
+        "session_id": observation.session_id,
         "duration_ms": round(observation.duration_ms, 1),
         "ttft_ms": None if observation.ttft_ms is None else round(observation.ttft_ms, 1),
         "verdict": verdict,
         "detail": detail,
     }
+
+
+def _transition_row(
+    source: str,
+    target: str,
+    scenario: Scenario,
+    observation: Observation,
+    prime: Observation,
+) -> dict[str, Any]:
+    record = row(target, scenario, observation)
+    prime_verdict, prime_detail = classify(_SWITCH_PRIME, prime)
+    record.update(
+        {
+            "source_model": source,
+            "prime_status": prime.status,
+            "prime_verdict": prime_verdict,
+            "prime_detail": prime_detail,
+        }
+    )
+    return record
 
 
 async def run_matrix(
@@ -756,16 +797,43 @@ async def run_switch_matrix(
             prime = await bridge.run(source, _SWITCH_PRIME)
             await asyncio.sleep(max(0.0, settle_seconds))
             observation = await bridge.run(target, scenario)
-            record = row(target, scenario, observation)
-            prime_verdict, prime_detail = classify(_SWITCH_PRIME, prime)
-            record.update(
-                {
-                    "source_model": source,
-                    "prime_status": prime.status,
-                    "prime_verdict": prime_verdict,
-                    "prime_detail": prime_detail,
-                }
-            )
+            record = _transition_row(source, target, scenario, observation, prime)
+            rows.append(record)
+            if on_row is not None:
+                on_row(record)
+    return rows
+
+
+async def run_continuation_switch_matrix(
+    bridge: Bridge,
+    models: list[str],
+    plan: list[Scenario],
+    *,
+    on_row: Any = None,
+) -> list[dict[str, Any]]:
+    """Attempt model changes on bridge-created continuation sessions."""
+    if len(models) < 2:
+        return []
+    rows: list[dict[str, Any]] = []
+    targets = models[1:] + models[:1]
+    for source, target in zip(models, targets, strict=True):
+        for scenario in plan:
+            prime = await bridge.run(source, _SWITCH_PRIME)
+            if prime.session_id is None:
+                observation = Observation(
+                    status=0,
+                    transport_error="session continuity returned no session id",
+                )
+            else:
+                continued = replace(
+                    scenario,
+                    body={
+                        **scenario.body,
+                        "factory_droid_session_id": prime.session_id,
+                    },
+                )
+                observation = await bridge.run(target, continued)
+            record = _transition_row(source, target, scenario, observation, prime)
             rows.append(record)
             if on_row is not None:
                 on_row(record)
@@ -923,6 +991,7 @@ class RunOptions:
     concurrency: int = 2
     streaming: bool = True
     switch_settle_seconds: float = 5.0
+    test_session_continuity: bool = False
     out: Path | None = None
 
 
@@ -934,9 +1003,15 @@ async def _run(options: RunOptions) -> int:
         models = options.models or await bridge.models()
         plan = scenarios(streaming=options.streaming)
         switch_plan = switch_scenarios(streaming=options.streaming)
+        continuation_plan = (
+            continuation_switch_scenarios(streaming=options.streaming)
+            if options.test_session_continuity
+            else []
+        )
         print(
             f"{len(models)} models x {len(plan)} scenarios + "
-            f"{len(switch_plan)} switch scenarios -> {out}",
+            f"{len(switch_plan)} warm switches + "
+            f"{len(continuation_plan)} continuation switches -> {out}",
             file=sys.stderr,
         )
         with out.open("a", encoding="utf-8") as handle:
@@ -961,6 +1036,14 @@ async def _run(options: RunOptions) -> int:
                     on_row=write,
                 )
             )
+            rows.extend(
+                await run_continuation_switch_matrix(
+                    bridge,
+                    models,
+                    continuation_plan,
+                    on_row=write,
+                )
+            )
     print(render_report(rows))
     return 1 if summarize(rows)["blocking"] else 0
 
@@ -975,6 +1058,7 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--concurrency", type=int, default=2)
     run_parser.add_argument("--no-stream", action="store_true")
     run_parser.add_argument("--switch-settle-seconds", type=float, default=5.0)
+    run_parser.add_argument("--test-session-continuity", action="store_true")
     run_parser.add_argument("--out", type=Path, default=None)
 
     report_parser = sub.add_parser("report", help="render a markdown report from a JSONL run")
@@ -999,6 +1083,7 @@ def main(argv: list[str] | None = None) -> int:
         concurrency=args.concurrency,
         streaming=not args.no_stream,
         switch_settle_seconds=args.switch_settle_seconds,
+        test_session_continuity=args.test_session_continuity,
         out=args.out,
     )
     return asyncio.run(_run(options))
