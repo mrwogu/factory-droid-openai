@@ -886,6 +886,31 @@ def test_stream_parser_stops_mangled_openai_tool_calls_before_they_leak(
         assert "".join(item.text for item in emissions if isinstance(item, TextEmission)) == prefix
 
 
+@pytest.mark.parametrize(
+    "mangled",
+    [
+        '"tool_calls":"call_1"',
+        '"tool_calls": "id" : "call_1"',
+        '"TOOL_CALLS":"ID":"CALL_1"',
+        '"Tool Calls":"call_1"',
+    ],
+)
+def test_stream_parser_stops_mangled_tool_calls_without_an_id_or_lower_case(
+    mangled: str,
+) -> None:
+    prefix = "safe answer "
+    value = f'{prefix}{mangled},"function":("name":"weather")'
+
+    for split in range(1, len(value)):
+        parser = ToolCallStreamParser(frozenset({"weather"}))
+        emissions: list[object] = []
+
+        with pytest.raises(MalformedToolCallError, match="echoed an OpenAI transcript"):
+            _feed_parser_to_finish(parser, emissions, value[:split], value[split:])
+
+        assert "".join(item.text for item in emissions if isinstance(item, TextEmission)) == prefix
+
+
 def test_stream_parser_preserves_tool_calls_phrase_without_json_separator() -> None:
     parser = ToolCallStreamParser(frozenset({"weather"}))
     text = 'The label "tool calls": remains ordinary prose.'
