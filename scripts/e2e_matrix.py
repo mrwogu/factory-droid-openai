@@ -19,10 +19,11 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import statistics
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -56,6 +57,10 @@ _CLOCK_TOOL: dict[str, Any] = {
         },
     },
 }
+_MANGLED_TOOL_CALL_OUTPUT = re.compile(
+    r'"tool(?:_|\s+)calls"\s*:\s*(?:"id"\s*:\s*)?"call_',
+    re.IGNORECASE,
+)
 
 # Verdicts that do not indicate a bridge defect still fail a scenario; only
 # BLOCKING ones mean the bridge itself has to change.
@@ -92,6 +97,12 @@ class Scenario:
     expect_tool_call: bool = False
     expect_content: bool = True
     timeout_seconds: float = 120.0
+
+
+_SWITCH_PRIME = Scenario(
+    name="model_switch_prime",
+    body={"messages": [{"role": "user", "content": "Reply with exactly: READY"}]},
+)
 
 
 def _baseline_scenarios() -> list[Scenario]:
@@ -312,6 +323,27 @@ def scenarios(*, streaming: bool = True) -> list[Scenario]:
     return built
 
 
+def switch_scenarios(*, streaming: bool = True) -> list[Scenario]:
+    """Tool-call contracts run after a model transition."""
+    scenario = Scenario(
+        name="model_switch_tool_required",
+        body={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "What is the weather in Gdansk? Use the tool.",
+                }
+            ],
+            "tools": [_WEATHER_TOOL],
+            "tool_choice": "required",
+        },
+        expect_finish=("tool_calls",),
+        expect_tool_call=True,
+        expect_content=False,
+    )
+    return [scenario, replace(scenario, stream=True)] if streaming else [scenario]
+
+
 @dataclass(frozen=True, slots=True)
 class Observation:
     """What one request produced, before it is judged."""
@@ -342,6 +374,8 @@ _TRAILING_TOOL_TEXT = "unexpected text after tool call"
 def _content_semantic_error(content: str) -> str | None:
     """Reject serialized OpenAI transcript objects returned as final text."""
     stripped = strip_code_fence(content.strip())
+    if _MANGLED_TOOL_CALL_OUTPUT.search(stripped):
+        return "assistant exposed malformed OpenAI tool-call output"
     try:
         payload = json.loads(stripped)
     except ValueError:
@@ -704,6 +738,40 @@ async def run_matrix(
     return rows
 
 
+async def run_switch_matrix(
+    bridge: Bridge,
+    models: list[str],
+    plan: list[Scenario],
+    *,
+    settle_seconds: float,
+    on_row: Any = None,
+) -> list[dict[str, Any]]:
+    """Run ordered model transitions against one bridge warm pool."""
+    if len(models) < 2:
+        return []
+    rows: list[dict[str, Any]] = []
+    targets = models[1:] + models[:1]
+    for source, target in zip(models, targets, strict=True):
+        for scenario in plan:
+            prime = await bridge.run(source, _SWITCH_PRIME)
+            await asyncio.sleep(max(0.0, settle_seconds))
+            observation = await bridge.run(target, scenario)
+            record = row(target, scenario, observation)
+            prime_verdict, prime_detail = classify(_SWITCH_PRIME, prime)
+            record.update(
+                {
+                    "source_model": source,
+                    "prime_status": prime.status,
+                    "prime_verdict": prime_verdict,
+                    "prime_detail": prime_detail,
+                }
+            )
+            rows.append(record)
+            if on_row is not None:
+                on_row(record)
+    return rows
+
+
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Aggregate verdicts, blocking failures and latency for a run."""
     counts = dict.fromkeys(VERDICTS, 0)
@@ -783,8 +851,13 @@ def _group_by(rows: list[dict[str, Any]], key: str) -> dict[str, list[dict[str, 
     return grouped
 
 
-def _key(record: dict[str, Any]) -> tuple[str, str, bool]:
-    return (str(record["model"]), str(record["scenario"]), bool(record["stream"]))
+def _key(record: dict[str, Any]) -> tuple[str, str, str, bool]:
+    return (
+        str(record.get("source_model") or ""),
+        str(record["model"]),
+        str(record["scenario"]),
+        bool(record["stream"]),
+    )
 
 
 def compare(before: list[dict[str, Any]], after: list[dict[str, Any]]) -> dict[str, Any]:
@@ -849,6 +922,7 @@ class RunOptions:
     models: list[str] = field(default_factory=list)
     concurrency: int = 2
     streaming: bool = True
+    switch_settle_seconds: float = 5.0
     out: Path | None = None
 
 
@@ -859,7 +933,12 @@ async def _run(options: RunOptions) -> int:
         bridge = Bridge(base_url=options.base_url, api_key=options.api_key, client=client)
         models = options.models or await bridge.models()
         plan = scenarios(streaming=options.streaming)
-        print(f"{len(models)} models x {len(plan)} scenarios -> {out}", file=sys.stderr)
+        switch_plan = switch_scenarios(streaming=options.streaming)
+        print(
+            f"{len(models)} models x {len(plan)} scenarios + "
+            f"{len(switch_plan)} switch scenarios -> {out}",
+            file=sys.stderr,
+        )
         with out.open("a", encoding="utf-8") as handle:
 
             def write(record: dict[str, Any]) -> None:
@@ -872,6 +951,15 @@ async def _run(options: RunOptions) -> int:
                 plan,
                 concurrency=options.concurrency,
                 on_row=write,
+            )
+            rows.extend(
+                await run_switch_matrix(
+                    bridge,
+                    models,
+                    switch_plan,
+                    settle_seconds=options.switch_settle_seconds,
+                    on_row=write,
+                )
             )
     print(render_report(rows))
     return 1 if summarize(rows)["blocking"] else 0
@@ -886,6 +974,7 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--models", default="", help="comma separated; default is discovery")
     run_parser.add_argument("--concurrency", type=int, default=2)
     run_parser.add_argument("--no-stream", action="store_true")
+    run_parser.add_argument("--switch-settle-seconds", type=float, default=5.0)
     run_parser.add_argument("--out", type=Path, default=None)
 
     report_parser = sub.add_parser("report", help="render a markdown report from a JSONL run")
@@ -909,6 +998,7 @@ def main(argv: list[str] | None = None) -> int:
         models=[value for value in args.models.split(",") if value],
         concurrency=args.concurrency,
         streaming=not args.no_stream,
+        switch_settle_seconds=args.switch_settle_seconds,
         out=args.out,
     )
     return asyncio.run(_run(options))
