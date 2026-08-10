@@ -23,6 +23,7 @@ import re
 import statistics
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -33,6 +34,7 @@ import httpx
 from factory_droid_openai.dialects import strip_code_fence
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8787"
+RowCallback = Callable[[dict[str, Any]], None] | None
 _WEATHER_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
@@ -755,7 +757,7 @@ def _model_ring(models: list[str]) -> tuple[tuple[str, str], ...]:
 def _record(
     rows: list[dict[str, Any]],
     record: dict[str, Any],
-    on_row: Any,
+    on_row: RowCallback,
 ) -> None:
     rows.append(record)
     if on_row is not None:
@@ -768,7 +770,7 @@ async def run_matrix(
     plan: list[Scenario],
     *,
     concurrency: int,
-    on_row: Any = None,
+    on_row: RowCallback = None,
 ) -> list[dict[str, Any]]:
     """Run every applicable (model, scenario) pair and return the rows."""
     jobs: list[tuple[str, Scenario]] = []
@@ -796,7 +798,7 @@ async def run_switch_matrix(
     plan: list[Scenario],
     *,
     settle_seconds: float,
-    on_row: Any = None,
+    on_row: RowCallback = None,
 ) -> list[dict[str, Any]]:
     """Run ordered model transitions against one bridge warm pool."""
     rows: list[dict[str, Any]] = []
@@ -815,10 +817,13 @@ async def run_continuation_switch_matrix(
     models: list[str],
     plan: list[Scenario],
     *,
-    on_row: Any = None,
+    on_row: RowCallback = None,
 ) -> list[dict[str, Any]]:
     """Attempt model changes on bridge-created continuation sessions."""
     rows: list[dict[str, Any]] = []
+    if not plan:
+        # The phase is opt-in, so an empty plan must not prime a single model.
+        return rows
     for source, target in _model_ring(models):
         prime = await bridge.run(source, _SWITCH_PRIME)
         for scenario in plan:

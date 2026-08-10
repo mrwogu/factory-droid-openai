@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Any
 import httpx
 import pytest
 
+from factory_droid_openai.protocol import _MANGLED_TOOL_CALLS_PATTERN
+
 if TYPE_CHECKING:
     from types import ModuleType
 
@@ -795,6 +797,38 @@ async def test_continuation_switch_matrix_reports_missing_session_ids(
     assert len(rows) == 2
     assert all(row["verdict"] == e2e.BRIDGE_DEFECT for row in rows)
     assert all("no session id" in row["detail"] for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_continuation_switch_matrix_skips_an_opted_out_plan(e2e: ModuleType) -> None:
+    """An empty plan is the default, so it must not prime a single model."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content)["model"])
+        return httpx.Response(200, json={"choices": []})
+
+    bridge = _bridge(e2e, handler)
+    async with bridge.client:
+        rows = await e2e.run_continuation_switch_matrix(bridge, ["m1", "m2", "m3"], [])
+
+    assert rows == []
+    assert seen == []
+
+
+@pytest.mark.parametrize(
+    "mangled",
+    [
+        '"tool_calls":"id":"call_1"',
+        '"tool_calls":"call_1"',
+        '"tool calls": "id" : "call_1"',
+        '"TOOL_CALLS":"ID":"CALL_1"',
+    ],
+)
+def test_mangled_detector_agrees_with_the_bridge_parser(e2e: ModuleType, mangled: str) -> None:
+    """A shape the harness reports must be one the bridge can actually contain."""
+    assert e2e._MANGLED_TOOL_CALL_OUTPUT.search(mangled) is not None
+    assert _MANGLED_TOOL_CALLS_PATTERN.search(mangled) is not None
 
 
 def _rows(e2e: ModuleType) -> list[dict[str, Any]]:
