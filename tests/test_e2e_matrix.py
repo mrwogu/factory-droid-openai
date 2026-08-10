@@ -136,12 +136,59 @@ def test_transcript_reproduction_is_a_bridge_defect(e2e: ModuleType) -> None:
 
 
 def test_expected_rejection_is_a_pass(e2e: ModuleType) -> None:
-    scenario = _scenario(e2e, expect_status=(400,))
+    scenario = _scenario(
+        e2e,
+        expect_status=(400,),
+        expect_error_type="invalid_request_error",
+        expect_error_contains="settings do not match",
+    )
 
-    verdict, detail = e2e.classify(scenario, _observation(e2e, status=400, finish_reason=None))
+    verdict, detail = e2e.classify(
+        scenario,
+        _observation(
+            e2e,
+            status=400,
+            error_type="invalid_request_error",
+            error_message="session settings do not match",
+            finish_reason=None,
+        ),
+    )
 
     assert verdict == e2e.SUCCESS
     assert "expected" in detail
+
+
+@pytest.mark.parametrize(
+    ("overrides", "detail"),
+    [
+        ({"error_type": "other"}, "error type"),
+        ({"error_message": "other"}, "message marker"),
+    ],
+)
+def test_expected_rejection_checks_error_contract(
+    e2e: ModuleType,
+    overrides: dict[str, str],
+    detail: str,
+) -> None:
+    scenario = _scenario(
+        e2e,
+        expect_status=(400,),
+        expect_error_type="invalid_request_error",
+        expect_error_contains="settings do not match",
+    )
+    fields: dict[str, Any] = {
+        "status": 400,
+        "error_type": "invalid_request_error",
+        "error_message": "session settings do not match",
+        "finish_reason": None,
+    }
+    fields.update(overrides)
+    observation = _observation(e2e, **fields)
+
+    verdict, reason = e2e.classify(scenario, observation)
+
+    assert verdict == e2e.BRIDGE_DEFECT
+    assert detail in reason
 
 
 @pytest.mark.parametrize(
@@ -636,6 +683,25 @@ async def test_switch_matrix_skips_one_model_and_supports_no_callback(e2e: Modul
     assert len(rows) == 2
 
 
+def test_transition_row_propagates_a_failed_prime(e2e: ModuleType) -> None:
+    record = e2e._transition_row(
+        "source",
+        "target",
+        _scenario(e2e),
+        _observation(e2e),
+        _observation(
+            e2e,
+            status=404,
+            error_type="model_not_found",
+            finish_reason=None,
+        ),
+    )
+
+    assert record["verdict"] == e2e.ACCOUNT_POLICY
+    assert record["prime_verdict"] == e2e.ACCOUNT_POLICY
+    assert "prime failed" in record["detail"]
+
+
 @pytest.mark.asyncio
 async def test_continuation_switch_matrix_rejects_a_model_ring(e2e: ModuleType) -> None:
     seen: list[tuple[str, str | None]] = []
@@ -651,7 +717,7 @@ async def test_continuation_switch_matrix_rejects_a_model_ring(e2e: ModuleType) 
                 json={
                     "error": {
                         "type": "invalid_request_error",
-                        "message": "start a new session",
+                        "message": "session settings do not match",
                     }
                 },
             )
@@ -670,7 +736,7 @@ async def test_continuation_switch_matrix_rejects_a_model_ring(e2e: ModuleType) 
 
     written: list[dict[str, Any]] = []
     bridge = _bridge(e2e, handler)
-    plan = e2e.continuation_switch_scenarios(streaming=False)
+    plan = e2e.continuation_switch_scenarios()
     async with bridge.client:
         rows = await e2e.run_continuation_switch_matrix(
             bridge,
@@ -682,7 +748,9 @@ async def test_continuation_switch_matrix_rejects_a_model_ring(e2e: ModuleType) 
     assert seen == [
         ("m1", None),
         ("m2", "session-m1"),
+        ("m2", "session-m1"),
         ("m2", None),
+        ("m1", "session-m2"),
         ("m1", "session-m2"),
     ]
     assert all(row["verdict"] == e2e.SUCCESS for row in rows)

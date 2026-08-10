@@ -96,6 +96,8 @@ class Scenario:
     expect_finish: tuple[str, ...] = ("stop",)
     expect_tool_call: bool = False
     expect_content: bool = True
+    expect_error_type: str | None = None
+    expect_error_contains: str | None = None
     timeout_seconds: float = 120.0
 
 
@@ -103,6 +105,25 @@ _SWITCH_PRIME = Scenario(
     name="model_switch_prime",
     body={"messages": [{"role": "user", "content": "Reply with exactly: READY"}]},
 )
+
+
+def _required_weather_scenario(name: str) -> Scenario:
+    return Scenario(
+        name=name,
+        body={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "What is the weather in Gdansk? Use the tool.",
+                }
+            ],
+            "tools": [_WEATHER_TOOL],
+            "tool_choice": "required",
+        },
+        expect_finish=("tool_calls",),
+        expect_tool_call=True,
+        expect_content=False,
+    )
 
 
 def _baseline_scenarios() -> list[Scenario]:
@@ -152,17 +173,7 @@ def _tool_scenarios() -> list[Scenario]:
             expect_tool_call=True,
             expect_content=False,
         ),
-        Scenario(
-            name="tool_required",
-            body={
-                "messages": [{"role": "user", "content": prompt}],
-                "tools": [_WEATHER_TOOL],
-                "tool_choice": "required",
-            },
-            expect_finish=("tool_calls",),
-            expect_tool_call=True,
-            expect_content=False,
-        ),
+        _required_weather_scenario("tool_required"),
         Scenario(
             name="tool_parallel",
             body={
@@ -306,41 +317,14 @@ def scenarios(*, streaming: bool = True) -> list[Scenario]:
     for scenario in base:
         built.append(scenario)
         if streaming:
-            built.append(
-                Scenario(
-                    name=scenario.name,
-                    body=scenario.body,
-                    stream=True,
-                    per_model=scenario.per_model,
-                    expect_status=scenario.expect_status,
-                    expect_finish=scenario.expect_finish,
-                    expect_tool_call=scenario.expect_tool_call,
-                    expect_content=scenario.expect_content,
-                    timeout_seconds=scenario.timeout_seconds,
-                )
-            )
+            built.append(replace(scenario, stream=True))
     built.extend(_hostile_scenarios())
     return built
 
 
 def switch_scenarios(*, streaming: bool = True) -> list[Scenario]:
     """Tool-call contracts run after a model transition."""
-    scenario = Scenario(
-        name="model_switch_tool_required",
-        body={
-            "messages": [
-                {
-                    "role": "user",
-                    "content": "What is the weather in Gdansk? Use the tool.",
-                }
-            ],
-            "tools": [_WEATHER_TOOL],
-            "tool_choice": "required",
-        },
-        expect_finish=("tool_calls",),
-        expect_tool_call=True,
-        expect_content=False,
-    )
+    scenario = _required_weather_scenario("model_switch_tool_required")
     return [scenario, replace(scenario, stream=True)] if streaming else [scenario]
 
 
@@ -352,6 +336,8 @@ def continuation_switch_scenarios(*, streaming: bool = True) -> list[Scenario]:
         expect_status=(400,),
         expect_finish=(),
         expect_content=False,
+        expect_error_type="invalid_request_error",
+        expect_error_contains="session settings do not match",
     )
     return [scenario, replace(scenario, stream=True)] if streaming else [scenario]
 
@@ -445,6 +431,13 @@ def classify(scenario: Scenario, observation: Observation) -> tuple[str, str]:
             f"unexpected status {observation.status} ({error_type})",
         )
     if observation.status != 200:
+        if scenario.expect_error_type is not None and error_type != scenario.expect_error_type:
+            return BRIDGE_DEFECT, f"unexpected error type {error_type}"
+        if (
+            scenario.expect_error_contains is not None
+            and scenario.expect_error_contains not in observation.error_message
+        ):
+            return BRIDGE_DEFECT, "expected error message marker is missing"
         return SUCCESS, f"rejected with {observation.status} as expected"
     if scenario.stream and not observation.stream_done:
         return BRIDGE_DEFECT, "stream ended without [DONE]"
@@ -746,7 +739,27 @@ def _transition_row(
             "prime_detail": prime_detail,
         }
     )
+    if prime_verdict != SUCCESS:
+        record["verdict"] = prime_verdict
+        record["detail"] = f"source-model prime failed: {prime_detail}"
     return record
+
+
+def _model_ring(models: list[str]) -> tuple[tuple[str, str], ...]:
+    if len(models) < 2:
+        return ()
+    targets = models[1:] + models[:1]
+    return tuple(zip(models, targets, strict=True))
+
+
+def _record(
+    rows: list[dict[str, Any]],
+    record: dict[str, Any],
+    on_row: Any,
+) -> None:
+    rows.append(record)
+    if on_row is not None:
+        on_row(record)
 
 
 async def run_matrix(
@@ -771,9 +784,7 @@ async def run_matrix(
         async with semaphore:
             observation = await bridge.run(model, scenario)
         record = row(model, scenario, observation)
-        rows.append(record)
-        if on_row is not None:
-            on_row(record)
+        _record(rows, record, on_row)
 
     await asyncio.gather(*(execute(model, scenario) for model, scenario in jobs))
     return rows
@@ -788,19 +799,14 @@ async def run_switch_matrix(
     on_row: Any = None,
 ) -> list[dict[str, Any]]:
     """Run ordered model transitions against one bridge warm pool."""
-    if len(models) < 2:
-        return []
     rows: list[dict[str, Any]] = []
-    targets = models[1:] + models[:1]
-    for source, target in zip(models, targets, strict=True):
+    for source, target in _model_ring(models):
         for scenario in plan:
             prime = await bridge.run(source, _SWITCH_PRIME)
             await asyncio.sleep(max(0.0, settle_seconds))
             observation = await bridge.run(target, scenario)
             record = _transition_row(source, target, scenario, observation, prime)
-            rows.append(record)
-            if on_row is not None:
-                on_row(record)
+            _record(rows, record, on_row)
     return rows
 
 
@@ -812,13 +818,10 @@ async def run_continuation_switch_matrix(
     on_row: Any = None,
 ) -> list[dict[str, Any]]:
     """Attempt model changes on bridge-created continuation sessions."""
-    if len(models) < 2:
-        return []
     rows: list[dict[str, Any]] = []
-    targets = models[1:] + models[:1]
-    for source, target in zip(models, targets, strict=True):
+    for source, target in _model_ring(models):
+        prime = await bridge.run(source, _SWITCH_PRIME)
         for scenario in plan:
-            prime = await bridge.run(source, _SWITCH_PRIME)
             if prime.session_id is None:
                 observation = Observation(
                     status=0,
@@ -834,9 +837,7 @@ async def run_continuation_switch_matrix(
                 )
                 observation = await bridge.run(target, continued)
             record = _transition_row(source, target, scenario, observation, prime)
-            rows.append(record)
-            if on_row is not None:
-                on_row(record)
+            _record(rows, record, on_row)
     return rows
 
 
