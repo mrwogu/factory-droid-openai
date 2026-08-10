@@ -25,7 +25,6 @@ from factory_droid_openai.app import (
     _finalize_stream,
     _JsonDepthTracker,
     _latency_bucket,
-    _model_family,
     _payload_size_bucket,
     _request_mode,
     _request_outcome,
@@ -2142,20 +2141,6 @@ def test_request_telemetry_classifies_routes_and_modes() -> None:
     assert (
         _request_mode(cast("Any", {"state": {"telemetry_mode": "unexpected"}})) == "not_applicable"
     )
-
-
-@pytest.mark.parametrize(
-    ("model", "expected"),
-    [
-        ("factory-droid", "factory_default"),
-        ("gpt-5.4", "gpt"),
-        ("gemini-3.1-pro", "gemini"),
-        ("claude-sonnet", "claude"),
-        ("custom-model", "other"),
-    ],
-)
-def test_model_family_is_coarse_and_stable(model: str, expected: str) -> None:
-    assert _model_family(model) == expected
 
 
 @pytest.mark.parametrize(

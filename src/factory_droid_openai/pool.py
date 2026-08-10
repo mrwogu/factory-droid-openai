@@ -82,9 +82,9 @@ class WarmSessionPool:
     Sessions are keyed by the settings they were initialized with. An exact
     key match serves a turn with no extra round trip; otherwise a compatible
     session may be repointed at another model or explicit reasoning effort.
-    Kimi model switches wait for a fresh session so its protocol state cannot
-    cross the boundary. A session serves at most one turn, which keeps the
-    bridge stateless.
+    Model families whose tool-call template survives a retune wait for a fresh
+    session instead, so that template cannot cross the boundary. A session
+    serves at most one turn, which keeps the bridge stateless.
     """
 
     def __init__(

@@ -76,6 +76,7 @@ from factory_droid_openai.runner import (
     Usage,
     UsageUpdate,
     WarmSession,
+    model_family,
     normalize_reasoning_effort,
 )
 from factory_droid_openai.strictjson import (
@@ -110,15 +111,6 @@ _PAYLOAD_SIZE_BUCKETS = (
     (102_400, "10kb_100kb"),
     (1_048_576, "100kb_1mb"),
 )
-_MODEL_FAMILY_PREFIXES = (
-    (("gpt-", "o1", "o3", "o4"), "gpt"),
-    (("gemini",), "gemini"),
-    (("claude",), "claude"),
-    (("qwen",), "qwen"),
-    (("kimi",), "kimi"),
-    (("deepseek",), "deepseek"),
-)
-
 CHAT_COMPLETION_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {
         "model": ChatCompletionResponse,
@@ -1119,7 +1111,7 @@ def create_app(
         # Requests rejected before the handler (validation, auth, request size)
         # never reach this line, so they stay reported as "not_applicable".
         request.state.telemetry_mode = "stream" if payload.stream else "non_stream"
-        request.state.telemetry_model_family = _model_family(payload.model)
+        request.state.telemetry_model_family = model_family(payload.model)
         timeout_seconds = min(
             payload.timeout or resolved_settings.timeout_seconds,
             resolved_settings.timeout_seconds,
@@ -2443,16 +2435,6 @@ def _latency_bucket(seconds: float) -> str:
         if seconds < upper:
             return bucket
     return "gt_30s"
-
-
-def _model_family(model: str) -> str:
-    normalized = model.strip().lower()
-    if normalized == "factory-droid":
-        return "factory_default"
-    for prefixes, family in _MODEL_FAMILY_PREFIXES:
-        if normalized.startswith(prefixes):
-            return family
-    return "other"
 
 
 def _json_content_type(scope: Scope) -> bool:
