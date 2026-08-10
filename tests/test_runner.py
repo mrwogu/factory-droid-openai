@@ -53,6 +53,7 @@ from factory_droid_openai.runner import (
     _create_client,
     _ManagedProcessTransport,
     _run_until,
+    model_family,
     sdk_error,
 )
 
@@ -1304,6 +1305,37 @@ async def test_runner_retunes_a_warm_session_to_the_requested_model(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_runner_retune_keeps_the_droid_default_effort(tmp_path: Path) -> None:
+    client = FakeClient([TurnComplete()])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+    warm = WarmSession(
+        key=SessionKey(model_id=None, reasoning_effort=None),
+        client=cast("Any", client),
+        transport=None,
+        session_id="session-1",
+        created_at=0.0,
+    )
+
+    events = [
+        event
+        async for event in runner.run(
+            _request(model="glm-5.2", reasoning_effort=None, warm_session=warm),
+        )
+    ]
+
+    assert isinstance(events[-1], RunComplete)
+    assert client.rpc_requests[0][1] == {
+        "modelId": "glm-5.2",
+        "interactionMode": "auto",
+        "autonomyLevel": "off",
+    }
+
+
+@pytest.mark.asyncio
 async def test_runner_rejects_a_cross_model_warm_session_for_kimi(tmp_path: Path) -> None:
     client = FakeClient([TurnComplete()])
     runner = DroidRunner(
@@ -1423,6 +1455,36 @@ def test_session_key_retuning_requires_an_expressible_target() -> None:
     assert SessionKey(model_id="glm-5.2", reasoning_effort="high").can_retune_from(explicit) is True
     assert kimi.can_retune_from(explicit) is False
     assert explicit.can_retune_from(kimi) is False
+    assert kimi.can_retune_from(SessionKey(model_id="kimi-k2.6", reasoning_effort="high")) is False
+    assert kimi.can_retune_from(SessionKey(model_id="kimi-k3", reasoning_effort="low")) is True
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("factory-droid", "factory_default"),
+        ("gpt-5.4", "gpt"),
+        ("gemini-3.1-pro", "gemini"),
+        ("claude-sonnet", "claude"),
+        ("custom-model", "other"),
+        ("kimi-k3", "kimi"),
+        ("KIMI_K4 ", "kimi"),
+    ],
+)
+def test_model_family_is_coarse_and_stable(model: str, expected: str) -> None:
+    assert model_family(model) == expected
+
+
+def test_fresh_session_families_follow_the_shared_model_family_table() -> None:
+    """A family spelling telemetry groups as Kimi cannot escape the guard."""
+    explicit = SessionKey(model_id="gpt-5.4", reasoning_effort="high")
+
+    for model_id in ("kimi-k3", "kimi_k4", "KIMI-K5"):
+        assert model_family(model_id) == "kimi"
+        assert (
+            SessionKey(model_id=model_id, reasoning_effort="high").can_retune_from(explicit)
+            is False
+        )
 
 
 @pytest.mark.asyncio

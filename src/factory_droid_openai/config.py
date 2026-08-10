@@ -12,6 +12,10 @@ from factory_droid_openai.payloadlog import PAYLOAD_TRACE_MODES
 
 _REASONING_EFFORTS: tuple[str, ...] = tuple(effort.value for effort in ReasoningEffort)
 
+# The model name that means "whatever Droid defaults to" instead of a concrete
+# Droid model id.
+DEFAULT_MODEL_ALIAS = "factory-droid"
+
 # Droid does not always emit a completion event after a client-side tool call,
 # so the bridge stops waiting this long after one arrives. Raise it when a
 # model spreads parallel calls over slower gaps than this.
@@ -54,7 +58,7 @@ class Settings:
     model_quarantine_seconds: float = 900.0
     worktree: str | None = None
     append_system_prompt_file: Path | None = None
-    model_alias: str = "factory-droid"
+    model_alias: str = DEFAULT_MODEL_ALIAS
     # Overrides any reasoning_effort a request carries when set.
     reasoning_effort: str | None = None
     log_level: str = "info"
@@ -301,7 +305,7 @@ class Settings:
             model_quarantine_seconds=model_quarantine_seconds,
             worktree=worktree,
             append_system_prompt_file=append_system_prompt_file,
-            model_alias=os.getenv("FACTORY_DROID_OPENAI_MODEL_ALIAS", "factory-droid"),
+            model_alias=os.getenv("FACTORY_DROID_OPENAI_MODEL_ALIAS", DEFAULT_MODEL_ALIAS),
             reasoning_effort=reasoning_effort,
             log_level=log_level,
             log_format=log_format,

@@ -32,6 +32,7 @@ from droid_sdk.schemas.enums import (
     ReasoningEffort,
 )
 
+from factory_droid_openai.config import DEFAULT_MODEL_ALIAS
 from factory_droid_openai.droid_rpc import (
     CompactionResult,
     ContextBreakdown,
@@ -72,12 +73,43 @@ _MODEL_DENIED_PATTERN = re.compile(
 # Weaker models do exactly that before answering, which is worth tolerating;
 # every other native tool still fails the turn closed.
 _IGNORED_NATIVE_TOOLS = frozenset({"exitspecmode", "toolsearch"})
-_FRESH_SESSION_MODEL_PREFIXES = ("kimi-",)
+_MODEL_FAMILY_PREFIXES = (
+    (("gpt-", "o1", "o3", "o4"), "gpt"),
+    (("gemini",), "gemini"),
+    (("claude",), "claude"),
+    (("qwen",), "qwen"),
+    (("kimi",), "kimi"),
+    (("deepseek",), "deepseek"),
+)
+# A retune only swaps modelId; Droid keeps the tool-call template the session
+# was initialized with. These families frame calls in special tokens no other
+# family understands, so a cross-family switch would leave the wrong template
+# active and produce mangled calls. They get a fresh session instead.
+_FRESH_SESSION_MODEL_FAMILIES = frozenset({"kimi"})
 
 
 def _is_ignorable_native_tool(tool_name: str) -> bool:
     """Report whether an event names a Droid meta tool the bridge tolerates."""
     return tool_name.replace("-", "").replace("_", "").casefold() in _IGNORED_NATIVE_TOOLS
+
+
+def model_family(model: str) -> str:
+    """Groups a requested model or resolved Droid model id into one family.
+
+    Telemetry labels and the warm-pool retune guard read the same table, so a
+    family the bridge treats as special cannot drift between the two.
+    """
+    normalized = model.strip().lower()
+    if normalized == DEFAULT_MODEL_ALIAS:
+        return "factory_default"
+    for prefixes, family in _MODEL_FAMILY_PREFIXES:
+        if normalized.startswith(prefixes):
+            return family
+    return "other"
+
+
+def _needs_fresh_session(model_id: str | None) -> bool:
+    return model_id is not None and model_family(model_id) in _FRESH_SESSION_MODEL_FAMILIES
 
 
 class RunnerError(RuntimeError):
@@ -116,19 +148,17 @@ class SessionKey:
     def can_retune_from(self, other: SessionKey) -> bool:
         """Whether a session warmed for ``other`` can be repointed at ``self``.
 
-        Kimi model changes need a fresh session because its protocol state can
-        survive a retune. Other model changes and explicit effort changes keep
-        using Droid's fast settings update.
+        A model change in or out of a fresh-session family needs a new session
+        because the template it was initialized with survives a retune. Other
+        model changes and explicit effort changes keep using Droid's fast
+        settings update. ``None`` means "whatever Droid defaults to", which
+        cannot be restored on a session that already carries an explicit value.
         """
         if self.model_id is None:
             return False
         model_changed = self.model_id != other.model_id
         if model_changed and (
-            self.model_id.startswith(_FRESH_SESSION_MODEL_PREFIXES)
-            or (
-                other.model_id is not None
-                and other.model_id.startswith(_FRESH_SESSION_MODEL_PREFIXES)
-            )
+            _needs_fresh_session(self.model_id) or _needs_fresh_session(other.model_id)
         ):
             return False
         return not (self.reasoning_effort is None and other.reasoning_effort is not None)
