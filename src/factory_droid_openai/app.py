@@ -111,6 +111,7 @@ _PAYLOAD_SIZE_BUCKETS = (
     (102_400, "10kb_100kb"),
     (1_048_576, "100kb_1mb"),
 )
+
 CHAT_COMPLETION_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {
         "model": ChatCompletionResponse,
@@ -866,6 +867,7 @@ def create_app(
 
     def require_known_session(session_id: str) -> SessionKey:
         if not resolved_settings.session_continuity:
+            log_warning("session.rejected", status=400, phase="session_continuity")
             raise BridgeHTTPError(
                 "Session continuity is disabled on this bridge.",
                 status_code=400,
@@ -873,6 +875,7 @@ def create_app(
             )
         key = sessions.key(session_id)
         if key is None:
+            log_warning("session.rejected", status=404, phase="session_unknown")
             raise BridgeHTTPError(
                 "Unknown Factory Droid session. Only sessions created by this "
                 "bridge process can be used.",
@@ -1139,11 +1142,34 @@ def create_app(
             log_warning("chat.rejected", status=rejection.status_code, phase="options")
             return rejection
 
+        reasoning_effort = _effective_reasoning_effort(payload, resolved_settings)
+        try:
+            reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+        except RunnerError as exc:
+            request.state.telemetry_error_type = exc.error_type
+            log_warning("chat.rejected", status=exc.status_code, phase="reasoning_effort")
+            return _error_response(str(exc), exc.status_code, exc.error_type)
+
+        requested_key = SessionKey.from_request(
+            model=payload.model,
+            model_alias=resolved_settings.model_alias,
+            reasoning_effort=reasoning_effort,
+        )
+
+        # Settled before the transcript is serialized so a mismatch cannot be
+        # masked by a payload-size rejection and costs no prompt work.
         session_id: str | None = None
-        continued_key: SessionKey | None = None
         if payload.factory_droid_session_id is not None:
             session_id = payload.factory_droid_session_id
-            continued_key = require_known_session(session_id)
+            if require_known_session(session_id) != requested_key:
+                request.state.telemetry_error_type = "invalid_request_error"
+                log_warning("chat.rejected", status=400, phase="session_settings")
+                return _error_response(
+                    "Factory Droid session settings do not match the request. "
+                    "Start a new session to switch model or reasoning effort.",
+                    400,
+                    "invalid_request_error",
+                )
 
         try:
             structured = _prepare_output_format(
@@ -1185,28 +1211,6 @@ def create_app(
             prompt_ms=timeline.mark("prompt_ms"),
         )
         payload_tracer.trace("chat.prompt", plan.prompt, model=payload.model)
-
-        reasoning_effort = _effective_reasoning_effort(payload, resolved_settings)
-        try:
-            reasoning_effort = normalize_reasoning_effort(reasoning_effort)
-        except RunnerError as exc:
-            request.state.telemetry_error_type = exc.error_type
-            log_warning("chat.rejected", status=exc.status_code, phase="reasoning_effort")
-            return _error_response(str(exc), exc.status_code, exc.error_type)
-
-        requested_key = SessionKey.from_request(
-            model=payload.model,
-            model_alias=resolved_settings.model_alias,
-            reasoning_effort=reasoning_effort,
-        )
-        if continued_key is not None and continued_key != requested_key:
-            request.state.telemetry_error_type = "invalid_request_error"
-            return _error_response(
-                "Factory Droid session settings do not match the request. "
-                "Start a new session to switch model or reasoning effort.",
-                400,
-                "invalid_request_error",
-            )
 
         quarantined = quarantine.reason(payload.model)
         if quarantined is not None:
@@ -1278,7 +1282,7 @@ def create_app(
             raise
 
         if session_id is None:
-            warm_session = pool.acquire(run_request.session_key())
+            warm_session = pool.acquire(requested_key)
             if warm_session is not None:
                 metrics.record_features(("warm_session",))
                 run_request = replace(run_request, warm_session=warm_session)
