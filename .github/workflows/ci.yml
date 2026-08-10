@@ -73,6 +73,13 @@ jobs:
       - name: Validate OpenAPI contract
         run: uv run openapi-spec-validator openapi.json
 
+      # Validating the committed file cannot catch a file that no longer
+      # matches the routes and schemas that produced it.
+      - name: Verify OpenAPI contract is regenerated
+        run: |
+          uv run python scripts/generate_openapi.py
+          git diff --exit-code openapi.json
+
       - name: Validate PromptScript targets
         run: |
           prs validate
