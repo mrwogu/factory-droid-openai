@@ -8,6 +8,7 @@
 #   Mount your project at /work so Droid sees it as the working directory.
 #   The bridge disables all Factory-native tools, so the mount can be
 #   read-only. Remove the volumes block below if you do not need a workdir.
+#   Set FACTORY_DROID_SETTINGS_FILE to mount one Droid settings.json read-only.
 #
 # Usage:
 #   export FACTORY_API_KEY=fk-...
@@ -33,10 +34,10 @@ services:
       # FACTORY_DROID_OPENAI_TIMEOUT_SECONDS: "600"
       # FACTORY_DROID_OPENAI_MODEL_CACHE_SECONDS: "300"
       # FACTORY_DROID_OPENAI_TELEMETRY: "false"
-    # Optional: expose your project to Droid as /work. Read-only is safe
-    # because Factory-native tools are disabled. Uncomment to mount a workdir.
+    # Optional read-only mounts. Uncomment `volumes` and either entry needed.
     # volumes:
     #   - ./:/work:ro
+    #   - ${FACTORY_DROID_SETTINGS_FILE:?set FACTORY_DROID_SETTINGS_FILE}:/home/droid/.factory/settings.json:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/health"]

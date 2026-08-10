@@ -441,6 +441,33 @@ Authentication inside a container uses `FACTORY_API_KEY` only. Interactive
 and pass it as an environment variable. The bridge never reads or copies
 that credential; the Droid subprocess inherits it directly.
 
+The container has its own Factory home, so host
+`~/.factory/settings.json` is not loaded automatically. Mount only that file
+read-only when the Droid subprocess should use your CLI settings:
+
+```bash
+docker run -d --rm --pull=always --name droid-bridge \
+  -p 127.0.0.1:8787:8787 \
+  -e FACTORY_API_KEY="$FACTORY_API_KEY" \
+  -e FACTORY_DROID_OPENAI_API_KEY="$FACTORY_DROID_OPENAI_API_KEY" \
+  -v "$HOME/.factory/settings.json:/home/droid/.factory/settings.json:ro" \
+  ghcr.io/mrwogu/factory-droid-openai:latest
+```
+
+With Compose, uncomment the settings entry in `docker-compose.yml` and set:
+
+```bash
+export FACTORY_DROID_SETTINGS_FILE="$HOME/.factory/settings.json"
+docker compose up -d
+```
+
+The file must be readable by container user `uid 1000`. Keep it outside the
+repository when it contains custom-model credentials. Request model,
+reasoning effort, Auto interaction mode, autonomy Off, and disabled Droid
+tools are pinned by the bridge and override matching session defaults.
+Mounting this file does not mount other profile files such as
+`system-prompt.md`, skills, or hooks.
+
 Never publish the bridge port to a non-loopback interface without a
 configured `FACTORY_DROID_OPENAI_API_KEY`. See
 [SECURITY.md](SECURITY.md) before any remote deployment.
