@@ -83,7 +83,8 @@ RUN if [ -n "${BRIDGE_VERSION}" ]; then \
 # working directory (Factory-native tools are disabled), so a read-only host
 # mount at /work is safe. Sessions live in the per-user Factory config dir.
 RUN useradd --create-home --uid 1000 droid \
- && chown -R droid:droid /work
+ && mkdir -p /home/droid/.factory \
+ && chown -R droid:droid /work /home/droid/.factory
 USER droid
 WORKDIR /work
 
