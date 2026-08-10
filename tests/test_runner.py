@@ -1263,7 +1263,7 @@ async def test_runner_reuses_a_warm_session_without_reinitializing(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_runner_retunes_a_warm_session_to_the_requested_model(tmp_path: Path) -> None:
+async def test_runner_retunes_a_warm_session_to_the_requested_effort(tmp_path: Path) -> None:
     client = FakeClient([TurnComplete()])
     runner = DroidRunner(
         droid_path="droid",
@@ -1271,7 +1271,7 @@ async def test_runner_retunes_a_warm_session_to_the_requested_model(tmp_path: Pa
         client_factory=cast("Any", lambda _path, _cwd: client),
     )
     warm = WarmSession(
-        key=SessionKey(model_id=None, reasoning_effort=None),
+        key=SessionKey(model_id="gpt-5.4", reasoning_effort="high"),
         client=cast("Any", client),
         transport=None,
         session_id="session-1",
@@ -1305,7 +1305,22 @@ async def test_runner_retunes_a_warm_session_to_the_requested_model(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_runner_retune_keeps_the_droid_default_effort(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("warmed_model", "requested_model"),
+    [
+        ("gpt-5.4", "kimi-k3"),
+        ("kimi-k3", "gpt-5.4"),
+        ("kimi-k2.6", "kimi-k3"),
+        ("gpt-5.4", "glm-5.2"),
+        ("claude-opus-5", "gemini-3.1-pro"),
+    ],
+)
+async def test_runner_rejects_a_cross_model_warm_session(
+    tmp_path: Path,
+    warmed_model: str,
+    requested_model: str,
+) -> None:
+    """No model pair may retune, whatever family either side belongs to."""
     client = FakeClient([TurnComplete()])
     runner = DroidRunner(
         droid_path="droid",
@@ -1313,30 +1328,28 @@ async def test_runner_retune_keeps_the_droid_default_effort(tmp_path: Path) -> N
         client_factory=cast("Any", lambda _path, _cwd: client),
     )
     warm = WarmSession(
-        key=SessionKey(model_id=None, reasoning_effort=None),
+        key=SessionKey(model_id=warmed_model, reasoning_effort="high"),
         client=cast("Any", client),
         transport=None,
         session_id="session-1",
         created_at=0.0,
     )
 
-    events = [
-        event
-        async for event in runner.run(
-            _request(model="glm-5.2", reasoning_effort=None, warm_session=warm),
-        )
-    ]
+    with pytest.raises(RunnerError, match="cannot be repointed"):
+        _ = [
+            event
+            async for event in runner.run(
+                _request(model=requested_model, reasoning_effort="high", warm_session=warm),
+            )
+        ]
 
-    assert isinstance(events[-1], RunComplete)
-    assert client.rpc_requests[0][1] == {
-        "modelId": "glm-5.2",
-        "interactionMode": "auto",
-        "autonomyLevel": "off",
-    }
+    assert client.rpc_requests == []
+    assert client.closed is True
 
 
 @pytest.mark.asyncio
-async def test_runner_rejects_a_cross_model_warm_session_for_kimi(tmp_path: Path) -> None:
+async def test_runner_rejects_a_warm_session_for_the_droid_default_model(tmp_path: Path) -> None:
+    """Droid's own default cannot be restored on a session pinned to a model."""
     client = FakeClient([TurnComplete()])
     runner = DroidRunner(
         droid_path="droid",
@@ -1355,7 +1368,7 @@ async def test_runner_rejects_a_cross_model_warm_session_for_kimi(tmp_path: Path
         _ = [
             event
             async for event in runner.run(
-                _request(model="kimi-k3", reasoning_effort="high", warm_session=warm),
+                _request(reasoning_effort="high", warm_session=warm),
             )
         ]
 
@@ -1446,17 +1459,12 @@ async def test_runner_keeps_other_sdk_failures_as_bridge_errors(tmp_path: Path) 
 def test_session_key_retuning_requires_an_expressible_target() -> None:
     default = SessionKey(model_id=None, reasoning_effort=None)
     explicit = SessionKey(model_id="gpt-5.4", reasoning_effort="high")
-    kimi = SessionKey(model_id="kimi-k3", reasoning_effort="high")
 
-    assert explicit.can_retune_from(default) is True
     assert explicit.can_retune_from(SessionKey(model_id="gpt-5.4", reasoning_effort="low")) is True
+    assert explicit.can_retune_from(SessionKey(model_id="gpt-5.4", reasoning_effort=None)) is True
     assert SessionKey(model_id="gpt-5.4", reasoning_effort=None).can_retune_from(explicit) is False
     assert default.can_retune_from(explicit) is False
-    assert SessionKey(model_id="glm-5.2", reasoning_effort="high").can_retune_from(explicit) is True
-    assert kimi.can_retune_from(explicit) is False
-    assert explicit.can_retune_from(kimi) is False
-    assert kimi.can_retune_from(SessionKey(model_id="kimi-k2.6", reasoning_effort="high")) is False
-    assert kimi.can_retune_from(SessionKey(model_id="kimi-k3", reasoning_effort="low")) is True
+    assert explicit.can_retune_from(default) is False
 
 
 @pytest.mark.parametrize(
@@ -1475,16 +1483,25 @@ def test_model_family_is_coarse_and_stable(model: str, expected: str) -> None:
     assert model_family(model) == expected
 
 
-def test_fresh_session_families_follow_the_shared_model_family_table() -> None:
-    """A family spelling telemetry groups as Kimi cannot escape the guard."""
-    explicit = SessionKey(model_id="gpt-5.4", reasoning_effort="high")
+def test_only_the_reasoning_effort_retunes_for_every_family() -> None:
+    """A retune keeps the template Droid installed, so no model pair qualifies."""
+    models = (
+        "gpt-5.4",
+        "gemini-3.1-pro",
+        "claude-opus-5",
+        "qwen3-coder",
+        "kimi-k2.6",
+        "kimi-k3",
+        "deepseek-v3.1",
+        "glm-5.2",
+        "custom-model",
+    )
 
-    for model_id in ("kimi-k3", "kimi_k4", "KIMI-K5"):
-        assert model_family(model_id) == "kimi"
-        assert (
-            SessionKey(model_id=model_id, reasoning_effort="high").can_retune_from(explicit)
-            is False
-        )
+    for warmed in models:
+        for requested in models:
+            assert SessionKey(model_id=requested, reasoning_effort="low").can_retune_from(
+                SessionKey(model_id=warmed, reasoning_effort="high")
+            ) is (warmed == requested)
 
 
 @pytest.mark.asyncio

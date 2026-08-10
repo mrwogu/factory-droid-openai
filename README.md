@@ -1318,7 +1318,7 @@ surface.
 | `factory_droid_openai_model_quarantines_total` | Models withheld after Droid refused them |
 | `factory_droid_openai_warm_sessions` | Warm Droid sessions ready now |
 | `factory_droid_openai_warm_session_hits_total` | Requests served from a warm session |
-| `factory_droid_openai_warm_session_retunes_total` | Warm sessions repointed at another model or effort |
+| `factory_droid_openai_warm_session_retunes_total` | Warm sessions repointed at another reasoning effort, labelled `reason="effort"` |
 | `factory_droid_openai_warm_session_misses_total` | Requests that had to start their own session |
 | `factory_droid_openai_warm_session_failures_total` | Failed warm-up attempts |
 | `factory_droid_openai_pending_reaps` | Droid teardowns still running in the background |
@@ -1356,15 +1356,16 @@ refills.
 
 Warm sessions are keyed by the model and reasoning effort they were
 initialized with. An exact match serves a turn with no extra round trip.
-A compatible session can be repointed at another model or explicit reasoning
-effort, which takes 4-18 ms instead of a 2.4-3.2 s startup, and logs
-`pool.retune` plus `droid.session_retuned`. A retune only swaps the model id,
-so the tool-call template the session was initialized with survives it: model
-families that frame calls in their own special tokens always use a fresh or
-exact-match warm session instead. Kimi is the one such family today, matched
-by the same family table telemetry labels use. Requests that ask for the
-model alias, or for the model's default reasoning effort on a session that
-carries an explicit one, also log `pool.miss`. The pool tracks the settings
+A session warmed for the same model can be repointed at another explicit
+reasoning effort, which takes 4-18 ms instead of a 2.4-3.2 s startup, and logs
+`pool.retune` plus `droid.session_retuned`. A model change never retunes: a
+retune swaps the model id while the session keeps the tool-call template it
+was initialized with, and that template belongs to the model rather than to
+its family, so no denylist of families would be safe either. Kimi K2 frames
+calls in `<|tool_calls_section_begin|>` where K3 uses `<|open|>tools<|sep|>`.
+Requests that ask for a different model, for the model alias, or for the
+model's default reasoning effort on a session that carries an explicit one,
+log `pool.miss` and wait for a fresh session. The pool tracks the settings
 recent traffic used, so repeat traffic converges on exact matches.
 
 Teardown runs after the response is finished, so session close and the second
@@ -1407,9 +1408,9 @@ DEBUG    2026-07-27T14:10:12+0200 event=droid.cleanup request_id=chatcmpl-8f2a c
 ```
 
 `droid.connected` and `droid_startup_ms` only appear on a cold session,
-`pool.retune` and `droid.session_retuned` only when a compatible session is
-reused with other settings, and cleanup is logged after the response because
-it is detached.
+`pool.retune` and `droid.session_retuned` only when a session warmed for the
+same model is reused at another reasoning effort, and cleanup is logged after
+the response because it is detached.
 
 Phase fields, in the order they occur:
 
@@ -1601,12 +1602,12 @@ request timeout, and bridge logs.
 ### One slow request after switching models
 
 The warm pool holds sessions for the model and reasoning effort recent traffic
-used. Most compatible model switches log `pool.retune` and complete in
-milliseconds. Kimi switches intentionally start a fresh session when no exact
-warm session exists, then log `pool.miss` with a multi-second
-`session_ready_ms`; this prevents Kimi-specific protocol state from leaking
-across the switch. Raise `FACTORY_DROID_OPENAI_WARM_SESSIONS` when clients
-alternate between models faster than the pool refills.
+used. A model switch intentionally starts a fresh session when no exact warm
+session exists, then logs `pool.miss` with a multi-second `session_ready_ms`;
+this prevents the tool-call template of the previous model from leaking across
+the switch. Only a reasoning-effort change on the same model logs `pool.retune`
+and completes in milliseconds. Raise `FACTORY_DROID_OPENAI_WARM_SESSIONS` when
+clients alternate between models faster than the pool refills.
 
 ### Every request logs a forced kill
 

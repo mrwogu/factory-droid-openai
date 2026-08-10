@@ -81,11 +81,6 @@ _MODEL_FAMILY_PREFIXES = (
     (("kimi",), "kimi"),
     (("deepseek",), "deepseek"),
 )
-# A retune only swaps modelId; Droid keeps the tool-call template the session
-# was initialized with. These families frame calls in special tokens no other
-# family understands, so a cross-family switch would leave the wrong template
-# active and produce mangled calls. They get a fresh session instead.
-_FRESH_SESSION_MODEL_FAMILIES = frozenset({"kimi"})
 
 
 def _is_ignorable_native_tool(tool_name: str) -> bool:
@@ -96,8 +91,8 @@ def _is_ignorable_native_tool(tool_name: str) -> bool:
 def model_family(model: str) -> str:
     """Groups a requested model or resolved Droid model id into one family.
 
-    Telemetry labels and the warm-pool retune guard read the same table, so a
-    family the bridge treats as special cannot drift between the two.
+    Telemetry labels group traffic by family so a model id never becomes a
+    metric label of its own.
     """
     normalized = model.strip().lower()
     if normalized == DEFAULT_MODEL_ALIAS:
@@ -106,10 +101,6 @@ def model_family(model: str) -> str:
         if normalized.startswith(prefixes):
             return family
     return "other"
-
-
-def _needs_fresh_session(model_id: str | None) -> bool:
-    return model_id is not None and model_family(model_id) in _FRESH_SESSION_MODEL_FAMILIES
 
 
 class RunnerError(RuntimeError):
@@ -148,18 +139,16 @@ class SessionKey:
     def can_retune_from(self, other: SessionKey) -> bool:
         """Whether a session warmed for ``other`` can be repointed at ``self``.
 
-        A model change in or out of a fresh-session family needs a new session
-        because the template it was initialized with survives a retune. Other
-        model changes and explicit effort changes keep using Droid's fast
-        settings update. ``None`` means "whatever Droid defaults to", which
-        cannot be restored on a session that already carries an explicit value.
+        Only the reasoning effort is retunable. A retune swaps the model id
+        while Droid keeps the tool-call template the session was initialized
+        with, and that template belongs to the model rather than to its
+        family: Kimi K2 frames calls in ``<|tool_calls_section_begin|>`` where
+        K3 uses ``<|open|>tools<|sep|>``. Any model change therefore waits for
+        a fresh or exact-match session. ``None`` means "whatever Droid
+        defaults to", which cannot be restored on a session that already
+        carries an explicit value.
         """
-        if self.model_id is None:
-            return False
-        model_changed = self.model_id != other.model_id
-        if model_changed and (
-            _needs_fresh_session(self.model_id) or _needs_fresh_session(other.model_id)
-        ):
+        if self.model_id is None or self.model_id != other.model_id:
             return False
         return not (self.reasoning_effort is None and other.reasoning_effort is not None)
 
@@ -388,16 +377,16 @@ class DroidRunner:
         if key == warm.key:
             return
         model_id = key.model_id
-        if model_id is None or not key.can_retune_from(warm.key):
+        effort = _resolve_reasoning_effort(key.reasoning_effort)
+        if model_id is None or effort is None or not key.can_retune_from(warm.key):
             raise RunnerError(
                 "Warm Droid session cannot be repointed at the requested settings.",
             )
         started = time.perf_counter()
-        effort = _resolve_reasoning_effort(key.reasoning_effort)
         await self._rpc.retune_session(
             warm.client,
             model_id=model_id,
-            reasoning_effort=effort.value if effort is not None else None,
+            reasoning_effort=effort.value,
         )
         previous = warm.key
         warm.key = key
