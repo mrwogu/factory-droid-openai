@@ -44,8 +44,16 @@ _UNPARSED_HEAD_CHARS = 64
 _MESSAGE_JSON_PATTERN = re.compile(r'\{\s*"(?:role|content|tool_calls|id|type)"\s*:')
 _MESSAGE_JSON_KEYS = ("role", "content", "tool_calls", "id", "type")
 _MAX_MESSAGE_JSON_PREFIX_CHARS = 64
-_MANGLED_TOOL_CALLS_PATTERN = re.compile(r'"tool(?:_|\s+)calls"\s*:\s*"id"\s*:\s*"call_')
+# A retuned session can emit the transcript's own "tool_calls" key with its
+# opening bracket lost, so the id follows the key as a bare string. The call id
+# itself is optional in the wreckage, and the case is whatever the template
+# produced, so both stay tolerated: this only decides what fails closed.
+_MANGLED_TOOL_CALLS_PATTERN = re.compile(
+    r'"tool(?:_|\s+)calls"\s*:\s*(?:"id"\s*:\s*)?"call_',
+    re.IGNORECASE,
+)
 _MANGLED_TOOL_CALLS_START = '"tool'
+_MANGLED_TOOL_CALLS_TAILS = ((":", '"id"', ":", '"call_'), (":", '"call_'))
 
 __all__ = [
     "TOOL_CALL_CLOSE",
@@ -923,6 +931,9 @@ def _partial_mangled_tool_calls_prefix_length(value: str) -> int:
 
 
 def _is_mangled_tool_calls_prefix(value: str) -> bool:
+    # The pattern is case-insensitive, and every literal below is lower case,
+    # so one fold up front keeps the walk comparing like with like.
+    value = value.lower()
     consumed = _consume_literal_prefix(value, 0, _MANGLED_TOOL_CALLS_START)
     if consumed is None:
         return False
@@ -946,7 +957,14 @@ def _is_mangled_tool_calls_prefix(value: str) -> bool:
     if ended:
         return True
 
-    for literal in (":", '"id"', ":", '"call_'):
+    return any(
+        _is_literal_sequence_prefix(value, index, tail) for tail in _MANGLED_TOOL_CALLS_TAILS
+    )
+
+
+def _is_literal_sequence_prefix(value: str, start: int, literals: tuple[str, ...]) -> bool:
+    index = start
+    for literal in literals:
         while index < len(value) and value[index].isspace():
             index += 1
         if index == len(value):
