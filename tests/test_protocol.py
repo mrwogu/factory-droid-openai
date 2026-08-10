@@ -911,6 +911,42 @@ def test_stream_parser_stops_mangled_tool_calls_without_an_id_or_lower_case(
         assert "".join(item.text for item in emissions if isinstance(item, TextEmission)) == prefix
 
 
+@pytest.mark.parametrize("separator", ["_", " "])
+def test_stream_parser_detects_mangled_tool_calls_after_plain_json(separator: str) -> None:
+    # A non-tool-call assistant message followed by a mangled tool_calls echo
+    # in the same chunk: _emit_plain_json disables message-JSON re-detection
+    # in the trailing but mangled detection must stay active.
+    plain = '{"role":"assistant","content":"hi"}'
+    mangled = (
+        f'"tool{separator}calls":"call_1","type":"function","function":'
+        '("name":"weather","arguments":("city":"Gdansk"))'
+    )
+    value = f"{plain}{mangled}"
+
+    for split in range(1, len(value)):
+        parser = ToolCallStreamParser(frozenset({"weather"}))
+        emissions: list[object] = []
+
+        with pytest.raises(MalformedToolCallError, match="echoed an OpenAI transcript"):
+            _feed_parser_to_finish(parser, emissions, value[:split], value[split:])
+
+        assert "".join(item.text for item in emissions if isinstance(item, TextEmission)) == plain
+
+
+def test_stream_parser_skips_mangled_detection_when_message_json_disabled() -> None:
+    # Structured-output mode disables message-JSON detection entirely, which
+    # also disables mangled tool-call detection.
+    parser = ToolCallStreamParser(frozenset({"weather"}), parse_message_json=False)
+    text = '"tool_calls":"call_1","function":("name":"weather")'
+
+    emissions: list[object] = []
+    for char in text:
+        emissions.extend(parser.feed(char))
+    emissions.extend(parser.finish())
+
+    assert "".join(item.text for item in emissions if isinstance(item, TextEmission)) == text
+
+
 def test_stream_parser_preserves_tool_calls_phrase_without_json_separator() -> None:
     parser = ToolCallStreamParser(frozenset({"weather"}))
     text = 'The label "tool calls": remains ordinary prose.'

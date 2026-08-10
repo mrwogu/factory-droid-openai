@@ -412,11 +412,16 @@ class ToolCallStreamParser:
         detect_message_json = (
             self._parse_message_json if parse_message_json is None else parse_message_json
         )
+        # Mangled tool-call detection stays tied to the parser's init setting,
+        # not the per-call flag: _emit_plain_json disables message-JSON
+        # re-detection in its trailing but a transcript echo there still fails
+        # closed.
+        detect_mangled = self._parse_message_json
         value = self._text_tail + chunk
         self._text_tail = ""
         found = find_open_marker(value)
         message_match = _MESSAGE_JSON_PATTERN.search(value) if detect_message_json else None
-        mangled_match = _MANGLED_TOOL_CALLS_PATTERN.search(value) if detect_message_json else None
+        mangled_match = _MANGLED_TOOL_CALLS_PATTERN.search(value) if detect_mangled else None
         emissions: list[ProtocolEmission] = []
         if (
             message_match is not None
@@ -460,8 +465,8 @@ class ToolCallStreamParser:
             _partial_marker_suffix_length(value, dialect.open_marker) for dialect in MARKER_DIALECTS
         )
         if detect_message_json:
-            partial_message = _partial_message_json_prefix_length(value)
-            held = max(held, partial_message)
+            held = max(held, _partial_message_json_prefix_length(value))
+        if detect_mangled:
             held = max(held, _partial_mangled_tool_calls_prefix_length(value))
         if self._saw_tool_call:
             held = max(held, len(self._trailing_partial(value)))
