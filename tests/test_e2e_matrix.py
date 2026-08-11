@@ -72,6 +72,31 @@ def test_scenarios_cover_both_transports_and_run_hostile_cases_once(e2e: ModuleT
     assert len(e2e.continuation_switch_scenarios(streaming=False)) == 1
 
 
+def test_blank_argument_scenarios_accept_answer_or_tool_retry(e2e: ModuleType) -> None:
+    scenarios = [
+        scenario for scenario in e2e.scenarios() if scenario.name == "tool_blank_arguments"
+    ]
+
+    assert {scenario.stream for scenario in scenarios} == {False, True}
+    for scenario in scenarios:
+        answered = _observation(
+            e2e,
+            finish_reason="stop",
+            content_chars=12,
+            stream_done=scenario.stream,
+        )
+        retried = _observation(
+            e2e,
+            finish_reason="tool_calls",
+            tool_calls=1,
+            content_chars=0,
+            stream_done=scenario.stream,
+        )
+
+        assert e2e.classify(scenario, answered)[0] == e2e.SUCCESS
+        assert e2e.classify(scenario, retried)[0] == e2e.SUCCESS
+
+
 def test_contract_satisfied_is_a_pass(e2e: ModuleType) -> None:
     verdict, _ = e2e.classify(_scenario(e2e), _observation(e2e))
 

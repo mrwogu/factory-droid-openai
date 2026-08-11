@@ -240,6 +240,10 @@ def _tool_scenarios() -> list[Scenario]:
                 ],
                 "tools": [_CLOCK_TOOL],
             },
+            # A model may trust the supplied result or retry the call with the
+            # missing city. Both prove the blank argument survived the bridge.
+            expect_finish=("stop", "tool_calls"),
+            expect_content=False,
         ),
     ]
 
