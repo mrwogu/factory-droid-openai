@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, cast
 
 import httpx
 import pytest
-from openai import APIStatusError, AsyncOpenAI
+from openai import APIError, APIStatusError, AsyncOpenAI
 
 from factory_droid_openai.app import create_app
 from factory_droid_openai.config import Settings
@@ -15,6 +15,7 @@ from factory_droid_openai.runner import (
     ReasoningDelta,
     RunComplete,
     RunEvent,
+    RunnerError,
     RunRequest,
     TextDelta,
     Usage,
@@ -158,6 +159,34 @@ async def test_official_openai_client_parses_stream(
     assert chunks[-1].choices == []
     assert chunks[-1].usage is not None
     assert chunks[-1].usage.total_tokens == 6
+
+
+@pytest.mark.asyncio
+async def test_official_openai_client_raises_for_an_sse_error(
+    tmp_path: Path,
+) -> None:
+    class FailingStreamRunner(ScriptedRunner):
+        async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
+            self.requests.append(request)
+            yield TextDelta("partial")
+            raise RunnerError(
+                "Droid failed",
+                error_type="factory_droid_sdk_error",
+            )
+
+    runner = FailingStreamRunner([])
+    client, http_client = _sdk_client(tmp_path, runner)
+    async with http_client:
+        stream = await client.chat.completions.create(
+            model="factory-droid",
+            messages=[{"role": "user", "content": "Hello"}],
+            stream=True,
+        )
+        with pytest.raises(APIError, match="Droid failed") as error:
+            _ = [chunk async for chunk in stream]
+
+    assert isinstance(error.value.body, dict)
+    assert error.value.body["type"] == "factory_droid_sdk_error"
 
 
 @pytest.mark.asyncio

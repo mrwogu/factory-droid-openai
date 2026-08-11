@@ -527,22 +527,41 @@ def _decode_json_object(raw: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _decode_json_arg_value_close(
-    body: str,
+def _parse_allowed_json_call(
+    raw: str,
     allowed_tool_names: frozenset[str],
-) -> list[dict[str, Any]] | None:
-    """Repairs strict JSON followed by GLM's mismatched value-close token."""
-    stripped = body.strip()
-    if not stripped.endswith(_ARG_VALUE_CLOSE):
-        return None
-    candidate = stripped[: -len(_ARG_VALUE_CLOSE)].rstrip()
+) -> dict[str, Any] | None:
     try:
-        parsed = parse_strict_json(candidate)
+        parsed = parse_strict_json(raw)
     except (json.JSONDecodeError, ValueError):
         return None
     if not isinstance(parsed, dict) or parsed.get("name") not in allowed_tool_names:
         return None
-    return [parsed]
+    return parsed
+
+
+def _decode_json_arg_value_close(
+    body: str,
+    allowed_tool_names: frozenset[str],
+) -> list[dict[str, Any]] | None:
+    """Repairs strict JSON calls followed by GLM's mismatched value-close token."""
+    stripped = body.strip()
+    if not stripped.endswith(_ARG_VALUE_CLOSE):
+        return None
+    candidate = stripped[: -len(_ARG_VALUE_CLOSE)].rstrip()
+    parsed = _parse_allowed_json_call(candidate, allowed_tool_names)
+    if parsed is not None:
+        return [parsed]
+    separator = f"{_ARG_VALUE_CLOSE}{TOOL_CALL_OPEN}"
+    if separator not in candidate:
+        return None
+    calls: list[dict[str, Any]] = []
+    for segment in candidate.split(separator):
+        parsed = _parse_allowed_json_call(segment.strip(), allowed_tool_names)
+        if parsed is None:
+            return None
+        calls.append(parsed)
+    return calls if len(calls) > 1 else None
 
 
 def _decode_arg_key_value(
@@ -565,13 +584,20 @@ def _decode_arg_key_value(
         value_start = body.find(_ARG_VALUE_OPEN, key_end)
         if not key or key in arguments or value_start < 0:
             return None
+        key_trailing = body[key_end + len(_ARG_KEY_CLOSE) : value_start]
+        if key_trailing.strip():
+            return None
         value_end = body.find(_ARG_VALUE_CLOSE, value_start)
         if value_end < 0:
             # A truncated value would silently drop data, so fail closed.
             return None
         raw = body[value_start + len(_ARG_VALUE_OPEN) : value_end].strip()
         arguments[key] = _coerce_arg_value(raw)
+        value_end += len(_ARG_VALUE_CLOSE)
         index = body.find(_ARG_KEY_OPEN, value_end)
+        trailing_end = index if index >= 0 else len(body)
+        if body[value_end:trailing_end].strip():
+            return None
     return [{"name": name, "arguments": arguments}]
 
 

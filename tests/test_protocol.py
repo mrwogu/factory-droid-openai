@@ -634,6 +634,48 @@ def test_stream_parser_repairs_arg_key_value_payload() -> None:
     assert json.loads(emissions[0].arguments) == {"city": "Gdańsk", "days": 3}
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "weather<arg_key>city</arg_key><arg_value>Gdansk</arg_value>unexpected",
+        "weather<arg_key>city</arg_key>unexpected<arg_value>Gdansk</arg_value>",
+        (
+            "weather<arg_key>city</arg_key><arg_value>Gdansk</arg_value>"
+            "unexpected<arg_key>days</arg_key><arg_value>2</arg_value>"
+        ),
+    ],
+)
+def test_stream_parser_rejects_residue_inside_arg_key_value_payload(payload: str) -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    with pytest.raises(MalformedToolCallError):
+        parser.feed(f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE}")
+
+
+def test_stream_parser_keeps_separate_tagged_arg_key_calls() -> None:
+    parser = ToolCallStreamParser(
+        frozenset({"weather", "calendar"}),
+        max_tool_calls=2,
+    )
+    payload = (
+        "weather<arg_key>city</arg_key><arg_value>Gdansk</arg_value>"
+        "<tool_call>"
+        "calendar<arg_key>day</arg_key><arg_value>2</arg_value>"
+    )
+
+    emissions = parser.feed(f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE}")
+
+    assert [emission.name for emission in emissions if isinstance(emission, ToolCallEmission)] == [
+        "weather",
+        "calendar",
+    ]
+    assert [
+        json.loads(emission.arguments)
+        for emission in emissions
+        if isinstance(emission, ToolCallEmission)
+    ] == [{"city": "Gdansk"}, {"day": 2}]
+
+
 def test_stream_parser_uses_injected_payload_tracer() -> None:
     traces: list[tuple[str, str, dict[str, Any]]] = []
 
@@ -2365,6 +2407,87 @@ def test_stream_parser_recovers_json_with_glm_value_close(close_marker: str) -> 
     assert len(emissions) == 1
     assert isinstance(emissions[0], ToolCallEmission)
     assert json.loads(emissions[0].arguments) == {"city": "Gdansk"}
+
+
+@pytest.mark.parametrize("close_marker", ["", TOOL_CALL_CLOSE])
+def test_stream_parser_recovers_packed_json_with_glm_value_closes(close_marker: str) -> None:
+    payload = (
+        '{"name":"weather","arguments":{"city":"Gdansk"}}</arg_value>'
+        '<tool_call>{"name":"clock","arguments":{"city":"Gdansk"}}</arg_value>'
+    )
+    stream = f"{TOOL_CALL_OPEN}{payload}{close_marker}"
+
+    for boundary in range(len(stream) + 1):
+        parser = ToolCallStreamParser(
+            frozenset({"weather", "clock"}),
+            max_tool_calls=2,
+        )
+        emissions = parser.feed(stream[:boundary])
+        emissions.extend(parser.feed(stream[boundary:]))
+        emissions.extend(parser.finish())
+
+        calls = [emission for emission in emissions if isinstance(emission, ToolCallEmission)]
+        assert [call.name for call in calls] == ["weather", "clock"]
+        assert [json.loads(call.arguments) for call in calls] == [
+            {"city": "Gdansk"},
+            {"city": "Gdansk"},
+        ]
+
+
+def test_stream_parser_recovers_reconstructed_568_byte_glm_read_file_payload() -> None:
+    paths = [
+        "/workspace/example/monorepo/service/api/service/runtime_x/README.md",
+        "/workspace/example/monorepo/service/api/service/runtime_x/pyproject.toml",
+        "/workspace/example/monorepo/service/api/src/ciapi/service/runtime_x/main.py",
+        "/workspace/example/monorepo/service/api/src/ciapi/service/runtime_x/config.py",
+    ]
+    calls = [
+        json.dumps(
+            {"name": "read_file", "arguments": {"file_path": path}},
+            separators=(",", ":"),
+        )
+        for path in paths
+    ]
+    payload = "</arg_value><tool_call>".join(calls) + "</arg_value>"
+    assert len(payload.encode("utf-8")) == 568
+
+    parser = ToolCallStreamParser(frozenset({"read_file"}), max_tool_calls=4)
+    emissions = parser.feed(f"{TOOL_CALL_OPEN}{payload}")
+    emissions.extend(parser.finish())
+
+    parsed_calls = [emission for emission in emissions if isinstance(emission, ToolCallEmission)]
+    assert [call.name for call in parsed_calls] == ["read_file"] * 4
+    assert [json.loads(call.arguments)["file_path"] for call in parsed_calls] == paths
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        (
+            '{"name":"weather","arguments":{"city":"Gdansk"}}</arg_value>'
+            '<tool_call>{"name":"unknown","arguments":{"city":"Gdansk"}}</arg_value>'
+        ),
+        (
+            '{"name":"weather","arguments":{"city":"Gdansk"}}</arg_value>junk'
+            '<tool_call>{"name":"clock","arguments":{"city":"Gdansk"}}</arg_value>'
+        ),
+        (
+            '{"name":"weather","arguments":{"city":"Gdansk"}}</arg_value>'
+            '<tool_call>{"name":"clock","name":"clock","arguments":{}}</arg_value>'
+        ),
+    ],
+)
+def test_stream_parser_rejects_invalid_packed_json_with_glm_value_closes(
+    payload: str,
+) -> None:
+    parser = ToolCallStreamParser(
+        frozenset({"weather", "clock"}),
+        max_tool_calls=2,
+    )
+    parser.feed(f"{TOOL_CALL_OPEN}{payload}")
+
+    with pytest.raises(IncompleteToolCallError):
+        parser.finish()
 
 
 @pytest.mark.parametrize(

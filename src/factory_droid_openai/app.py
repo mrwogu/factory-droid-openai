@@ -145,6 +145,10 @@ CHAT_COMPLETION_RESPONSES: dict[int | str, dict[str, Any]] = {
         "model": ErrorResponse,
         "description": "The requested Factory Droid session is unknown to this bridge.",
     },
+    409: {
+        "model": ErrorResponse,
+        "description": "The requested Factory Droid session is already in use.",
+    },
     502: {
         "model": ErrorResponse,
         "description": "Droid SDK, process, or bridge protocol failure.",
@@ -168,6 +172,7 @@ FACTORY_OPERATION_RESPONSES: dict[int | str, dict[str, Any]] = {
         "model": ErrorResponse,
         "description": "The requested Factory Droid session is unknown to this bridge.",
     },
+    409: CHAT_COMPLETION_RESPONSES[409],
     429: CHAT_COMPLETION_RESPONSES[429],
     502: CHAT_COMPLETION_RESPONSES[502],
     503: CHAT_COMPLETION_RESPONSES[503],
@@ -302,12 +307,26 @@ class SessionRegistry:
     def __init__(self, max_entries: int) -> None:
         self._max_entries = max_entries
         self._sessions: OrderedDict[str, SessionKey] = OrderedDict()
+        self._in_use: set[str] = set()
 
     def remember(self, session_id: str, key: SessionKey) -> None:
         self._sessions.pop(session_id, None)
         self._sessions[session_id] = key
+        self._evict_excess(protected=session_id)
+
+    def _evict_excess(self, *, protected: str | None = None) -> None:
         while len(self._sessions) > self._max_entries:
-            self._sessions.popitem(last=False)
+            candidate = next(
+                (
+                    existing_id
+                    for existing_id in self._sessions
+                    if existing_id not in self._in_use and existing_id != protected
+                ),
+                None,
+            )
+            if candidate is None:
+                return
+            self._sessions.pop(candidate)
 
     def key(self, session_id: str) -> SessionKey | None:
         key = self._sessions.get(session_id)
@@ -318,6 +337,42 @@ class SessionRegistry:
 
     def forget(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)
+
+    def acquire(self, session_id: str) -> SessionUseLease | None:
+        if session_id in self._in_use:
+            return None
+        self._in_use.add(session_id)
+        return SessionUseLease(self, session_id)
+
+    def release(self, session_id: str) -> None:
+        self._in_use.discard(session_id)
+        self._evict_excess()
+
+
+class SessionUseLease:
+    """Keeps one bridge-created Droid session on one operation at a time."""
+
+    def __init__(self, registry: SessionRegistry, session_id: str) -> None:
+        self._registry = registry
+        self._session_id = session_id
+        self._released = False
+
+    async def __aenter__(self) -> SessionUseLease:
+        return self
+
+    async def __aexit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        _exc_value: BaseException | None,
+        _traceback: object,
+    ) -> None:
+        self.release()
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._registry.release(self._session_id)
+        self._released = True
 
 
 class AdmissionLease:
@@ -884,6 +939,17 @@ def create_app(
             )
         return key
 
+    def acquire_session_use(session_id: str) -> SessionUseLease:
+        lease = sessions.acquire(session_id)
+        if lease is None:
+            log_warning("session.rejected", status=409, phase="session_busy")
+            raise BridgeHTTPError(
+                "Factory Droid session is already serving another request.",
+                status_code=409,
+                error_type="invalid_request_error",
+            )
+        return lease
+
     @application.get(
         "/health",
         response_model=HealthResponse,
@@ -981,12 +1047,13 @@ def create_app(
     )
     async def session_context(session_id: str) -> SessionContextResponse:
         require_known_session(session_id)
-        stats, breakdown = await run_factory_operation(
-            lambda runner, remaining: runner.get_context(
-                session_id,
-                timeout_seconds=remaining,
+        async with acquire_session_use(session_id):
+            stats, breakdown = await run_factory_operation(
+                lambda runner, remaining: runner.get_context(
+                    session_id,
+                    timeout_seconds=remaining,
+                )
             )
-        )
         return SessionContextResponse(
             session_id=session_id,
             stats=ContextStatsResponse(
@@ -1026,13 +1093,14 @@ def create_app(
         payload: CompactSessionRequest,
     ) -> CompactSessionResponse:
         key = require_known_session(session_id)
-        result = await run_factory_operation(
-            lambda runner, remaining: runner.compact_session(
-                session_id,
-                custom_instructions=payload.custom_instructions,
-                timeout_seconds=remaining,
+        async with acquire_session_use(session_id):
+            result = await run_factory_operation(
+                lambda runner, remaining: runner.compact_session(
+                    session_id,
+                    custom_instructions=payload.custom_instructions,
+                    timeout_seconds=remaining,
+                )
             )
-        )
         sessions.remember(result.new_session_id, key)
         return CompactSessionResponse(
             session_id=result.new_session_id,
@@ -1049,12 +1117,13 @@ def create_app(
     )
     async def fork_session(session_id: str) -> ForkSessionResponse:
         key = require_known_session(session_id)
-        new_session_id = await run_factory_operation(
-            lambda runner, remaining: runner.fork_session(
-                session_id,
-                timeout_seconds=remaining,
+        async with acquire_session_use(session_id):
+            new_session_id = await run_factory_operation(
+                lambda runner, remaining: runner.fork_session(
+                    session_id,
+                    timeout_seconds=remaining,
+                )
             )
-        )
         sessions.remember(new_session_id, key)
         return ForkSessionResponse(session_id=new_session_id)
 
@@ -1071,13 +1140,14 @@ def create_app(
         payload: RenameSessionRequest,
     ) -> SessionOperationResponse:
         require_known_session(session_id)
-        await run_factory_operation(
-            lambda runner, remaining: runner.rename_session(
-                session_id,
-                title=payload.title,
-                timeout_seconds=remaining,
+        async with acquire_session_use(session_id):
+            await run_factory_operation(
+                lambda runner, remaining: runner.rename_session(
+                    session_id,
+                    title=payload.title,
+                    timeout_seconds=remaining,
+                )
             )
-        )
         return SessionOperationResponse(session_id=session_id, status="renamed")
 
     @application.delete(
@@ -1090,12 +1160,13 @@ def create_app(
     )
     async def close_session(session_id: str) -> SessionOperationResponse:
         require_known_session(session_id)
-        await run_factory_operation(
-            lambda runner, remaining: runner.close_session(
-                session_id,
-                timeout_seconds=remaining,
+        async with acquire_session_use(session_id):
+            await run_factory_operation(
+                lambda runner, remaining: runner.close_session(
+                    session_id,
+                    timeout_seconds=remaining,
+                )
             )
-        )
         sessions.forget(session_id)
         return SessionOperationResponse(session_id=session_id, status="closed")
 
@@ -1246,10 +1317,13 @@ def create_app(
             session_id=session_id,
             output_format=structured.payload if structured is not None else None,
         )
+        session_use = acquire_session_use(session_id) if session_id is not None else None
 
         try:
             lease = await admission.acquire(deadline)
         except AdmissionRejectedError:
+            if session_use is not None:
+                session_use.release()
             metrics.increment_overload_rejections()
             request.state.telemetry_error_type = "rate_limit_error"
             log_warning("chat.rejected", status=429, phase="queue")
@@ -1260,6 +1334,8 @@ def create_app(
                 headers={"Retry-After": str(resolved_settings.retry_after_seconds)},
             )
         except TimeoutError:
+            if session_use is not None:
+                session_use.release()
             request.state.telemetry_error_type = "factory_droid_timeout"
             log_warning(
                 "chat.rejected",
@@ -1272,13 +1348,21 @@ def create_app(
                 504,
                 "factory_droid_timeout",
             )
+        except BaseException:
+            if session_use is not None:
+                session_use.release()
+            raise
 
         log_debug("chat.admitted", queue_ms=timeline.mark("queue_ms"))
 
         try:
             runner = resolved_runner_factory()
         except BaseException:
-            await lease.release()
+            try:
+                await lease.release()
+            finally:
+                if session_use is not None:
+                    session_use.release()
             raise
 
         if session_id is None:
@@ -1301,6 +1385,21 @@ def create_app(
 
         if payload.stream:
             request.state.stream_outcome = "pending"
+            started_stream_session: str | None = None
+
+            def record_started_session(started_id: str) -> None:
+                nonlocal started_stream_session
+                started_stream_session = started_id
+
+            def record_stream_outcome(outcome: str) -> None:
+                request.state.stream_outcome = outcome
+                if started_stream_session is not None and outcome in {
+                    "success",
+                    "truncated",
+                    "malformed",
+                }:
+                    sessions.remember(started_stream_session, requested_key)
+
             event_stream = _stream_completion(
                 request_id=request_id,
                 created=created,
@@ -1311,18 +1410,11 @@ def create_app(
                 lease=lease,
                 metrics=metrics,
                 request_started_at=request_started_at,
-                outcome_callback=lambda outcome: setattr(
-                    request.state,
-                    "stream_outcome",
-                    outcome,
-                ),
+                outcome_callback=record_stream_outcome,
                 include_usage=bool(payload.stream_options and payload.stream_options.include_usage),
                 stop_sequences=payload.stop_sequences,
                 emit_status=payload.factory_droid_status,
-                session_callback=lambda started_id: sessions.remember(
-                    started_id,
-                    requested_key,
-                ),
+                session_callback=record_started_session,
                 expose_session=resolved_settings.session_continuity,
                 structured=structured,
                 failure_callback=note_runner_failure,
@@ -1339,6 +1431,7 @@ def create_app(
                     warm_session=run_request.warm_session,
                     reaper=reaper,
                     runner_factory=resolved_runner_factory,
+                    session_use=session_use,
                 ),
                 headers={
                     "Cache-Control": "no-cache",
@@ -1404,6 +1497,9 @@ def create_app(
             log_warning("chat.failed", status=exc.status_code, error_type=exc.error_type)
             note_runner_failure(payload.model, exc)
             return _error_response(str(exc), exc.status_code, exc.error_type)
+        finally:
+            if session_use is not None:
+                session_use.release()
 
         log_info(
             "chat.completed",
@@ -2031,6 +2127,7 @@ async def _finalize_stream(
     warm_session: WarmSession | None = None,
     reaper: BackgroundReaper | None = None,
     runner_factory: RunnerFactory | None = None,
+    session_use: SessionUseLease | None = None,
 ) -> None:
     close = getattr(stream, "aclose", None)
     try:
@@ -2048,7 +2145,11 @@ async def _finalize_stream(
             # The stream was discarded before the run started, so nothing else
             # will tear this session down.
             reaper.submit(runner_factory().discard(warm_session))
-        await lease.release()
+        try:
+            await lease.release()
+        finally:
+            if session_use is not None:
+                session_use.release()
 
 
 def _apply_emissions(
