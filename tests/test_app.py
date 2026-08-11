@@ -835,15 +835,18 @@ async def test_streaming_recovers_tool_call_without_close_marker(tmp_path: Path)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
-async def test_partial_close_marker_recovers_tool_call(
+@pytest.mark.parametrize("close_prefix_length", range(len(TOOL_CALL_CLOSE)))
+async def test_every_partial_close_marker_recovers_tool_call(
     tmp_path: Path,
     stream: bool,
+    close_prefix_length: int,
 ) -> None:
     runner = FakeRunner(
         [
+            ReasoningDelta("planning"),
             TextDelta(
                 f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Hel"}}}}'
-                f"{TOOL_CALL_CLOSE[:-1]}"
+                f"{TOOL_CALL_CLOSE[:close_prefix_length]}"
             ),
             RunComplete(Usage()),
         ]
@@ -872,12 +875,19 @@ async def test_partial_close_marker_recovers_tool_call(
         tool_calls = [
             call for event in events for call in event["choices"][0]["delta"].get("tool_calls", [])
         ]
+        reasoning = "".join(
+            event["choices"][0]["delta"].get("reasoning", "")
+            for event in events
+            if event["choices"]
+        )
     else:
         choice = response.json()["choices"][0]
         tool_calls = choice["message"]["tool_calls"]
+        reasoning = choice["message"]["reasoning"]
     assert choice["finish_reason"] == "tool_calls"
     assert len(tool_calls) == 1
     assert json.loads(tool_calls[0]["function"]["arguments"]) == {"city": "Hel"}
+    assert reasoning == "planning"
 
 
 @pytest.mark.asyncio

@@ -229,6 +229,94 @@ async def test_official_openai_client_parses_function_tool_call(
 
 
 @pytest.mark.asyncio
+async def test_official_openai_client_recovers_partial_tool_close(
+    tmp_path: Path,
+) -> None:
+    marker = (
+        f'{TOOL_CALL_OPEN}{{"name":"get_weather","arguments":{{"city":"Gdansk"}}}}'
+        f"{TOOL_CALL_CLOSE[:-1]}"
+    )
+    runner = ScriptedRunner([TextDelta(marker), RunComplete(Usage())])
+    client, http_client = _sdk_client(tmp_path, runner)
+    async with http_client:
+        completion = await client.chat.completions.create(
+            model="factory-droid",
+            messages=[{"role": "user", "content": "Check the weather"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+        )
+
+    message = completion.choices[0].message
+    assert completion.choices[0].finish_reason == "tool_calls"
+    assert message.content is None
+    assert message.tool_calls is not None
+    assert len(message.tool_calls) == 1
+    tool_call = message.tool_calls[0]
+    assert tool_call.type == "function"
+    assert tool_call.function.name == "get_weather"
+    assert tool_call.function.arguments == '{"city":"Gdansk"}'
+
+
+@pytest.mark.asyncio
+async def test_official_openai_stream_recovers_partial_tool_close(
+    tmp_path: Path,
+) -> None:
+    marker = (
+        f'{TOOL_CALL_OPEN}{{"name":"get_weather","arguments":{{"city":"Gdansk"}}}}'
+        f"{TOOL_CALL_CLOSE[:-1]}"
+    )
+    runner = ScriptedRunner([TextDelta(marker), RunComplete(Usage())])
+    client, http_client = _sdk_client(tmp_path, runner)
+    async with http_client:
+        stream = await client.chat.completions.create(
+            model="factory-droid",
+            messages=[{"role": "user", "content": "Check the weather"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+            stream=True,
+        )
+        chunks = [chunk async for chunk in stream]
+
+    tool_calls = [
+        call
+        for chunk in chunks
+        for choice in chunk.choices
+        for call in choice.delta.tool_calls or ()
+    ]
+    finish_reasons = [
+        choice.finish_reason
+        for chunk in chunks
+        for choice in chunk.choices
+        if choice.finish_reason is not None
+    ]
+    assert finish_reasons == ["tool_calls"]
+    assert len(tool_calls) == 1
+    assert tool_calls[0].function is not None
+    assert tool_calls[0].function.name == "get_weather"
+    assert tool_calls[0].function.arguments == '{"city":"Gdansk"}'
+
+
+@pytest.mark.asyncio
 async def test_official_openai_client_parses_payload_limit_error(
     tmp_path: Path,
 ) -> None:
