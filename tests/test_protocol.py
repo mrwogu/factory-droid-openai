@@ -1773,6 +1773,23 @@ def test_stream_parser_translates_kimi_sections() -> None:
     assert json.loads(emissions[0].arguments) == {"city": "Gdansk"}
 
 
+def test_stream_parser_recovers_kimi_call_with_partial_section_close() -> None:
+    for split in range(1, len(_KIMI_SECTION_CLOSE)):
+        parser = ToolCallStreamParser(frozenset({"weather"}))
+
+        assert (
+            parser.feed(
+                f"{_KIMI_SECTION_OPEN}{_KIMI_CALL}{_KIMI_SECTION_CLOSE[:split]}",
+            )
+            == []
+        )
+        emissions = parser.finish()
+
+        assert len(emissions) == 1
+        assert isinstance(emissions[0], ToolCallEmission)
+        assert json.loads(emissions[0].arguments) == {"city": "Gdansk"}
+
+
 def test_stream_parser_translates_multiple_kimi_calls() -> None:
     parser = ToolCallStreamParser(frozenset({"weather"}), max_tool_calls=2)
 
@@ -2314,6 +2331,38 @@ def test_stream_parser_recovers_tool_call_without_close_marker() -> None:
     assert len(emissions) == 1
     assert isinstance(emissions[0], ToolCallEmission)
     assert json.loads(emissions[0].arguments) == {"city": "Hel"}
+
+
+def test_stream_parser_recovers_tool_call_with_partial_close_marker() -> None:
+    payload = '{"name":"weather","arguments":{"city":"Hel"}}'
+
+    for split in range(1, len(TOOL_CALL_CLOSE)):
+        parser = ToolCallStreamParser(frozenset({"weather"}))
+
+        assert (
+            parser.feed(
+                f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE[:split]}",
+            )
+            == []
+        )
+        emissions = parser.finish()
+
+        assert len(emissions) == 1
+        assert isinstance(emissions[0], ToolCallEmission)
+        assert json.loads(emissions[0].arguments) == {"city": "Hel"}
+
+
+def test_stream_parser_counts_partial_close_marker_in_incomplete_payload() -> None:
+    payload = '{"name":"weather","arguments":{"city":"Hel"'
+    partial_close = TOOL_CALL_CLOSE[:-1]
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    parser.feed(f"{TOOL_CALL_OPEN}{payload}{partial_close}")
+
+    with pytest.raises(IncompleteToolCallError) as excinfo:
+        parser.finish()
+
+    assert excinfo.value.payload_bytes == len((payload + partial_close).encode("utf-8"))
 
 
 def test_recovered_tool_call_satisfies_a_required_tool_call() -> None:
