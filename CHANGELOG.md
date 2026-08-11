@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.6.7](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.6...v1.6.7) (2026-08-11)
+
+
+### Bug Fixes
+
+* **protocol:** recover mismatched GLM close token ([2c0e2d9](https://github.com/mrwogu/factory-droid-openai/commit/2c0e2d9d5233af7653c5184194ea780050fe70e6))
+* **protocol:** recover partial closing markers ([9f5dcb4](https://github.com/mrwogu/factory-droid-openai/commit/9f5dcb4903ab582d099509b1521f259ad6a3fa4e))
+
 ## [1.6.6](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.5...v1.6.6) (2026-08-10)
 
 
