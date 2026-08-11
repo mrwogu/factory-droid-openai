@@ -527,6 +527,24 @@ def _decode_json_object(raw: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _decode_json_arg_value_close(
+    body: str,
+    allowed_tool_names: frozenset[str],
+) -> list[dict[str, Any]] | None:
+    """Repairs strict JSON followed by GLM's mismatched value-close token."""
+    stripped = body.strip()
+    if not stripped.endswith(_ARG_VALUE_CLOSE):
+        return None
+    candidate = stripped[: -len(_ARG_VALUE_CLOSE)].rstrip()
+    try:
+        parsed = parse_strict_json(candidate)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, dict) or parsed.get("name") not in allowed_tool_names:
+        return None
+    return [parsed]
+
+
 def _decode_arg_key_value(
     body: str,
     allowed_tool_names: frozenset[str],  # noqa: ARG001 - uniform decoder signature
@@ -787,6 +805,7 @@ PAYLOAD_DECODERS: tuple[PayloadDecoder, ...] = (
     PayloadDecoder("harmony_commentary", _decode_harmony_commentary),
     PayloadDecoder("deepseek_calls", _decode_deepseek_calls),
     PayloadDecoder("function_parameter_tags", _decode_function_parameter_tags),
+    PayloadDecoder("json_arg_value_close", _decode_json_arg_value_close),
     PayloadDecoder("arg_key_value", _decode_arg_key_value),
     PayloadDecoder("python_call", _decode_python_call),
     PayloadDecoder("arg_key_value_repair", _decode_arg_key_value_repair),

@@ -2352,6 +2352,53 @@ def test_stream_parser_recovers_tool_call_with_partial_close_marker() -> None:
         assert json.loads(emissions[0].arguments) == {"city": "Hel"}
 
 
+@pytest.mark.parametrize("close_marker", ["", TOOL_CALL_CLOSE])
+def test_stream_parser_recovers_json_with_glm_value_close(close_marker: str) -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    emissions = parser.feed(
+        f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Gdansk"}}}}'
+        f"</arg_value>{close_marker}"
+    )
+
+    emissions.extend(parser.finish())
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == {"city": "Gdansk"}
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "</arg_key>",
+        "</arg_value>junk",
+        "junk</arg_value>",
+        "</arg_value></arg_value>",
+    ],
+)
+def test_stream_parser_rejects_other_json_close_residue(suffix: str) -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    parser.feed(f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Gdansk"}}}}{suffix}')
+
+    with pytest.raises(IncompleteToolCallError):
+        parser.finish()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "[]</arg_value>",
+        '{"name":"unknown","arguments":{}}</arg_value>',
+    ],
+)
+def test_stream_parser_rejects_invalid_glm_value_close_payloads(payload: str) -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    parser.feed(f"{TOOL_CALL_OPEN}{payload}")
+
+    with pytest.raises(IncompleteToolCallError):
+        parser.finish()
+
+
 def test_stream_parser_counts_partial_close_marker_in_incomplete_payload() -> None:
     payload = '{"name":"weather","arguments":{"city":"Hel"'
     partial_close = TOOL_CALL_CLOSE[:-1]

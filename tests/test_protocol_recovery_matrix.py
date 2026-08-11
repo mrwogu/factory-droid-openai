@@ -85,6 +85,11 @@ _DECODER_FIXTURES = (
         {"city": "Gdansk"},
     ),
     RecoveryFixture(
+        "json_arg_value_close",
+        _NATIVE_CALL + "</arg_value>",
+        {"city": "Gdansk"},
+    ),
+    RecoveryFixture(
         "arg_key_value",
         "weather<arg_key>city</arg_key><arg_value>Gdansk</arg_value>",
         {"city": "Gdansk"},
@@ -224,13 +229,14 @@ def test_every_decoder_recovers_from_every_partial_native_close_marker(
     fixture: RecoveryFixture,
 ) -> None:
     for prefix_length in range(len(TOOL_CALL_CLOSE)):
-        variants: list[str] = []
-        parser = ToolCallStreamParser(
-            frozenset({"weather"}),
-            trace_payload=_variant_tracer(variants),
-        )
-        emissions = parser.feed(TOOL_CALL_OPEN + fixture.payload + TOOL_CALL_CLOSE[:prefix_length])
-        assert emissions == []
+        stream = TOOL_CALL_OPEN + fixture.payload + TOOL_CALL_CLOSE[:prefix_length]
+        for chunk_size in _CHUNK_SIZES:
+            variants: list[str] = []
+            parser = ToolCallStreamParser(
+                frozenset({"weather"}),
+                trace_payload=_variant_tracer(variants),
+            )
+            assert _feed_in_chunks(parser, stream, chunk_size) == []
 
-        _assert_tool_call(parser.finish(), fixture.expected_arguments)
-        assert variants == [fixture.name]
+            _assert_tool_call(parser.finish(), fixture.expected_arguments)
+            assert variants == [fixture.name]

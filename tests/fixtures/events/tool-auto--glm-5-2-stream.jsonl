@@ -1,0 +1,8 @@
+{"kind": "meta", "scenario": "tool_auto", "stream": true, "recorded_model": "glm-5.2", "expect_verdict": "pass"}
+{"kind": "session_started"}
+{"kind": "status", "state": "streaming_assistant_message"}
+{"kind": "usage", "usage": {"prompt_tokens": 709, "completion_tokens": 27, "total_tokens": 736, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "usage", "usage": {"prompt_tokens": 709, "completion_tokens": 27, "total_tokens": 736, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"kind": "text_delta", "text": "<tool_call>{\"name\":\"weather\",\"arguments\":{\"city\":\"Gdansk\"}}</arg_value>"}
+{"kind": "status", "state": "idle"}
+{"kind": "run_complete", "usage": {"prompt_tokens": 709, "completion_tokens": 27, "total_tokens": 736, "prompt_tokens_details": {"cached_tokens": 0}}}
