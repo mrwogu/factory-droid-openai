@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.8](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.7...v1.6.8) (2026-08-11)
+
+
+### Bug Fixes
+
+* **runtime:** harden tool calls and sessions ([f5ff63d](https://github.com/mrwogu/factory-droid-openai/commit/f5ff63ddce763add34d8c465acda01e271e3519c))
+
 ## [1.6.7](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.6...v1.6.7) (2026-08-11)
 
 
