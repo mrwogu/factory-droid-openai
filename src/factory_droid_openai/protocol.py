@@ -676,7 +676,8 @@ class ToolCallStreamParser:
 
     def _recover_unclosed_tool_call(self) -> list[dict[str, Any]] | None:
         """Repairs a tool call whose closing marker never arrived."""
-        payload = "".join(self._payload_chunks) + self._close_tail
+        # A held suffix is a verified close-marker prefix, not payload data.
+        payload = "".join(self._payload_chunks)
         try:
             objects = self._tool_payload_objects(payload)
         except ProtocolError:

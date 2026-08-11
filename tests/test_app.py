@@ -834,6 +834,53 @@ async def test_streaming_recovers_tool_call_without_close_marker(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_partial_close_marker_recovers_tool_call(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    runner = FakeRunner(
+        [
+            TextDelta(
+                f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Hel"}}}}'
+                f"{TOOL_CALL_CLOSE[:-1]}"
+            ),
+            RunComplete(Usage()),
+        ]
+    )
+    payload = _payload(
+        stream=stream,
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ],
+    )
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    if stream:
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and not line.endswith("[DONE]")
+        ]
+        choice = events[-1]["choices"][0]
+        tool_calls = [
+            call for event in events for call in event["choices"][0]["delta"].get("tool_calls", [])
+        ]
+    else:
+        choice = response.json()["choices"][0]
+        tool_calls = choice["message"]["tool_calls"]
+    assert choice["finish_reason"] == "tool_calls"
+    assert len(tool_calls) == 1
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {"city": "Hel"}
+
+
+@pytest.mark.asyncio
 async def test_streaming_tool_call_does_not_need_turn_complete(tmp_path: Path) -> None:
     runner = FakeRunner(
         [
