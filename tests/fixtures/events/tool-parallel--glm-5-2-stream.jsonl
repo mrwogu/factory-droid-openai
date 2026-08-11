@@ -1,0 +1,6 @@
+{"kind": "meta", "scenario": "tool_parallel", "stream": true, "recorded_model": "glm-5.2", "expect_verdict": "pass", "provenance": "reconstructed"}
+{"kind": "session_started"}
+{"kind": "status", "state": "streaming_assistant_message"}
+{"kind": "text_delta", "text": "<tool_call>{\"name\":\"weather\",\"arguments\":{\"city\":\"Gdansk\"}}</arg_value><tool_call>{\"name\":\"clock\",\"arguments\":{\"city\":\"Gdansk\"}}</arg_value>"}
+{"kind": "status", "state": "idle"}
+{"kind": "run_complete", "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "prompt_tokens_details": {"cached_tokens": 0}}}

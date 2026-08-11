@@ -123,7 +123,7 @@
           "max_completion_tokens": {
             "anyOf": [
               {
-                "exclusiveMinimum": 0,
+                "exclusiveMinimum": 0.0,
                 "type": "integer"
               },
               {
@@ -135,7 +135,7 @@
           "max_tokens": {
             "anyOf": [
               {
-                "exclusiveMinimum": 0,
+                "exclusiveMinimum": 0.0,
                 "type": "integer"
               },
               {
@@ -157,7 +157,7 @@
           },
           "n": {
             "default": 1,
-            "minimum": 1,
+            "minimum": 1.0,
             "title": "N",
             "type": "integer"
           },
@@ -237,7 +237,7 @@
           "timeout": {
             "anyOf": [
               {
-                "exclusiveMinimum": 0,
+                "exclusiveMinimum": 0.0,
                 "type": "number"
               },
               {
@@ -1103,6 +1103,16 @@
             },
             "description": "The requested Factory Droid session is unknown to this bridge."
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The requested Factory Droid session is already in use."
+          },
           "413": {
             "content": {
               "application/json": {
@@ -1130,6 +1140,16 @@
                 }
               }
             }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
           },
           "502": {
             "content": {
@@ -1160,16 +1180,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1218,6 +1228,16 @@
             },
             "description": "The requested Factory Droid session is unknown to this bridge."
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The requested Factory Droid session is already in use."
+          },
           "429": {
             "content": {
               "application/json": {
@@ -1235,6 +1255,16 @@
                 }
               }
             }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
           },
           "502": {
             "content": {
@@ -1265,16 +1295,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1331,6 +1351,16 @@
             },
             "description": "The requested Factory Droid session is unknown to this bridge."
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The requested Factory Droid session is already in use."
+          },
           "429": {
             "content": {
               "application/json": {
@@ -1348,6 +1378,16 @@
                 }
               }
             }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
           },
           "502": {
             "content": {
@@ -1378,16 +1418,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1446,6 +1476,16 @@
             },
             "description": "The requested Factory Droid session is unknown to this bridge."
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The requested Factory Droid session is already in use."
+          },
           "429": {
             "content": {
               "application/json": {
@@ -1463,6 +1503,16 @@
                 }
               }
             }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
           },
           "502": {
             "content": {
@@ -1493,16 +1543,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1551,6 +1591,16 @@
             },
             "description": "The requested Factory Droid session is unknown to this bridge."
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The requested Factory Droid session is already in use."
+          },
           "429": {
             "content": {
               "application/json": {
@@ -1568,6 +1618,16 @@
                 }
               }
             }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
           },
           "502": {
             "content": {
@@ -1598,16 +1658,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1656,6 +1706,16 @@
             },
             "description": "The requested Factory Droid session is unknown to this bridge."
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The requested Factory Droid session is already in use."
+          },
           "429": {
             "content": {
               "application/json": {
@@ -1673,6 +1733,16 @@
                 }
               }
             }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
           },
           "502": {
             "content": {
@@ -1703,16 +1773,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1748,6 +1808,16 @@
               }
             }
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The requested Factory Droid session is already in use."
+          },
           "429": {
             "content": {
               "application/json": {
@@ -1765,6 +1835,16 @@
                 }
               }
             }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
           },
           "502": {
             "content": {
@@ -1795,16 +1875,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1861,6 +1931,16 @@
             },
             "description": "The requested model is unknown to this bridge."
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The requested Factory Droid session is already in use."
+          },
           "429": {
             "content": {
               "application/json": {
@@ -1878,6 +1958,16 @@
                 }
               }
             }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
           },
           "502": {
             "content": {
@@ -1908,16 +1998,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [

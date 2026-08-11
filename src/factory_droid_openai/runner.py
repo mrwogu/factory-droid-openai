@@ -433,6 +433,8 @@ class DroidRunner:
         initialized = warm is not None
         completed = False
         ignored_native_tool = False
+        saw_assistant_text = False
+        unmapped_event_kind: str | None = None
         usage = Usage()
 
         try:
@@ -528,6 +530,7 @@ class DroidRunner:
                     if log_enabled(_TRACE_LEVEL):
                         log_trace("droid.event", kind=type(event).__name__)
                     if isinstance(event, AssistantTextDelta):
+                        saw_assistant_text = saw_assistant_text or bool(event.text)
                         yield TextDelta(event.text)
                     elif isinstance(event, ThinkingTextDelta):
                         yield ReasoningDelta(event.text)
@@ -537,6 +540,18 @@ class DroidRunner:
                         usage = _map_usage(event)
                         yield UsageUpdate(usage)
                     elif isinstance(event, TurnComplete):
+                        if not saw_assistant_text and (
+                            ignored_native_tool or unmapped_event_kind is not None
+                        ):
+                            reason = (
+                                "a disabled Droid meta-tool attempt"
+                                if ignored_native_tool
+                                else f"unmapped SDK event {unmapped_event_kind!r}"
+                            )
+                            raise RunnerError(
+                                f"Factory Droid completed without assistant output after {reason}.",
+                                error_type="factory_incomplete_response",
+                            )
                         if event.token_usage is not None:
                             usage = _map_usage(event.token_usage)
                         completed = True
@@ -577,6 +592,9 @@ class DroidRunner:
                             event,
                             model=_resolve_model_id(request.model, request.model_alias),
                         )
+                    else:
+                        unmapped_event_kind = type(event).__name__
+                        log_debug("droid.event_unmapped", kind=unmapped_event_kind)
         except (TimeoutError, DroidTimeoutError) as exc:
             raise RunnerError(
                 f"Factory Droid timed out after {loop.time() - started:.1f} seconds.",

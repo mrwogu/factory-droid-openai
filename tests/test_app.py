@@ -976,6 +976,60 @@ async def test_tool_call_drain_keeps_usage_reported_by_the_sdk(tmp_path: Path) -
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
+async def test_tool_call_drain_keeps_delayed_parallel_calls(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    class DelayedParallelRunner(FakeRunner):
+        async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
+            self.requests.append(request)
+            try:
+                for city in ("Gdansk", "Sopot"):
+                    call = json.dumps(
+                        {"name": "weather", "arguments": {"city": city}},
+                        separators=(",", ":"),
+                    )
+                    yield TextDelta(f"{TOOL_CALL_OPEN}{call}{TOOL_CALL_CLOSE}")
+                    await asyncio.sleep(0.01)
+                await asyncio.Event().wait()
+            finally:
+                self.closed = True
+
+    runner = DelayedParallelRunner([])
+    app = _feature_app(tmp_path, runner, tool_call_drain_seconds=0.05)
+    payload = _payload(
+        stream=stream,
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ],
+    )
+
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    if stream:
+        calls = [
+            call
+            for line in response.text.splitlines()
+            if line.startswith("data: {")
+            for choice in json.loads(line.removeprefix("data: "))["choices"]
+            for call in choice["delta"].get("tool_calls", [])
+        ]
+    else:
+        calls = response.json()["choices"][0]["message"]["tool_calls"]
+    assert [json.loads(call["function"]["arguments"])["city"] for call in calls] == [
+        "Gdansk",
+        "Sopot",
+    ]
+    assert runner.closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
 async def test_backend_timeout_after_tool_call_returns_the_call(
     tmp_path: Path,
     stream: bool,
@@ -1332,9 +1386,11 @@ async def test_bounded_queue_rejects_overload_before_stream_headers(
             max_concurrency=1,
             max_queue_size=1,
             retry_after_seconds=2,
+            session_continuity=True,
         ),
         runner_factory=cast("RunnerFactory", lambda: runner),
     )
+    app.state.sessions.remember("session-rejected", SessionKey(None, None))
     async with _client(app) as client:
         active = asyncio.create_task(client.post("/v1/chat/completions", json=_payload()))
         await runner.started.wait()
@@ -1345,7 +1401,10 @@ async def test_bounded_queue_rejects_overload_before_stream_headers(
 
         rejected = await client.post(
             "/v1/chat/completions",
-            json=_payload(stream=True),
+            json=_payload(
+                stream=True,
+                factory_droid_session_id="session-rejected",
+            ),
         )
 
         assert rejected.status_code == 429
@@ -1354,10 +1413,20 @@ async def test_bounded_queue_rejects_overload_before_stream_headers(
         runner.release.set()
         assert (await active).status_code == 200
         assert (await queued).status_code == 200
+        retried = await client.post(
+            "/v1/chat/completions",
+            json=_payload(factory_droid_session_id="session-rejected"),
+        )
+
+    assert retried.status_code == 200
 
 
 @pytest.mark.asyncio
-async def test_queue_wait_consumes_end_to_end_timeout(tmp_path: Path) -> None:
+@pytest.mark.parametrize("use_session", [False, True])
+async def test_queue_wait_consumes_end_to_end_timeout(
+    tmp_path: Path,
+    use_session: bool,
+) -> None:
     runner = GateRunner()
     app = create_app(
         Settings(
@@ -1365,16 +1434,24 @@ async def test_queue_wait_consumes_end_to_end_timeout(tmp_path: Path) -> None:
             timeout_seconds=30,
             max_concurrency=1,
             max_queue_size=1,
+            session_continuity=True,
         ),
         runner_factory=cast("RunnerFactory", lambda: runner),
     )
+    timed_payload = _payload(timeout=0.02)
+    if use_session:
+        app.state.sessions.remember("session-timeout", SessionKey(None, None))
+        timed_payload = _payload(
+            timeout=0.02,
+            factory_droid_session_id="session-timeout",
+        )
     async with _client(app) as client:
         active = asyncio.create_task(client.post("/v1/chat/completions", json=_payload()))
         await runner.started.wait()
 
         timed_out = await client.post(
             "/v1/chat/completions",
-            json=_payload(timeout=0.02),
+            json=timed_payload,
         )
 
         assert timed_out.status_code == 504
@@ -1382,6 +1459,12 @@ async def test_queue_wait_consumes_end_to_end_timeout(tmp_path: Path) -> None:
         assert len(runner.requests) == 1
         runner.release.set()
         assert (await active).status_code == 200
+        retried = await client.post(
+            "/v1/chat/completions",
+            json=timed_payload,
+        )
+
+    assert retried.status_code == 200
 
 
 @pytest.mark.asyncio
@@ -2887,6 +2970,92 @@ async def test_session_id_round_trips_and_drives_a_continuation(
 
 
 @pytest.mark.asyncio
+async def test_concurrent_session_uses_return_conflict_and_release_the_lease(
+    tmp_path: Path,
+) -> None:
+    runner = GateRunner()
+    app = _feature_app(
+        tmp_path,
+        runner,
+        session_continuity=True,
+        max_concurrency=3,
+        max_queue_size=0,
+    )
+    app.state.sessions.remember("session-77", SessionKey(None, None))
+    continuation = _payload(factory_droid_session_id="session-77")
+
+    async with _client(app) as client:
+        active = asyncio.create_task(client.post("/v1/chat/completions", json=continuation))
+        await runner.started.wait()
+
+        duplicate = await client.post("/v1/chat/completions", json=continuation)
+        context = await client.get("/v1/factory/sessions/session-77/context")
+
+        runner.release.set()
+        completed = await active
+        retried = await client.post("/v1/chat/completions", json=continuation)
+
+    assert duplicate.status_code == 409
+    assert context.status_code == 409
+    assert duplicate.json()["error"]["type"] == "invalid_request_error"
+    assert context.json()["error"]["type"] == "invalid_request_error"
+    assert completed.status_code == 200
+    assert retried.status_code == 200
+    assert len(runner.requests) == 2
+    assert runner.session_operations == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_session", [False, True])
+async def test_cancelled_admission_wait_releases_the_session_lease(
+    tmp_path: Path,
+    use_session: bool,
+) -> None:
+    runner = GateRunner()
+    app = _feature_app(
+        tmp_path,
+        runner,
+        session_continuity=True,
+        max_concurrency=1,
+        max_queue_size=1,
+    )
+    app.state.sessions.remember("session-active", SessionKey(None, None))
+    queued_payload = _payload()
+    if use_session:
+        app.state.sessions.remember("session-queued", SessionKey(None, None))
+        queued_payload = _payload(factory_droid_session_id="session-queued")
+
+    async with _client(app) as client:
+        active = asyncio.create_task(
+            client.post(
+                "/v1/chat/completions",
+                json=_payload(factory_droid_session_id="session-active"),
+            )
+        )
+        await runner.started.wait()
+        queued = asyncio.create_task(
+            client.post(
+                "/v1/chat/completions",
+                json=queued_payload,
+            )
+        )
+        await _wait_for_metric(app, "factory_droid_openai_queued_requests 1")
+
+        queued.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await queued
+
+        runner.release.set()
+        assert (await active).status_code == 200
+        retried = await client.post(
+            "/v1/chat/completions",
+            json=queued_payload,
+        )
+
+    assert retried.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_session_continuation_rejects_settings_switches(tmp_path: Path) -> None:
     runner = FakeRunner(
         [
@@ -2987,6 +3156,24 @@ async def test_streaming_session_id_is_announced_when_continuity_is_enabled(
         )
 
     assert '"factory_droid_session_id":"session-5"' in response.text
+    assert app.state.sessions.key("session-5") == SessionKey(None, None)
+
+
+@pytest.mark.asyncio
+async def test_failed_stream_does_not_register_its_started_session(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner([SessionStarted("session-failed"), TextDelta("partial")])
+    app = _feature_app(tmp_path, runner, session_continuity=True)
+
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(stream=True),
+        )
+
+    assert '"type":"factory_incomplete_response"' in response.text
+    assert app.state.sessions.key("session-failed") is None
 
 
 @pytest.mark.asyncio
@@ -3558,6 +3745,65 @@ def test_session_registry_ignores_duplicate_entries() -> None:
     assert registry.key("missing") is None
 
 
+def test_session_registry_does_not_evict_a_session_in_use() -> None:
+    registry = SessionRegistry(2)
+    key_a = SessionKey("model-a", None)
+    key_b = SessionKey("model-b", None)
+    key_c = SessionKey("model-c", None)
+    registry.remember("a", key_a)
+    registry.remember("b", key_b)
+    lease = registry.acquire("a")
+    assert lease is not None
+
+    registry.remember("c", key_c)
+
+    assert registry.key("a") == key_a
+    assert registry.key("b") is None
+    assert registry.key("c") == key_c
+    lease.release()
+
+
+def test_session_registry_defers_eviction_until_a_busy_session_releases() -> None:
+    registry = SessionRegistry(2)
+    keys = {session_id: SessionKey(f"model-{session_id}", None) for session_id in ("a", "b", "c")}
+    registry.remember("a", keys["a"])
+    registry.remember("b", keys["b"])
+    first = registry.acquire("a")
+    second = registry.acquire("b")
+    assert first is not None
+    assert second is not None
+
+    registry.remember("c", keys["c"])
+    assert registry.key("a") == keys["a"]
+    assert registry.key("b") == keys["b"]
+    assert registry.key("c") == keys["c"]
+
+    first.release()
+    assert registry.key("a") is None
+    assert registry.key("b") == keys["b"]
+    assert registry.key("c") == keys["c"]
+    second.release()
+
+
+@pytest.mark.asyncio
+async def test_session_registry_lease_is_exclusive_and_idempotent() -> None:
+    registry = SessionRegistry(2)
+    registry.remember("a", SessionKey("model-a", None))
+
+    first = registry.acquire("a")
+    assert first is not None
+    assert registry.acquire("a") is None
+
+    first.release()
+    first.release()
+    second = registry.acquire("a")
+    assert second is not None
+    async with second:
+        assert registry.acquire("a") is None
+
+    assert registry.acquire("a") is not None
+
+
 @pytest.mark.asyncio
 async def test_request_limit_middleware_passes_non_http_scopes_through() -> None:
     seen: list[str] = []
@@ -4064,6 +4310,35 @@ async def test_runner_factory_failure_releases_the_admission_slot(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_runner_factory_failure_releases_the_session_lease(tmp_path: Path) -> None:
+    attempts = 0
+
+    def factory() -> Any:
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("no droid runner")
+
+    app = create_app(
+        Settings(
+            workdir=tmp_path,
+            session_continuity=True,
+            max_concurrency=1,
+            max_queue_size=0,
+        ),
+        runner_factory=cast("RunnerFactory", factory),
+    )
+    app.state.sessions.remember("session-1", SessionKey(None, None))
+    payload = _payload(factory_droid_session_id="session-1")
+
+    async with _client(app) as client:
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="no droid runner"):
+                await client.post("/v1/chat/completions", json=payload)
+
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
 async def test_non_streaming_request_answers_499_when_the_client_disconnects(
     tmp_path: Path,
 ) -> None:
@@ -4247,16 +4522,23 @@ async def test_stream_finalizer_accepts_a_stream_without_aclose() -> None:
     metrics = BridgeMetrics()
     admission = AdmissionController(max_concurrency=1, max_queue_size=1, metrics=metrics)
     lease = await admission.acquire(asyncio.get_running_loop().time() + 30)
+    registry = SessionRegistry(1)
+    registry.remember("session-1", SessionKey(None, None))
+    session_use = registry.acquire("session-1")
+    assert session_use is not None
+    assert registry.acquire("session-1") is None
     request = SimpleNamespace(state=SimpleNamespace(stream_outcome="pending"))
 
     await _finalize_stream(
         cast("Any", SimpleNamespace(aclose=None)),
         lease,
         cast("Any", request),
+        session_use=session_use,
     )
 
     assert request.state.stream_outcome == "cancelled"
     assert "factory_droid_openai_active_sessions 0" in metrics.render()
+    assert registry.acquire("session-1") is not None
 
 
 def test_request_outcome_falls_back_to_the_status_code() -> None:

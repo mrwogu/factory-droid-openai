@@ -294,6 +294,32 @@ async def test_runner_lets_droid_meta_tools_pass(tmp_path: Path, tool_name: str)
 
 
 @pytest.mark.asyncio
+async def test_runner_rejects_a_meta_tool_only_completion(tmp_path: Path) -> None:
+    client = FakeClient(
+        [
+            ToolUse(
+                tool_name="ToolSearch",
+                tool_input={"query": "select:weather"},
+                tool_use_id="meta-call",
+            ),
+            ToolResult(tool_name="", content="tool disabled", is_error=True),
+            TurnComplete(token_usage=None),
+        ]
+    )
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    with pytest.raises(RunnerError, match="without assistant output") as error:
+        _ = [event async for event in runner.run(_request())]
+
+    assert error.value.error_type == "factory_incomplete_response"
+    assert client.interrupted is True
+
+
+@pytest.mark.asyncio
 async def test_runner_blocks_an_unattributed_tool_result(tmp_path: Path) -> None:
     client = FakeClient([ToolResult(tool_name="", content="", is_error=False)])
     runner = DroidRunner(
@@ -1634,7 +1660,13 @@ async def test_runner_maps_events_without_trace_logging(
 
 @pytest.mark.asyncio
 async def test_runner_ignores_sdk_events_it_does_not_map(tmp_path: Path) -> None:
-    client = FakeClient([SimpleNamespace(kind="unknown"), TurnComplete()])
+    client = FakeClient(
+        [
+            SimpleNamespace(kind="unknown"),
+            AssistantTextDelta("done"),
+            TurnComplete(),
+        ]
+    )
     runner = DroidRunner(
         droid_path="droid",
         workdir=tmp_path,
@@ -1643,7 +1675,27 @@ async def test_runner_ignores_sdk_events_it_does_not_map(tmp_path: Path) -> None
 
     events = await _collect(runner, _request())
 
-    assert events == [SessionStarted("session-1"), RunComplete(usage=Usage())]
+    assert events == [
+        SessionStarted("session-1"),
+        TextDelta("done"),
+        RunComplete(usage=Usage()),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runner_rejects_an_unmapped_event_only_completion(tmp_path: Path) -> None:
+    client = FakeClient([SimpleNamespace(kind="unknown"), TurnComplete()])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    with pytest.raises(RunnerError, match="unmapped SDK event") as error:
+        await _collect(runner, _request())
+
+    assert error.value.error_type == "factory_incomplete_response"
+    assert client.interrupted is True
 
 
 @pytest.mark.asyncio

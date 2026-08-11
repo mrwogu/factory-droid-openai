@@ -45,6 +45,7 @@ def test_openapi_contract_documents_compatibility_surface(tmp_path: Path) -> Non
         "200",
         "4XX",
         "404",
+        "409",
         "413",
         "429",
         "502",
