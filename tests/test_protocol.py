@@ -2435,29 +2435,81 @@ def test_stream_parser_recovers_packed_json_with_glm_value_closes(close_marker: 
 
 
 def test_stream_parser_recovers_reconstructed_568_byte_glm_read_file_payload() -> None:
+    base = "/workspace/example/monorepo/service/api/src/ciapi/service/runtime_x_dev/"
     paths = [
-        "/workspace/example/monorepo/service/api/service/runtime_x/README.md",
-        "/workspace/example/monorepo/service/api/service/runtime_x/pyproject.toml",
-        "/workspace/example/monorepo/service/api/src/ciapi/service/runtime_x/main.py",
-        "/workspace/example/monorepo/service/api/src/ciapi/service/runtime_x/config.py",
+        base + "README.md",
+        base + "pyproject.toml",
+        base + "main.py",
+        base + "config.py",
     ]
     calls = [
-        json.dumps(
-            {"name": "read_file", "arguments": {"file_path": path}},
+        "read_file"
+        + json.dumps(
+            {"filePath": path, "startLine": 1, "endLine": 300},
             separators=(",", ":"),
         )
         for path in paths
     ]
-    payload = "</arg_value><tool_call>".join(calls) + "</arg_value>"
+    payload = TOOL_CALL_OPEN.join(calls)
     assert len(payload.encode("utf-8")) == 568
 
-    parser = ToolCallStreamParser(frozenset({"read_file"}), max_tool_calls=4)
-    emissions = parser.feed(f"{TOOL_CALL_OPEN}{payload}")
-    emissions.extend(parser.finish())
+    stream = f"{TOOL_CALL_OPEN}{payload}"
+    for chunk_size in (1, 17, len(stream)):
+        parser = ToolCallStreamParser(frozenset({"read_file"}), max_tool_calls=4)
+        emissions: list[object] = []
+        for index in range(0, len(stream), chunk_size):
+            emissions.extend(parser.feed(stream[index : index + chunk_size]))
+        emissions.extend(parser.finish())
 
-    parsed_calls = [emission for emission in emissions if isinstance(emission, ToolCallEmission)]
-    assert [call.name for call in parsed_calls] == ["read_file"] * 4
-    assert [json.loads(call.arguments)["file_path"] for call in parsed_calls] == paths
+        parsed_calls = [
+            emission for emission in emissions if isinstance(emission, ToolCallEmission)
+        ]
+        assert [call.name for call in parsed_calls] == ["read_file"] * 4
+        assert [json.loads(call.arguments) for call in parsed_calls] == [
+            {"filePath": path, "startLine": 1, "endLine": 300} for path in paths
+        ]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        'read_file{"filePath":"a"}<tool_call>unknown{"filePath":"b"}',
+        'read_file{"filePath":"a"}<tool_call>read_file{"filePath":"b"',
+        'read_file{"filePath":"a"}junk<tool_call>read_file{"filePath":"b"}',
+        'read_file{"filePath":"a"}<tool_call>read_file{"filePath":"b","filePath":"c"}',
+        'read_file{"filePath":"a"}<tool_call><tool_call>read_file{"filePath":"b"}',
+        'read_file{"filePath":"a"}<tool_call>',
+    ],
+)
+def test_stream_parser_rejects_invalid_packed_bare_calls(payload: str) -> None:
+    parser = ToolCallStreamParser(frozenset({"read_file"}), max_tool_calls=3)
+    parser.feed(f"{TOOL_CALL_OPEN}{payload}")
+
+    with pytest.raises(IncompleteToolCallError):
+        parser.finish()
+
+
+def test_stream_parser_keeps_open_marker_inside_packed_bare_call_arguments() -> None:
+    payload = (
+        'write_file{"content":"literal <tool_call> marker"}'
+        '<tool_call>read_file{"filePath":"README.md"}'
+    )
+    parser = ToolCallStreamParser(
+        frozenset({"write_file", "read_file"}),
+        max_tool_calls=2,
+    )
+    parser.feed(f"{TOOL_CALL_OPEN}{payload}")
+
+    calls = parser.finish()
+
+    assert [call.name for call in calls if isinstance(call, ToolCallEmission)] == [
+        "write_file",
+        "read_file",
+    ]
+    assert [json.loads(call.arguments) for call in calls if isinstance(call, ToolCallEmission)] == [
+        {"content": "literal <tool_call> marker"},
+        {"filePath": "README.md"},
+    ]
 
 
 @pytest.mark.parametrize(
