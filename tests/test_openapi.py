@@ -1,22 +1,49 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from openapi_spec_validator import validate
 
 from factory_droid_openai.app import create_app
 from factory_droid_openai.config import Settings
 
+if TYPE_CHECKING:
+    from types import ModuleType
 
-def test_committed_openapi_contract_is_valid_and_current(tmp_path: Path) -> None:
-    root = Path(__file__).resolve().parents[1]
-    committed = json.loads((root / "openapi.json").read_text(encoding="utf-8"))
-    generated = create_app(Settings(workdir=tmp_path)).openapi()
+_ROOT = Path(__file__).resolve().parents[1]
+_SCRIPT_PATH = _ROOT / "scripts" / "generate_openapi.py"
+
+
+def _load_generator() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("generate_openapi", _SCRIPT_PATH)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_committed_openapi_contract_is_valid_and_current() -> None:
+    committed = json.loads((_ROOT / "openapi.json").read_text(encoding="utf-8"))
+    generated = json.loads(_load_generator().render(_ROOT))
 
     validate(committed)
-    assert committed == generated
+    # Dumping both sides makes the comparison type-sensitive: a parsed 0 equals
+    # a parsed 0.0, which is exactly the drift that kept rewriting the file.
+    assert json.dumps(committed, sort_keys=True) == json.dumps(generated, sort_keys=True)
+
+
+def test_openapi_generator_normalizes_whole_floats() -> None:
+    normalized = _load_generator().normalize_numbers(
+        {"minimum": 0.0, "values": [1.0, 1.5, True, "1.0", None], "nested": {"timeout": 2.0}}
+    )
+
+    assert json.dumps(normalized, sort_keys=True) == (
+        '{"minimum": 0, "nested": {"timeout": 2}, "values": [1, 1.5, true, "1.0", null]}'
+    )
 
 
 def test_openapi_contract_documents_compatibility_surface(tmp_path: Path) -> None:
