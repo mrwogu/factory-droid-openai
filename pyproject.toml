@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "factory-droid-openai"
-version = "1.6.8"
+version = "1.6.9"
 description = "Unofficial OpenAI-compatible HTTP bridge for Factory Droid"
 readme = "README.md"
 requires-python = ">=3.11"

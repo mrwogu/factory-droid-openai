@@ -98,7 +98,7 @@ BearerCredentials = Annotated[
 # Warming happens off the request path, so it never needs the full request
 # timeout budget.
 _WARM_TIMEOUT_CEILING = 120.0
-_BRIDGE_VERSION = "1.6.8"  # x-release-please-version
+_BRIDGE_VERSION = "1.6.9"  # x-release-please-version
 _LATENCY_BUCKETS = (
     (0.1, "lt_100ms"),
     (0.5, "100ms_500ms"),

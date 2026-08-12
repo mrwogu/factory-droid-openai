@@ -33,7 +33,7 @@ body:
     id: bridge-version
     attributes:
       label: Bridge version
-      placeholder: 1.6.8
+      placeholder: 1.6.9
     validations:
       required: true
   - type: input
