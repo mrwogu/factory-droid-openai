@@ -378,14 +378,15 @@ class ToolCallStreamParser:
             self._pending_transcript_error = None
             raise error
         if self._capturing:
+            # Snapshot before recovering: a successful repair clears the chunks.
+            payload = "".join(self._payload_chunks) + self._close_tail
             recovered = self._recover_unclosed_tool_call()
             if recovered is None:
-                payload = "".join(self._payload_chunks) + self._close_tail
                 raise IncompleteToolCallError(
                     tool_name=_guess_tool_name(payload, self._allowed_tool_names),
                     payload_bytes=len(payload.encode("utf-8")),
                 )
-            emissions.extend(self._emit_tool_calls(recovered))
+            emissions.extend(self._emit_tool_calls(recovered, payload))
         if self._capturing_message_json:
             payload = "".join(self._message_json_chunks)
             self._reset_message_json()
@@ -581,6 +582,7 @@ class ToolCallStreamParser:
             emissions.extend(
                 self._emit_tool_calls(
                     [{"name": name, "arguments": arguments}],
+                    raw,
                 )
             )
         return emissions
@@ -663,7 +665,9 @@ class ToolCallStreamParser:
         self._close_tail = ""
         self._capturing = False
 
-        emissions: list[ProtocolEmission] = list(self._emit_tool_calls(payload_objects))
+        emissions: list[ProtocolEmission] = list(
+            self._emit_tool_calls(payload_objects, complete_payload)
+        )
         if self._tool_call_count >= self._max_tool_calls:
             self._done = True
             if self._residual(trailing).strip():
@@ -688,15 +692,43 @@ class ToolCallStreamParser:
         self._capturing = False
         return objects
 
-    def _emit_tool_calls(self, payload_objects: list[dict[str, Any]]) -> list[ToolCallEmission]:
+    def _emit_tool_calls(
+        self,
+        payload_objects: list[dict[str, Any]],
+        payload: str,
+    ) -> list[ToolCallEmission]:
         emissions: list[ToolCallEmission] = []
         for value in payload_objects:
             if self._tool_call_count >= self._max_tool_calls:
-                raise ProtocolError("more tool calls than the configured maximum")
+                raise self._tool_call_limit_error(payload, len(payload_objects))
             emissions.append(self._tool_call_from_object(value))
             self._saw_tool_call = True
             self._tool_call_count += 1
         return emissions
+
+    def _tool_call_limit_error(self, payload: str, requested: int) -> MalformedToolCallError:
+        """Drops a turn that asked for more calls than the limit allows.
+
+        Reported like any other dropped payload, so the client receives the
+        malformed-call note instead of a bridge error and the log still names
+        the tool the model was reaching for.
+        """
+        tool_name = _guess_tool_name(payload, self._allowed_tool_names)
+        payload_bytes = len(payload.encode("utf-8"))
+        log_trace(
+            "tool_call.over_limit",
+            tool_name=tool_name,
+            requested=requested,
+            maximum=self._max_tool_calls,
+            dialect=self._dialect.name,
+            payload_bytes=payload_bytes,
+        )
+        self._trace_payload("tool_call.over_limit", payload)
+        return MalformedToolCallError(
+            "more tool calls than the configured maximum",
+            tool_name=tool_name,
+            payload_bytes=payload_bytes,
+        )
 
     def _append_payload(self, value: str) -> None:
         if not value:

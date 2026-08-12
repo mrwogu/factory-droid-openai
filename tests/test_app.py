@@ -1972,6 +1972,37 @@ async def test_non_streaming_malformed_tool_call_stops_with_note(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_non_streaming_turn_over_the_tool_call_limit_stops_with_note(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [
+            TextDelta(
+                f"{TOOL_CALL_OPEN}"
+                '{"name":"weather","arguments":{}}{"name":"weather","arguments":{}}'
+                f"{TOOL_CALL_CLOSE}"
+            ),
+            RunComplete(Usage()),
+        ]
+    )
+    payload = _payload(
+        parallel_tool_calls=False,
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ],
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "stop"
+    assert 'for tool "weather"' in choice["message"]["content"]
+    assert "tool_calls" not in choice["message"]
+
+
+@pytest.mark.asyncio
 async def test_non_streaming_incomplete_message_json_stops_with_note(tmp_path: Path) -> None:
     runner = FakeRunner(
         [

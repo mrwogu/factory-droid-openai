@@ -281,7 +281,8 @@ text. Every accepted form lives in one table in
 Translation never widens validation. An unknown tool name, a duplicate
 argument key, or prose after a call still fails the turn. A payload truncated
 before its close marker ends with `finish_reason="length"`. A closed malformed
-call or a mangled OpenAI `tool_calls` fragment ends with `finish_reason="stop"`
+call, a mangled OpenAI `tool_calls` fragment, or a turn packing more calls than
+`FACTORY_DROID_OPENAI_MAX_TOOL_CALLS` allows ends with `finish_reason="stop"`
 and a plain-text bridge notice. The malformed JSON and the call are dropped,
 never executed or returned to the client. The notice names no tool-call
 format, because anything it named would itself be tool-call-shaped text in
