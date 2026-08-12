@@ -7,7 +7,11 @@ from typing import Any
 import pytest
 
 from factory_droid_openai import logs, protocol
-from factory_droid_openai.dialects import _MAX_PACKED_BARE_CALLS
+from factory_droid_openai.dialects import (
+    _MAX_PACKED_BARE_CALLS,
+    MARKER_DIALECTS,
+    MarkerDialect,
+)
 from factory_droid_openai.models import ChatCompletionRequest
 from factory_droid_openai.protocol import (
     _MAX_TOOL_PAYLOAD_BYTES,
@@ -1498,6 +1502,11 @@ def _repair_recorder() -> tuple[list[tuple[str, str, str | None]], Any]:
     return reported, record
 
 
+def _feed_parts(parser: ToolCallStreamParser, *parts: str) -> None:
+    for part in parts:
+        parser.feed(part)
+
+
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [
@@ -1557,6 +1566,93 @@ def test_stream_parser_reports_the_repair_before_the_call_limit() -> None:
         ("tool_call.repaired", "native", "packed_objects"),
         ("tool_call.over_limit", "native", None),
     ]
+
+
+def test_stream_parser_reports_a_same_feed_trailing_call_over_limit() -> None:
+    reported, record = _repair_recorder()
+    parser = ToolCallStreamParser(
+        frozenset({"weather"}),
+        max_tool_calls=1,
+        record_repair=record,
+    )
+
+    with pytest.raises(ProtocolError, match="unexpected text after tool call"):
+        parser.feed(_tool_call("weather", "{}") + _tool_call("weather", "{}"))
+
+    assert reported == [("tool_call.over_limit", "native", None)]
+
+
+@pytest.mark.parametrize("dialect", MARKER_DIALECTS, ids=lambda dialect: dialect.name)
+def test_stream_parser_reports_the_trailing_call_dialect_over_limit(
+    dialect: MarkerDialect,
+) -> None:
+    reported, record = _repair_recorder()
+    parser = ToolCallStreamParser(
+        frozenset({"weather"}),
+        max_tool_calls=1,
+        record_repair=record,
+    )
+    parser.feed(_tool_call("weather", "{}"))
+
+    with pytest.raises(
+        ProtocolError,
+        match=rf"unexpected text after tool call \({dialect.name} dialect\)",
+    ):
+        parser.feed(dialect.open_marker)
+
+    assert reported == [("tool_call.over_limit", dialect.name, None)]
+
+
+def test_stream_parser_reports_a_split_trailing_call_over_limit() -> None:
+    second = _tool_call("weather", "{}")
+
+    for split in range(1, len(second)):
+        reported, record = _repair_recorder()
+        parser = ToolCallStreamParser(
+            frozenset({"weather"}),
+            max_tool_calls=1,
+            record_repair=record,
+        )
+        parser.feed(_tool_call("weather", "{}"))
+
+        with pytest.raises(ProtocolError, match="unexpected text after tool call"):
+            _feed_parts(parser, second[:split], second[split:])
+
+        assert reported == [("tool_call.over_limit", "native", None)]
+
+
+def test_stream_parser_rejects_an_incomplete_trailing_marker_after_limit() -> None:
+    reported, record = _repair_recorder()
+    parser = ToolCallStreamParser(
+        frozenset({"weather"}),
+        max_tool_calls=1,
+        record_repair=record,
+    )
+    parser.feed(_tool_call("weather", "{}"))
+    parser.feed(_tool_call("weather", "{}")[: len(TOOL_CALL_OPEN) - 1])
+
+    with pytest.raises(ProtocolError, match="unexpected text after tool call"):
+        parser.finish()
+
+    assert reported == []
+
+
+def test_stream_parser_does_not_report_prose_before_a_trailing_call() -> None:
+    second = _tool_call("weather", "{}")
+
+    for trailing in (f"prose {second}", f"prose {second[: len(TOOL_CALL_OPEN) - 1]}"):
+        reported, record = _repair_recorder()
+        parser = ToolCallStreamParser(
+            frozenset({"weather"}),
+            max_tool_calls=1,
+            record_repair=record,
+        )
+        parser.feed(_tool_call("weather", "{}"))
+
+        with pytest.raises(ProtocolError, match="unexpected text after tool call"):
+            parser.feed(trailing)
+
+        assert reported == []
 
 
 def test_stream_parser_keeps_diagnostics_when_an_unclosed_payload_packs_too_many_calls() -> None:

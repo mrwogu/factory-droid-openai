@@ -368,12 +368,7 @@ class ToolCallStreamParser:
         if self._done:
             if self._ignore_transcript_tail:
                 return []
-            self._text_tail += chunk
-            if self._residual(self._text_tail).strip():
-                raise self._trailing_output_error()
-            # Everything left is verified noise except a control token the next
-            # chunk still has to complete.
-            self._text_tail = self._trailing_partial(self._text_tail)
+            self._consume_post_limit_trailing(chunk)
             return []
         if self._capturing:
             return self._consume_tool_payload(chunk)
@@ -473,9 +468,7 @@ class ToolCallStreamParser:
             )
             return emissions
 
-        held = max(
-            _partial_marker_suffix_length(value, dialect.open_marker) for dialect in MARKER_DIALECTS
-        )
+        held = _partial_open_marker_suffix_length(value)
         if detect_message_json:
             held = max(held, _partial_message_json_prefix_length(value))
         if detect_mangled:
@@ -681,13 +674,31 @@ class ToolCallStreamParser:
         )
         if self._tool_call_count >= self._max_tool_calls:
             self._done = True
-            if self._residual(trailing).strip():
-                raise self._trailing_output_error()
-            self._text_tail = self._trailing_partial(trailing)
+            self._consume_post_limit_trailing(trailing)
             return emissions
         if trailing:
             emissions.extend(self._consume_text(trailing))
         return emissions
+
+    def _consume_post_limit_trailing(self, chunk: str) -> None:
+        value = self._text_tail + chunk
+        self._text_tail = ""
+        found = find_open_marker(value)
+        if found is not None:
+            marker_index, dialect = found
+            if not self._residual(value[:marker_index]).strip():
+                self._dialect = dialect
+                self._report_repair("tool_call.over_limit")
+            raise self._trailing_output_error()
+
+        held = max(
+            _partial_open_marker_suffix_length(value),
+            len(self._trailing_partial(value)),
+        )
+        residual = value[:-held] if held else value
+        if self._residual(residual).strip():
+            raise self._trailing_output_error()
+        self._text_tail = value[-held:] if held else ""
 
     def _recover_unclosed_tool_call(self) -> list[dict[str, Any]] | None:
         """Repairs a tool call whose closing marker never arrived."""
@@ -949,6 +960,12 @@ def _partial_marker_suffix_length(value: str, marker: str) -> int:
         if value.endswith(marker[:length]):
             return length
     return 0
+
+
+def _partial_open_marker_suffix_length(value: str) -> int:
+    return max(
+        _partial_marker_suffix_length(value, dialect.open_marker) for dialect in MARKER_DIALECTS
+    )
 
 
 def _partial_message_json_prefix_length(value: str) -> int:
