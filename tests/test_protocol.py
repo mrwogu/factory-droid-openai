@@ -1479,14 +1479,39 @@ def test_stream_parser_accepts_objects_packed_in_one_marker_pair() -> None:
 
 def test_stream_parser_rejects_packed_objects_past_the_cap() -> None:
     parser = ToolCallStreamParser(frozenset({"weather"}), max_tool_calls=1)
+    payload = '{"name":"weather","arguments":{}}{"name":"weather","arguments":{}}'
 
-    with pytest.raises(ProtocolError, match="more tool calls than the configured maximum"):
-        parser.feed(
-            f"{TOOL_CALL_OPEN}"
-            '{"name":"weather","arguments":{}}'
-            '{"name":"weather","arguments":{}}'
-            f"{TOOL_CALL_CLOSE}"
-        )
+    with pytest.raises(MalformedToolCallError) as excinfo:
+        parser.feed(f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE}")
+
+    assert str(excinfo.value) == "more tool calls than the configured maximum"
+    assert excinfo.value.tool_name == "weather"
+    assert excinfo.value.payload_bytes == len(payload.encode("utf-8"))
+
+
+def test_stream_parser_keeps_diagnostics_when_an_unclosed_payload_packs_too_many_calls() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}), max_tool_calls=1)
+    payload = f'weather{{"city":"Gdansk"}}{TOOL_CALL_OPEN}weather{{"city":"Sopot"}}'
+    parser.feed(f"{TOOL_CALL_OPEN}{payload}")
+
+    with pytest.raises(MalformedToolCallError) as excinfo:
+        parser.finish()
+
+    assert excinfo.value.tool_name == "weather"
+    assert excinfo.value.payload_bytes == len(payload.encode("utf-8"))
+
+
+def test_stream_parser_keeps_diagnostics_when_a_transcript_echo_packs_too_many_calls() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}), max_tool_calls=1)
+    calls = [
+        {"id": "call_1", "type": "function", "function": {"name": "weather", "arguments": "{}"}},
+        {"id": "call_2", "type": "function", "function": {"name": "weather", "arguments": "{}"}},
+    ]
+
+    with pytest.raises(MalformedToolCallError) as excinfo:
+        parser.feed(json.dumps({"role": "assistant", "tool_calls": calls}))
+
+    assert str(excinfo.value) == "more tool calls than the configured maximum"
 
 
 @pytest.mark.parametrize(
