@@ -663,22 +663,48 @@ def _decode_bare_call(
     body: str,
     allowed_tool_names: frozenset[str],
 ) -> list[dict[str, Any]] | None:
-    """Rebuilds ``name{"key":"value"}`` - the tool name glued to its arguments.
+    """Rebuilds one or more ``name{"key":"value"}`` calls.
 
-    Unlike :func:`_decode_bare_name`, no newline separates the name from the
-    JSON object. The name must match an allowed tool exactly.
+    GLM may pack calls by repeating the opening marker without emitting the
+    matching closes. Every segment must name an allowed tool and carry one
+    strict JSON object, so residue and partial calls remain rejected.
     """
-    stripped = body.strip()
-    match = _BARE_CALL_PATTERN.match(stripped)
+    remaining = body.strip()
+    calls: list[dict[str, Any]] = []
+    while True:
+        parsed = _decode_bare_call_segment(remaining, allowed_tool_names)
+        if parsed is None:
+            return None
+        call, end = parsed
+        calls.append(call)
+        trailing = remaining[end:].lstrip()
+        if not trailing:
+            return calls
+        if not trailing.startswith(TOOL_CALL_OPEN):
+            return None
+        remaining = trailing[len(TOOL_CALL_OPEN) :].lstrip()
+        if not remaining:
+            return None
+
+
+def _decode_bare_call_segment(
+    segment: str,
+    allowed_tool_names: frozenset[str],
+) -> tuple[dict[str, Any], int] | None:
+    match = _BARE_CALL_PATTERN.match(segment)
     if match is None:
         return None
     name = match.group(1)
     if name not in allowed_tool_names:
         return None
-    arguments = _decode_json_object(stripped[match.end() :])
+    try:
+        _, end = json.JSONDecoder().raw_decode(segment, match.end())
+    except json.JSONDecodeError:
+        return None
+    arguments = _decode_json_object(segment[match.end() : end])
     if arguments is None:
         return None
-    return [{"name": name, "arguments": arguments}]
+    return {"name": name, "arguments": arguments}, end
 
 
 _ARG_KEY_REPAIR_TERMINATORS = ("<arg_key>", _ARG_VALUE_CLOSE, "<tool_call>")
