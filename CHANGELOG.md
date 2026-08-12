@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.6.9](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.8...v1.6.9) (2026-08-12)
+
+
+### Bug Fixes
+
+* **protocol:** bound packed bare-call repair work ([1c28ec4](https://github.com/mrwogu/factory-droid-openai/commit/1c28ec4fd5c362912c82d8d02a5a2aff957617d5))
+* **protocol:** keep diagnostics on the tool-call limit ([a596b8f](https://github.com/mrwogu/factory-droid-openai/commit/a596b8f6f0e202e8f6e138bb3aeba7753f284e10))
+* **protocol:** recover packed GLM bare calls ([a1ce6b1](https://github.com/mrwogu/factory-droid-openai/commit/a1ce6b1f9998682539f5a69fe958aa8759d66274))
+* **telemetry:** count sequential tool-call limits ([eb6e22d](https://github.com/mrwogu/factory-droid-openai/commit/eb6e22d5a8db8591f2989244672bb3af0bdc986d))
+* **telemetry:** count tool-call repairs by dialect ([9e41b32](https://github.com/mrwogu/factory-droid-openai/commit/9e41b32678e6f1266f289680f8892c43d02baa8b))
+
 ## [1.6.8](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.7...v1.6.8) (2026-08-11)
 
 
