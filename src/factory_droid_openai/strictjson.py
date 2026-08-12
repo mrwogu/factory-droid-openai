@@ -9,6 +9,7 @@ __all__ = [
     "check_no_duplicate_keys",
     "decode_json_values",
     "parse_strict_json",
+    "raw_decode_strict",
 ]
 
 
@@ -47,11 +48,6 @@ def decode_json_values(text: str) -> list[Any]:
     A model that packs several tool calls into one marker pair produces
     ``{...}{...}``, which ``json.loads`` rejects as trailing data.
     """
-    decoder = json.JSONDecoder(
-        object_pairs_hook=_reject_duplicate_keys,
-        parse_constant=_reject_non_json_constant,
-        parse_float=_parse_finite_float,
-    )
     values: list[Any] = []
     index = 0
     while True:
@@ -59,8 +55,18 @@ def decode_json_values(text: str) -> list[Any]:
             index += 1
         if index >= len(text):
             return values
-        value, index = decoder.raw_decode(text, index)
+        value, index = raw_decode_strict(text, index)
         values.append(value)
+
+
+def raw_decode_strict(text: str, index: int) -> tuple[Any, int]:
+    """Decodes the strict JSON value at ``index`` and reports where it ends.
+
+    The end offset is what separates a packed payload's calls from the residue
+    that follows them, so the boundary is taken from the same strict decoder
+    that validates the value instead of a permissive second pass.
+    """
+    return _STRICT_DECODER.raw_decode(text, index)
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -81,3 +87,10 @@ def _parse_finite_float(value: str) -> float:
     if not math.isfinite(parsed):
         raise ValueError(f"non-finite number '{value}'")
     return parsed
+
+
+_STRICT_DECODER = json.JSONDecoder(
+    object_pairs_hook=_reject_duplicate_keys,
+    parse_constant=_reject_non_json_constant,
+    parse_float=_parse_finite_float,
+)

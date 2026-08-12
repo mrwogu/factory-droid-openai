@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from factory_droid_openai import logs, protocol
+from factory_droid_openai.dialects import _MAX_PACKED_BARE_CALLS
 from factory_droid_openai.models import ChatCompletionRequest
 from factory_droid_openai.protocol import (
     _MAX_TOOL_PAYLOAD_BYTES,
@@ -2434,8 +2435,8 @@ def test_stream_parser_recovers_packed_json_with_glm_value_closes(close_marker: 
         ]
 
 
-def test_stream_parser_recovers_reconstructed_568_byte_glm_read_file_payload() -> None:
-    base = "/workspace/example/monorepo/service/api/src/ciapi/service/runtime_x_dev/"
+def test_stream_parser_recovers_packed_glm_bare_read_file_calls() -> None:
+    base = "/workspace/example/monorepo/service/api/src/ciapi/service/runtime_x/"
     paths = [
         base + "README.md",
         base + "pyproject.toml",
@@ -2451,7 +2452,6 @@ def test_stream_parser_recovers_reconstructed_568_byte_glm_read_file_payload() -
         for path in paths
     ]
     payload = TOOL_CALL_OPEN.join(calls)
-    assert len(payload.encode("utf-8")) == 568
 
     stream = f"{TOOL_CALL_OPEN}{payload}"
     for chunk_size in (1, 17, len(stream)):
@@ -2483,10 +2483,40 @@ def test_stream_parser_recovers_reconstructed_568_byte_glm_read_file_payload() -
 )
 def test_stream_parser_rejects_invalid_packed_bare_calls(payload: str) -> None:
     parser = ToolCallStreamParser(frozenset({"read_file"}), max_tool_calls=3)
-    parser.feed(f"{TOOL_CALL_OPEN}{payload}")
+
+    emissions = parser.feed(f"{TOOL_CALL_OPEN}{payload}")
+
+    # A rejected payload must not have leaked its valid leading segment first.
+    assert [emission for emission in emissions if isinstance(emission, ToolCallEmission)] == []
+    with pytest.raises(IncompleteToolCallError):
+        parser.finish()
+
+
+def test_stream_parser_rejects_packed_bare_calls_beyond_the_repair_cap() -> None:
+    segments = [
+        f'read_file{{"filePath":"f{index}"}}' for index in range(_MAX_PACKED_BARE_CALLS + 1)
+    ]
+    parser = ToolCallStreamParser(
+        frozenset({"read_file"}),
+        max_tool_calls=_MAX_PACKED_BARE_CALLS + 1,
+    )
+    parser.feed(TOOL_CALL_OPEN + TOOL_CALL_OPEN.join(segments))
 
     with pytest.raises(IncompleteToolCallError):
         parser.finish()
+
+
+def test_stream_parser_recovers_packed_bare_calls_separated_by_whitespace() -> None:
+    payload = 'read_file{"filePath":"a"}\n\t<tool_call>\n read_file{"filePath":"b"}'
+    parser = ToolCallStreamParser(frozenset({"read_file"}), max_tool_calls=2)
+    parser.feed(f"{TOOL_CALL_OPEN}{payload}")
+
+    calls = parser.finish()
+
+    assert [json.loads(call.arguments) for call in calls if isinstance(call, ToolCallEmission)] == [
+        {"filePath": "a"},
+        {"filePath": "b"},
+    ]
 
 
 def test_stream_parser_keeps_open_marker_inside_packed_bare_call_arguments() -> None:
