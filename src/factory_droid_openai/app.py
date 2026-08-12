@@ -1371,6 +1371,16 @@ def create_app(
                 metrics.record_features(("warm_session",))
                 run_request = replace(run_request, warm_session=warm_session)
 
+        def record_repair(
+            event: str,
+            *,
+            dialect: str,
+            variant: str | None = None,
+        ) -> None:
+            metrics.record_features(
+                (_tool_call_repair_feature(event, dialect=dialect, variant=variant),)
+            )
+
         def message_parser() -> ToolCallStreamParser:
             return ToolCallStreamParser(
                 plan.allowed_tool_names,
@@ -1381,6 +1391,7 @@ def create_app(
                 repair_lost_prefix=resolved_settings.repair_lost_prefix,
                 parse_message_json=structured is None,
                 trace_payload=payload_tracer.trace,
+                record_repair=record_repair,
             )
 
         if payload.stream:
@@ -2718,6 +2729,28 @@ def _request_telemetry_features(
         )
         features.append(f"request_error:{route}:{error_category}")
     return tuple(features)
+
+
+_TOOL_CALL_REPAIR_FEATURES = {
+    "tool_call.repaired": "tool_repair",
+    "tool_call.unparsed": "tool_unparsed",
+    "tool_call.over_limit": "tool_over_limit",
+}
+
+
+def _tool_call_repair_feature(
+    event: str,
+    *,
+    dialect: str,
+    variant: str | None = None,
+) -> str:
+    """Names one tool-call repair outcome as a telemetry feature.
+
+    Both halves come from marker-dialect and decoder constants, so the label
+    space stays closed and carries no payload text, tool name or model name.
+    """
+    prefix = _TOOL_CALL_REPAIR_FEATURES.get(event, event.replace(".", "_"))
+    return f"{prefix}:{dialect}" if variant is None else f"{prefix}:{dialect}:{variant}"
 
 
 def _observe_ttft(

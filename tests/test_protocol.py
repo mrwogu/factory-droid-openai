@@ -1489,6 +1489,76 @@ def test_stream_parser_rejects_packed_objects_past_the_cap() -> None:
     assert excinfo.value.payload_bytes == len(payload.encode("utf-8"))
 
 
+def _repair_recorder() -> tuple[list[tuple[str, str, str | None]], Any]:
+    reported: list[tuple[str, str, str | None]] = []
+
+    def record(event: str, *, dialect: str, variant: str | None = None) -> None:
+        reported.append((event, dialect, variant))
+
+    return reported, record
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ('weather{"city":"Gdansk"}', [("tool_call.repaired", "native", "bare_call")]),
+        (
+            '{"name":"weather","arguments":{}}{"name":"weather","arguments":{}}',
+            [("tool_call.repaired", "native", "packed_objects")],
+        ),
+        (
+            '[{"name":"weather","arguments":{}}]',
+            [("tool_call.repaired", "native", "json_array")],
+        ),
+    ],
+)
+def test_stream_parser_reports_the_repair_variant_it_used(
+    payload: str,
+    expected: list[tuple[str, str, str | None]],
+) -> None:
+    reported, record = _repair_recorder()
+    parser = ToolCallStreamParser(
+        frozenset({"weather"}),
+        max_tool_calls=2,
+        record_repair=record,
+    )
+
+    parser.feed(f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE}")
+
+    assert reported == expected
+
+
+def test_stream_parser_reports_an_unparsed_payload() -> None:
+    reported, record = _repair_recorder()
+    parser = ToolCallStreamParser(frozenset({"weather"}), record_repair=record)
+
+    with pytest.raises(MalformedToolCallError):
+        parser.feed(f"{TOOL_CALL_OPEN}not json{TOOL_CALL_CLOSE}")
+
+    assert reported == [("tool_call.unparsed", "native", None)]
+
+
+def test_stream_parser_reports_the_repair_before_the_call_limit() -> None:
+    reported, record = _repair_recorder()
+    parser = ToolCallStreamParser(
+        frozenset({"weather"}),
+        max_tool_calls=1,
+        record_repair=record,
+    )
+
+    with pytest.raises(MalformedToolCallError):
+        parser.feed(
+            f"{TOOL_CALL_OPEN}"
+            '{"name":"weather","arguments":{}}{"name":"weather","arguments":{}}'
+            f"{TOOL_CALL_CLOSE}"
+        )
+
+    assert reported == [
+        ("tool_call.repaired", "native", "packed_objects"),
+        ("tool_call.over_limit", "native", None),
+    ]
+
+
 def test_stream_parser_keeps_diagnostics_when_an_unclosed_payload_packs_too_many_calls() -> None:
     parser = ToolCallStreamParser(frozenset({"weather"}), max_tool_calls=1)
     payload = f'weather{{"city":"Gdansk"}}{TOOL_CALL_OPEN}weather{{"city":"Sopot"}}'

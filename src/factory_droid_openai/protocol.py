@@ -37,6 +37,15 @@ if TYPE_CHECKING:
     class PayloadTrace(Protocol):
         def __call__(self, event: str, payload: str, **fields: Any) -> None: ...
 
+    class RepairReporter(Protocol):
+        def __call__(
+            self,
+            event: str,
+            *,
+            dialect: str,
+            variant: str | None = None,
+        ) -> None: ...
+
 
 _MAX_TOOL_PAYLOAD_BYTES = 1_000_000
 _ARGUMENT_KEYS = ("arguments", "parameters", "args", "input")
@@ -320,6 +329,7 @@ class ToolCallStreamParser:
         repair_lost_prefix: bool = False,
         parse_message_json: bool = True,
         trace_payload: PayloadTrace | None = None,
+        record_repair: RepairReporter | None = None,
     ) -> None:
         self._allowed_tool_names = allowed_tool_names
         self._require_tool_call = require_tool_call
@@ -328,6 +338,7 @@ class ToolCallStreamParser:
         if repair_lost_prefix:
             self._payload_decoders = (*PAYLOAD_DECODERS, LOST_PREFIX_DECODER)
         self._trace_payload: PayloadTrace = trace_payload or NULL_PAYLOAD_TRACER.trace
+        self._record_repair = record_repair
         self._parse_message_json = parse_message_json
         self._text_tail = ""
         self._payload_chunks: list[str] = []
@@ -724,11 +735,21 @@ class ToolCallStreamParser:
             payload_bytes=payload_bytes,
         )
         self._trace_payload("tool_call.over_limit", payload)
+        self._report_repair("tool_call.over_limit")
         return MalformedToolCallError(
             "more tool calls than the configured maximum",
             tool_name=tool_name,
             payload_bytes=payload_bytes,
         )
+
+    def _report_repair(self, event: str, variant: str | None = None) -> None:
+        """Reports one repair outcome to the caller's aggregate counters.
+
+        Only the dialect and the repair variant travel, never payload text or
+        the tool name, so the caller can count shapes without holding content.
+        """
+        if self._record_repair is not None:
+            self._record_repair(event, dialect=self._dialect.name, variant=variant)
 
     def _append_payload(self, value: str) -> None:
         if not value:
@@ -768,6 +789,7 @@ class ToolCallStreamParser:
                     payload_bytes=len(body.encode("utf-8")),
                 )
                 self._trace_payload("tool_call.unparsed", body)
+                self._report_repair("tool_call.unparsed")
                 raise MalformedToolCallError(
                     f"invalid tool-call JSON: {exc}",
                     tool_name=tool_name,
@@ -785,6 +807,7 @@ class ToolCallStreamParser:
                     raise ProtocolError("tool-call payload must be a JSON object")
                 log_debug("tool_call.repaired", variant="json_array")
                 self._trace_payload("tool_call.repaired", body, variant="json_array")
+                self._report_repair("tool_call.repaired", "json_array")
                 objects.extend(value)
                 continue
             if not isinstance(value, dict):
@@ -793,6 +816,7 @@ class ToolCallStreamParser:
         if len(objects) > 1:
             log_debug("tool_call.repaired", variant="packed_objects")
             self._trace_payload("tool_call.repaired", body, variant="packed_objects")
+            self._report_repair("tool_call.repaired", "packed_objects")
         return objects
 
     def _decode_payload(self, body: str) -> list[Any] | None:
@@ -801,6 +825,7 @@ class ToolCallStreamParser:
             if decoded is not None:
                 log_debug("tool_call.repaired", variant=decoder.name)
                 self._trace_payload("tool_call.repaired", body, variant=decoder.name)
+                self._report_repair("tool_call.repaired", decoder.name)
                 return list(decoded)
         return None
 
