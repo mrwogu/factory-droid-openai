@@ -24,7 +24,7 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from factory_droid_openai.strictjson import parse_strict_json
+from factory_droid_openai.strictjson import parse_strict_json, raw_decode_strict
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -656,7 +656,11 @@ def _decode_python_call(
     return [{"name": name, "arguments": arguments}]
 
 
-_BARE_CALL_PATTERN = re.compile(r"^([A-Za-z_][\w.-]*)\s*(?=\{)")
+_BARE_CALL_PATTERN = re.compile(r"([A-Za-z_][\w.-]*)\s*(?=\{)")
+# Past this many segments the payload is malformed beyond any tool-call limit
+# an operator can configure, and the parser's byte cap alone would let a
+# pathological turn cost far more work than it can ever be worth.
+_MAX_PACKED_BARE_CALLS = 64
 
 
 def _decode_bare_call(
@@ -667,44 +671,52 @@ def _decode_bare_call(
 
     GLM may pack calls by repeating the opening marker without emitting the
     matching closes. Every segment must name an allowed tool and carry one
-    strict JSON object, so residue and partial calls remain rejected.
+    strict JSON object, so residue and partial calls remain rejected. Segments
+    are walked by offset instead of re-sliced, keeping a payload at the byte
+    cap linear work.
     """
-    remaining = body.strip()
+    stripped = body.strip()
     calls: list[dict[str, Any]] = []
-    while True:
-        parsed = _decode_bare_call_segment(remaining, allowed_tool_names)
+    index = 0
+    while len(calls) < _MAX_PACKED_BARE_CALLS:
+        parsed = _decode_bare_call_segment(stripped, index, allowed_tool_names)
         if parsed is None:
             return None
-        call, end = parsed
+        call, index = parsed
         calls.append(call)
-        trailing = remaining[end:].lstrip()
-        if not trailing:
+        index = _skip_whitespace(stripped, index)
+        if index == len(stripped):
             return calls
-        if not trailing.startswith(TOOL_CALL_OPEN):
+        if not stripped.startswith(TOOL_CALL_OPEN, index):
             return None
-        remaining = trailing[len(TOOL_CALL_OPEN) :].lstrip()
-        if not remaining:
+        index = _skip_whitespace(stripped, index + len(TOOL_CALL_OPEN))
+        if index == len(stripped):
             return None
+    return None
 
 
 def _decode_bare_call_segment(
     segment: str,
+    index: int,
     allowed_tool_names: frozenset[str],
 ) -> tuple[dict[str, Any], int] | None:
-    match = _BARE_CALL_PATTERN.match(segment)
+    match = _BARE_CALL_PATTERN.match(segment, index)
     if match is None:
         return None
     name = match.group(1)
     if name not in allowed_tool_names:
         return None
     try:
-        _, end = json.JSONDecoder().raw_decode(segment, match.end())
-    except json.JSONDecodeError:
-        return None
-    arguments = _decode_json_object(segment[match.end() : end])
-    if arguments is None:
+        arguments, end = raw_decode_strict(segment, match.end())
+    except (json.JSONDecodeError, ValueError):
         return None
     return {"name": name, "arguments": arguments}, end
+
+
+def _skip_whitespace(value: str, index: int) -> int:
+    while index < len(value) and value[index].isspace():
+        index += 1
+    return index
 
 
 _ARG_KEY_REPAIR_TERMINATORS = ("<arg_key>", _ARG_VALUE_CLOSE, "<tool_call>")
