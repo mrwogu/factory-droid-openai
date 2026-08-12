@@ -74,7 +74,8 @@ jobs:
         run: uv run openapi-spec-validator openapi.json
 
       # Release Please rewrites JSON while updating info.version, so compare
-      # parsed documents instead of serializer-specific formatting.
+      # re-serialized documents instead of the committed formatting. Dumping
+      # keeps the check type-sensitive, where a parsed 0 would equal 0.0.
       - name: Verify OpenAPI contract is regenerated
         run: |
           export COMMITTED_OPENAPI="$RUNNER_TEMP/openapi-committed.json"
@@ -89,7 +90,7 @@ jobs:
               Path(os.environ["COMMITTED_OPENAPI"]).read_text(encoding="utf-8")
           )
           generated = json.loads(Path("openapi.json").read_text(encoding="utf-8"))
-          if committed != generated:
+          if json.dumps(committed, sort_keys=True) != json.dumps(generated, sort_keys=True):
               raise SystemExit("Committed OpenAPI document differs from generated schema.")
           PY
 
