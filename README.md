@@ -1258,6 +1258,9 @@ Collected fields:
 - coarse error category by route, without error messages
 - counts for tools, structured output, attachments, reasoning effort, session
   continuity, multiple choices, and warm-session use
+- counts of tool-call payload repairs, keyed by marker dialect and the repair
+  variant that handled the payload, plus counts of payloads no decoder could
+  parse and turns that asked for more calls than the limit allows
 - aggregate warm-pool, model-discovery, quarantine, and forced-kill counters
 
 Telemetry never includes prompts, responses, full model names, tool names, tool

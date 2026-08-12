@@ -1972,6 +1972,58 @@ async def test_non_streaming_malformed_tool_call_stops_with_note(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_repaired_tool_call_counts_a_bounded_telemetry_feature(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [
+            TextDelta(f'{TOOL_CALL_OPEN}weather{{"city":"Gdansk"}}{TOOL_CALL_CLOSE}'),
+            RunComplete(Usage()),
+        ]
+    )
+    payload = _payload(
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ],
+    )
+    app = _app(tmp_path, runner)
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    features = dict(app.state.metrics.telemetry_snapshot().features)
+    assert features["tool_repair:native:bare_call"] == 1
+    # The label must carry no tool name, model name or payload text.
+    assert not any("weather" in feature or "Gdansk" in feature for feature in features)
+
+
+@pytest.mark.asyncio
+async def test_unparsed_tool_call_counts_a_bounded_telemetry_feature(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        [
+            TextDelta(f"{TOOL_CALL_OPEN}not json{TOOL_CALL_CLOSE}"),
+            RunComplete(Usage()),
+        ]
+    )
+    payload = _payload(
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ],
+    )
+    app = _app(tmp_path, runner)
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    features = dict(app.state.metrics.telemetry_snapshot().features)
+    assert features["tool_unparsed:native"] == 1
+
+
+@pytest.mark.asyncio
 async def test_non_streaming_turn_over_the_tool_call_limit_stops_with_note(tmp_path: Path) -> None:
     runner = FakeRunner(
         [
