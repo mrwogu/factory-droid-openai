@@ -170,6 +170,12 @@ _PACKED_DECODER_FIXTURES = (
         _PACKED_ARGUMENTS,
     ),
     PackedRecoveryFixture(
+        "bare_call",
+        f'weather{{"city":"Gdansk"}}</arg_value>{TOOL_CALL_OPEN}'
+        'weather{"city":"Sopot"}</arg_value>',
+        _PACKED_ARGUMENTS,
+    ),
+    PackedRecoveryFixture(
         "python_call",
         f'weather({{"city":"Gdansk"}}){TOOL_CALL_OPEN}weather({{"city":"Sopot"}})',
         _PACKED_ARGUMENTS,

@@ -2679,6 +2679,24 @@ def test_stream_parser_recovers_packed_glm_bare_read_file_calls() -> None:
         ]
 
 
+def test_stream_parser_recovers_packed_bare_calls_with_glm_value_closes() -> None:
+    payload = (
+        'read_file{"filePath":"a"}</arg_value>'
+        f"{TOOL_CALL_OPEN}"
+        'read_file{"filePath":"b"}</arg_value>'
+    )
+    parser = ToolCallStreamParser(frozenset({"read_file"}), max_tool_calls=2)
+
+    parser.feed(f"{TOOL_CALL_OPEN}{payload}")
+    emissions = parser.finish()
+
+    calls = [emission for emission in emissions if isinstance(emission, ToolCallEmission)]
+    assert [json.loads(call.arguments) for call in calls] == [
+        {"filePath": "a"},
+        {"filePath": "b"},
+    ]
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -2688,6 +2706,7 @@ def test_stream_parser_recovers_packed_glm_bare_read_file_calls() -> None:
         'read_file{"filePath":"a"}<tool_call>read_file{"filePath":"b","filePath":"c"}',
         'read_file{"filePath":"a"}<tool_call><tool_call>read_file{"filePath":"b"}',
         'read_file{"filePath":"a"}<tool_call>',
+        'read_file{"filePath":"a"}</arg_value></arg_value><tool_call>read_file{"filePath":"b"}',
     ],
 )
 def test_stream_parser_rejects_invalid_packed_bare_calls(payload: str) -> None:

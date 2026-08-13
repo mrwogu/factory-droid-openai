@@ -711,9 +711,10 @@ def _decode_bare_call(
 
     GLM may pack calls by repeating the opening marker without emitting the
     matching closes. Every segment must name an allowed tool and carry one
-    strict JSON object, so residue and partial calls remain rejected. Segments
-    are walked by offset instead of re-sliced, keeping a payload at the byte
-    cap linear work.
+    strict JSON object. A single GLM value-close residue may separate segments
+    or terminate the payload; other residue and partial calls remain rejected.
+    Segments are walked by offset instead of re-sliced, keeping a payload at
+    the byte cap linear work.
     """
     stripped = body.strip()
     calls: list[dict[str, Any]] = []
@@ -725,6 +726,8 @@ def _decode_bare_call(
         call, index = parsed
         calls.append(call)
         index = _skip_whitespace(stripped, index)
+        if stripped.startswith(_ARG_VALUE_CLOSE, index):
+            index = _skip_whitespace(stripped, index + len(_ARG_VALUE_CLOSE))
         if index == len(stripped):
             return calls
         if not stripped.startswith(TOOL_CALL_OPEN, index):
