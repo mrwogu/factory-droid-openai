@@ -104,6 +104,7 @@ def test_configure_logging_replaces_previous_handler() -> None:
     logs.info("probe")
 
     assert first.getvalue() == ""
+    assert len(_lines(second)) == 1
     assert "event=probe" in second.getvalue()
 
 
@@ -130,6 +131,19 @@ def test_text_format_renders_fields_and_request_id(log_stream: io.StringIO) -> N
     assert fields["zero"] == "0.0"
     assert "dropped" not in fields
     assert "elapsed_ms" in fields
+
+
+def test_text_format_emits_each_record_and_field_once(log_stream: io.StringIO) -> None:
+    logs.bind_request("chatcmpl-once")
+    logs.info("chat.completed", model="gpt-5.4", status=200)
+
+    lines = _lines(log_stream)
+
+    assert len(lines) == 1
+    assert lines[0].count("event=chat.completed") == 1
+    assert lines[0].count("request_id=chatcmpl-once") == 1
+    assert lines[0].count("model=gpt-5.4") == 1
+    assert lines[0].count("status=200") == 1
 
 
 def test_elapsed_is_omitted_when_phase_timings_are_present(log_stream: io.StringIO) -> None:
@@ -180,6 +194,26 @@ def test_json_format_emits_one_object_per_line() -> None:
     assert payload["level"] == "WARNING"
     assert payload["request_id"] == "chatcmpl-json"
     assert payload["status"] == 429
+
+
+def test_json_format_emits_each_record_and_key_once() -> None:
+    stream = io.StringIO()
+    logs.configure_logging(level="info", log_format="json", stream=stream)
+    logs.bind_request("chatcmpl-json-once")
+
+    logs.info("chat.completed", model="gpt-5.4", status=200)
+
+    lines = _lines(stream)
+    assert len(lines) == 1
+    assert lines[0].count('"event"') == 1
+    assert lines[0].count('"request_id"') == 1
+    assert lines[0].count('"model"') == 1
+    assert lines[0].count('"status"') == 1
+    payload = json.loads(lines[0])
+    assert payload["event"] == "chat.completed"
+    assert payload["request_id"] == "chatcmpl-json-once"
+    assert payload["model"] == "gpt-5.4"
+    assert payload["status"] == 200
 
 
 def test_json_format_includes_exception_text() -> None:
