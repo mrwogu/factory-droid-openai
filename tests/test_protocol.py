@@ -2644,6 +2644,41 @@ def test_stream_parser_recovers_packed_json_with_glm_value_closes(close_marker: 
         ]
 
 
+def test_stream_parser_recovers_packed_json_calls_without_value_closes() -> None:
+    base = "/home/user/.config/Code/User/workspaceStorage/9f1c8d/tasks/1786623818430/"
+    paths = [base + "api_conversation_history.json", base + "content.txt"]
+    calls = [
+        json.dumps(
+            {
+                "name": "read_file",
+                "arguments": {"filePath": path, "startLine": 1, "endLine": 500},
+            },
+            separators=(",", ":"),
+        )
+        for path in paths
+    ]
+    # Observed on a GLM turn: wrapped JSON calls packed by a repeated open
+    # marker alone, with none of the value-close residue the same model emits
+    # on other turns, and the turn dying before the close marker.
+    payload = TOOL_CALL_OPEN.join(calls)
+    stream = f"{TOOL_CALL_OPEN}{payload}"
+
+    for chunk_size in (1, 17, len(stream)):
+        parser = ToolCallStreamParser(frozenset({"read_file"}), max_tool_calls=2)
+        emissions: list[object] = []
+        for index in range(0, len(stream), chunk_size):
+            emissions.extend(parser.feed(stream[index : index + chunk_size]))
+        emissions.extend(parser.finish())
+
+        parsed_calls = [
+            emission for emission in emissions if isinstance(emission, ToolCallEmission)
+        ]
+        assert [call.name for call in parsed_calls] == ["read_file"] * 2
+        assert [json.loads(call.arguments) for call in parsed_calls] == [
+            {"filePath": path, "startLine": 1, "endLine": 500} for path in paths
+        ]
+
+
 def test_stream_parser_recovers_packed_glm_bare_read_file_calls() -> None:
     base = "/workspace/example/monorepo/service/api/src/ciapi/service/runtime_x/"
     paths = [
@@ -2827,6 +2862,12 @@ def test_stream_parser_keeps_open_marker_inside_packed_bare_call_arguments() -> 
             '{"name":"weather","arguments":{"city":"Gdansk"}}</arg_value>'
             '<tool_call>{"name":"clock","name":"clock","arguments":{}}</arg_value>'
         ),
+        (
+            '{"name":"weather","arguments":{"city":"Gdansk"}}'
+            '<tool_call><tool_call>{"name":"clock","arguments":{}}'
+        ),
+        '{"name":"weather","arguments":{"city":"Gdansk"}}<tool_call>',
+        '{"name":"weather","arguments":{"city":"Gdansk"}}<tool_call>{"name":"clock"',
     ],
 )
 def test_stream_parser_rejects_invalid_packed_json_with_glm_value_closes(
