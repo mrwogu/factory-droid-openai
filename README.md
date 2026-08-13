@@ -160,7 +160,7 @@ factory-droid-openai
 | Parallel tool calls | ✅ | Several sequential tool calls per turn, bounded by a configured cap |
 | Stop sequences | ✅ | `stop` truncates the reply and interrupts the Droid turn |
 | Reasoning output | ✅ | Emitted as `reasoning` and `reasoning_content` |
-| Token usage | ✅ | Includes cache read and write token details |
+| Token usage | ⚠️ | Cache read and write details included; counts are Droid's session counters, not per-request accounting |
 | Model selection | ✅ | `/v1/models` discovers the authenticated account's current catalog |
 | Multimodal content | ⚠️ | Inline image and file data URIs use SDK attachments; remote URLs are rejected |
 | Structured outputs | ✅ | `json_schema` and `json_object` are enforced by Droid and validated by the bridge |
@@ -1561,6 +1561,7 @@ This is a compatibility bridge, not a native OpenAI inference implementation.
 | No native SDK tool-result continuation | Each request runs a fresh Droid session; warm sessions remove its startup cost, not its empty state |
 | Python SDK protocol drift | A small isolated compatibility shim supplies structured output, tool controls, and session RPCs |
 | Session-per-request execution | Prompt caching differs from a native inference endpoint |
+| Droid-reported token usage | `usage` mirrors the newest Droid session counter, so it can undercount a prompt and, on a continued session, include earlier turns |
 | Strict tool marker protocol | Invalid generated tool payloads fail closed; unparseable or truncated payloads end the turn with `finish_reason="length"` |
 | Sequential tool calls only | Calls arrive one after another, never concurrently |
 
