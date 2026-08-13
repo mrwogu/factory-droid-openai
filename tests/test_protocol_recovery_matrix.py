@@ -169,6 +169,11 @@ _PACKED_DECODER_FIXTURES = (
         f'weather{{"city":"Gdansk"}}{TOOL_CALL_OPEN}weather{{"city":"Sopot"}}',
         _PACKED_ARGUMENTS,
     ),
+    PackedRecoveryFixture(
+        "python_call",
+        f'weather({{"city":"Gdansk"}}){TOOL_CALL_OPEN}weather({{"city":"Sopot"}})',
+        _PACKED_ARGUMENTS,
+    ),
 )
 # These shapes carry exactly one call per marker pair, so packing them is not a
 # form the wire can produce. A new decoder has to land in one list or the other.
@@ -176,7 +181,6 @@ _SINGLE_CALL_DECODERS = frozenset(
     {
         "harmony_commentary",
         "arg_key_value",
-        "python_call",
         "bare_name",
     }
 )

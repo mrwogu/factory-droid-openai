@@ -8,7 +8,7 @@ import pytest
 
 from factory_droid_openai import logs, protocol
 from factory_droid_openai.dialects import (
-    _MAX_PACKED_BARE_CALLS,
+    _MAX_PACKED_CALLS,
     MARKER_DIALECTS,
     MarkerDialect,
 )
@@ -1305,6 +1305,19 @@ def test_stream_parser_repairs_python_call_payload() -> None:
     assert json.loads(emissions[0].arguments) == {"name": "apple-notes"}
 
 
+def test_stream_parser_repairs_python_call_with_repeated_close_residue() -> None:
+    parser = ToolCallStreamParser(frozenset({"skill_view"}))
+
+    emissions = parser.feed(
+        TOOL_CALL_OPEN + 'skill_view({"name":"apple-notes"})})' + TOOL_CALL_CLOSE
+    )
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert emissions[0].name == "skill_view"
+    assert json.loads(emissions[0].arguments) == {"name": "apple-notes"}
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -1314,6 +1327,11 @@ def test_stream_parser_repairs_python_call_payload() -> None:
         'skill_view(["apple-notes"])',
         "skill_view()",
         'print("hello")',
+        'skill_view({"name":"apple-notes"}) and then I read it',
+        'skill_view({"name":"apple-notes"}',
+        'skill_view({"name":"apple-notes"})skill_view({"name":',
+        '})skill_view({"name":"apple-notes"})',
+        f'skill_view({{"name":"apple-notes"}}){TOOL_CALL_OPEN}',
     ],
 )
 def test_stream_parser_rejects_unrepairable_python_call_payloads(payload: str) -> None:
@@ -2684,14 +2702,56 @@ def test_stream_parser_rejects_invalid_packed_bare_calls(payload: str) -> None:
 
 
 def test_stream_parser_rejects_packed_bare_calls_beyond_the_repair_cap() -> None:
-    segments = [
-        f'read_file{{"filePath":"f{index}"}}' for index in range(_MAX_PACKED_BARE_CALLS + 1)
-    ]
+    segments = [f'read_file{{"filePath":"f{index}"}}' for index in range(_MAX_PACKED_CALLS + 1)]
     parser = ToolCallStreamParser(
         frozenset({"read_file"}),
-        max_tool_calls=_MAX_PACKED_BARE_CALLS + 1,
+        max_tool_calls=_MAX_PACKED_CALLS + 1,
     )
     parser.feed(TOOL_CALL_OPEN + TOOL_CALL_OPEN.join(segments))
+
+    with pytest.raises(IncompleteToolCallError):
+        parser.finish()
+
+
+def test_stream_parser_recovers_packed_glm_python_read_file_calls() -> None:
+    base = "/home/user/.config/Code/User/workspaceStorage/9f1c8d/tasks/1786532954597/"
+    paths = [base + "content.txt", base + "api_conversation_history.json"]
+    calls = [
+        "read_file("
+        + json.dumps(
+            {"filePath": path, "startLine": 1, "endLine": 300},
+            separators=(",", ":"),
+        )
+        + ")"
+        for path in paths
+    ]
+    # Observed on a GLM turn: packed python calls, the last call's closing
+    # punctuation repeated, and the turn dying two bytes into the close marker.
+    stream = TOOL_CALL_OPEN + "".join(calls) + "})" + TOOL_CALL_CLOSE[:2]
+
+    for chunk_size in (1, 17, len(stream)):
+        parser = ToolCallStreamParser(frozenset({"read_file"}), max_tool_calls=2)
+        emissions: list[object] = []
+        for index in range(0, len(stream), chunk_size):
+            emissions.extend(parser.feed(stream[index : index + chunk_size]))
+        emissions.extend(parser.finish())
+
+        parsed_calls = [
+            emission for emission in emissions if isinstance(emission, ToolCallEmission)
+        ]
+        assert [call.name for call in parsed_calls] == ["read_file"] * 2
+        assert [json.loads(call.arguments) for call in parsed_calls] == [
+            {"filePath": path, "startLine": 1, "endLine": 300} for path in paths
+        ]
+
+
+def test_stream_parser_rejects_packed_python_calls_beyond_the_repair_cap() -> None:
+    segments = [f'read_file({{"filePath":"f{index}"}})' for index in range(_MAX_PACKED_CALLS + 1)]
+    parser = ToolCallStreamParser(
+        frozenset({"read_file"}),
+        max_tool_calls=_MAX_PACKED_CALLS + 1,
+    )
+    parser.feed(TOOL_CALL_OPEN + "".join(segments))
 
     with pytest.raises(IncompleteToolCallError):
         parser.finish()
