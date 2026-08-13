@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.6.11](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.10...v1.6.11) (2026-08-13)
+
+
+### Bug Fixes
+
+* **protocol:** tolerate one GLM value-close in bare calls ([40222b7](https://github.com/mrwogu/factory-droid-openai/commit/40222b7014aa27a6315ff7d33af60bbc0cc4f1f5)), closes [#65](https://github.com/mrwogu/factory-droid-openai/issues/65)
+* **runner:** report newest Droid usage snapshot ([f07294f](https://github.com/mrwogu/factory-droid-openai/commit/f07294f5526e8cd3c66399ef79013e9e30a189dc)), closes [#70](https://github.com/mrwogu/factory-droid-openai/issues/70)
+
 ## [1.6.10](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.9...v1.6.10) (2026-08-13)
 
 
