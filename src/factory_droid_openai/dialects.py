@@ -630,11 +630,11 @@ def _coerce_arg_value(raw: str) -> Any:
     return parsed
 
 
-_PYTHON_CALL_PATTERN = re.compile(r"([A-Za-z_][\w.-]*)\s*\(\s*(?=\{)")
+_PYTHON_CALL_PATTERN = re.compile(r"([A-Za-z_][\w.-]*)\(\s*(?=\{)")
 # Closing punctuation a template repeats around a call. It carries no argument
 # data, so skipping it between and after calls cannot change what the client
 # executes, while prose still fails to parse as the next segment.
-_CALL_RESIDUE = ")}]"
+_CALL_RESIDUE = ")}"
 
 
 def _decode_python_call(
