@@ -544,24 +544,24 @@ def _decode_json_arg_value_close(
     body: str,
     allowed_tool_names: frozenset[str],
 ) -> list[dict[str, Any]] | None:
-    """Repairs strict JSON calls followed by GLM's mismatched value-close token."""
-    stripped = body.strip()
-    if not stripped.endswith(_ARG_VALUE_CLOSE):
-        return None
-    candidate = stripped[: -len(_ARG_VALUE_CLOSE)].rstrip()
-    parsed = _parse_allowed_json_call(candidate, allowed_tool_names)
-    if parsed is not None:
-        return [parsed]
-    separator = f"{_ARG_VALUE_CLOSE}{TOOL_CALL_OPEN}"
-    if separator not in candidate:
-        return None
+    """Repairs strict JSON calls wrapped in GLM's leftover template markers.
+
+    GLM ends a call with a mismatched ``</arg_value>`` and packs further calls
+    by repeating ``<tool_call>`` without the matching closes. The two residues
+    are independent, so ``{...}</arg_value>``, ``{...}<tool_call>{...}`` and
+    ``{...}</arg_value><tool_call>{...}</arg_value>`` all arrive on the wire.
+    Every segment must strict-parse to an object naming an allowed tool, which
+    also keeps a segment left empty by a doubled marker failing closed instead
+    of dropping the call whose payload never arrived.
+    """
     calls: list[dict[str, Any]] = []
-    for segment in candidate.split(separator):
-        parsed = _parse_allowed_json_call(segment.strip(), allowed_tool_names)
+    for segment in body.strip().split(TOOL_CALL_OPEN):
+        candidate = segment.strip().removesuffix(_ARG_VALUE_CLOSE).rstrip()
+        parsed = _parse_allowed_json_call(candidate, allowed_tool_names)
         if parsed is None:
             return None
         calls.append(parsed)
-    return calls if len(calls) > 1 else None
+    return calls
 
 
 def _decode_arg_key_value(

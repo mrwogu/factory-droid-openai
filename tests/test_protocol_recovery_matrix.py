@@ -160,6 +160,11 @@ _PACKED_DECODER_FIXTURES = (
         _PACKED_ARGUMENTS,
     ),
     PackedRecoveryFixture(
+        "json_arg_value_close",
+        f"{_native_call('Gdansk')}{TOOL_CALL_OPEN}{_native_call('Sopot')}",
+        _PACKED_ARGUMENTS,
+    ),
+    PackedRecoveryFixture(
         "arg_key_value_repair",
         f'weather<arg_key>city":"Gdansk"}}{TOOL_CALL_OPEN}weather<arg_key>city":"Sopot"}}',
         _PACKED_ARGUMENTS,
