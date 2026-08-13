@@ -537,6 +537,10 @@ class DroidRunner:
                     elif isinstance(event, WorkingStateChanged):
                         yield StatusUpdate(_state_value(event.state))
                     elif isinstance(event, TokenUsageUpdate):
+                        # The SDK forwards session-cumulative counters, and its
+                        # own TurnComplete carries the newest update as the turn
+                        # total. Summing them would count the same tokens once
+                        # per event.
                         usage = _map_usage(event)
                         yield UsageUpdate(usage)
                     elif isinstance(event, TurnComplete):

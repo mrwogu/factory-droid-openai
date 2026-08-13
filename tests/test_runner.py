@@ -224,6 +224,44 @@ async def test_runner_maps_sdk_stream_and_usage(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_runner_reports_newest_usage_snapshot_without_summing(tmp_path: Path) -> None:
+    """Mirrors the SDK: counters are cumulative and TurnComplete repeats the last one."""
+    first = TokenUsageUpdate(
+        input_tokens=2000,
+        output_tokens=10,
+        cache_read_tokens=6,
+        cache_write_tokens=8,
+    )
+    latest = TokenUsageUpdate(
+        input_tokens=2000,
+        output_tokens=25,
+        cache_read_tokens=6,
+        cache_write_tokens=8,
+    )
+    client = FakeClient(
+        [
+            AssistantTextDelta("hello"),
+            first,
+            latest,
+            TurnComplete(latest),
+        ]
+    )
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    events = [event async for event in runner.run(_request())]
+
+    assert [event.usage for event in events if isinstance(event, UsageUpdate)] == [
+        Usage(2000, 10, 6, 8),
+        Usage(2000, 25, 6, 8),
+    ]
+    assert events[-1] == RunComplete(Usage(2000, 25, 6, 8))
+
+
+@pytest.mark.asyncio
 async def test_runner_passes_explicit_model_id(tmp_path: Path) -> None:
     client = FakeClient([TurnComplete()])
     runner = DroidRunner(
