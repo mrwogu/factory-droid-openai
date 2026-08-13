@@ -2679,6 +2679,41 @@ def test_stream_parser_recovers_packed_json_calls_without_value_closes() -> None
         ]
 
 
+def test_stream_parser_preserves_markers_inside_packed_json_arguments() -> None:
+    first = json.dumps(
+        {
+            "name": "weather",
+            "arguments": {"text": "literal <tool_call> and </arg_value> markers"},
+        },
+        separators=(",", ":"),
+    )
+    second = '{"name":"clock","arguments":{"city":"Gdansk"}}'
+    parser = ToolCallStreamParser(
+        frozenset({"weather", "clock"}),
+        max_tool_calls=2,
+    )
+
+    emissions = parser.feed(f"{TOOL_CALL_OPEN}{first}</arg_value>{TOOL_CALL_OPEN}{second}")
+    emissions.extend(parser.finish())
+
+    calls = [emission for emission in emissions if isinstance(emission, ToolCallEmission)]
+    assert [call.name for call in calls] == ["weather", "clock"]
+    assert json.loads(calls[0].arguments) == {
+        "text": "literal <tool_call> and </arg_value> markers"
+    }
+    assert json.loads(calls[1].arguments) == {"city": "Gdansk"}
+
+
+def test_stream_parser_rejects_packed_json_unhashable_name() -> None:
+    payload = f'{{"name":[],"arguments":{{}}}}{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{}}}}'
+    parser = ToolCallStreamParser(frozenset({"weather"}), max_tool_calls=2)
+
+    parser.feed(f"{TOOL_CALL_OPEN}{payload}")
+
+    with pytest.raises(IncompleteToolCallError):
+        parser.finish()
+
+
 def test_stream_parser_recovers_packed_glm_bare_read_file_calls() -> None:
     base = "/workspace/example/monorepo/service/api/src/ciapi/service/runtime_x/"
     paths = [

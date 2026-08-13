@@ -527,19 +527,6 @@ def _decode_json_object(raw: str) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _parse_allowed_json_call(
-    raw: str,
-    allowed_tool_names: frozenset[str],
-) -> dict[str, Any] | None:
-    try:
-        parsed = parse_strict_json(raw)
-    except (json.JSONDecodeError, ValueError):
-        return None
-    if not isinstance(parsed, dict) or parsed.get("name") not in allowed_tool_names:
-        return None
-    return parsed
-
-
 def _decode_json_arg_value_close(
     body: str,
     allowed_tool_names: frozenset[str],
@@ -554,14 +541,31 @@ def _decode_json_arg_value_close(
     also keeps a segment left empty by a doubled marker failing closed instead
     of dropping the call whose payload never arrived.
     """
+    stripped = body.strip()
     calls: list[dict[str, Any]] = []
-    for segment in body.strip().split(TOOL_CALL_OPEN):
-        candidate = segment.strip().removesuffix(_ARG_VALUE_CLOSE).rstrip()
-        parsed = _parse_allowed_json_call(candidate, allowed_tool_names)
-        if parsed is None:
+    index = 0
+    while True:
+        try:
+            parsed, end = raw_decode_strict(stripped, index)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if (
+            not isinstance(parsed, dict)
+            or not isinstance(parsed.get("name"), str)
+            or parsed["name"] not in allowed_tool_names
+        ):
             return None
         calls.append(parsed)
-    return calls
+        index = _skip_whitespace(stripped, end)
+        if stripped.startswith(_ARG_VALUE_CLOSE, index):
+            index = _skip_whitespace(stripped, index + len(_ARG_VALUE_CLOSE))
+        if index == len(stripped):
+            return calls
+        if not stripped.startswith(TOOL_CALL_OPEN, index):
+            return None
+        index = _skip_whitespace(stripped, index + len(TOOL_CALL_OPEN))
+        if index == len(stripped):
+            return None
 
 
 def _decode_arg_key_value(
