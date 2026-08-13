@@ -229,7 +229,7 @@ wheels = [
 
 [[package]]
 name = "factory-droid-openai"
-version = "1.6.9"
+version = "1.6.10"
 source = { editable = "." }
 dependencies = [
     { name = "droid-sdk" },

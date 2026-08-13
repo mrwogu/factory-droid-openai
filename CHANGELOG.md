@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.6.10](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.9...v1.6.10) (2026-08-13)
+
+
+### Bug Fixes
+
+* **protocol:** recover packed python-call tool calls ([af5cbde](https://github.com/mrwogu/factory-droid-openai/commit/af5cbde92ad1d5d084d92ebb510e517d0b8f314d))
+* **protocol:** tighten python-call name spacing and residue ([ee26610](https://github.com/mrwogu/factory-droid-openai/commit/ee2661047039cbb07b05dfbb611ce1fa6af0a451))
+
 ## [1.6.9](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.8...v1.6.9) (2026-08-12)
 
 
