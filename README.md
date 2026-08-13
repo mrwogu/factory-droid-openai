@@ -1440,6 +1440,24 @@ tasks such as title generation.
 Log lines carry no prompt or completion text: sizes, counts, timings, model
 IDs, and session IDs only.
 
+The bridge writes one formatted record per event to stderr. For container
+diagnostics, capture the runtime output directly before sending it to a log
+collector or viewer:
+
+```bash
+# Docker:
+docker logs --timestamps droid-bridge > bridge-docker.log
+
+# Docker Compose:
+docker compose logs --no-color --no-log-prefix --timestamps droid-bridge > bridge-compose.log
+```
+
+These direct command outputs are the source of truth. If one contains one event
+and one copy of each field but a downstream export contains repeated fields,
+the duplication is in the collector or viewer, not the bridge. Do not feed
+already formatted lines back through a formatter that treats their fields as
+new record attributes.
+
 ### Payload tracing
 
 Prompts and malformed tool-call payloads stay out of the log stream. When a
