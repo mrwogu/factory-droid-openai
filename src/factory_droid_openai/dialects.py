@@ -630,37 +630,77 @@ def _coerce_arg_value(raw: str) -> Any:
     return parsed
 
 
-_PYTHON_CALL_PATTERN = re.compile(r"^([A-Za-z_][\w.-]*)\(\s*(\{.*\})\s*\)$", re.DOTALL)
+_PYTHON_CALL_PATTERN = re.compile(r"([A-Za-z_][\w.-]*)\s*\(\s*(?=\{)")
+# Closing punctuation a template repeats around a call. It carries no argument
+# data, so skipping it between and after calls cannot change what the client
+# executes, while prose still fails to parse as the next segment.
+_CALL_RESIDUE = ")}]"
 
 
 def _decode_python_call(
     body: str,
     allowed_tool_names: frozenset[str],
 ) -> list[dict[str, Any]] | None:
-    """Rebuilds python-call syntax: ``name({"key":"value"})``.
+    """Rebuilds one or more python-call segments: ``name({"key":"value"})``.
 
     Observed on GLM-family turns: the model answers with the function call it
-    would write in code instead of the requested JSON object. The name must
-    match an allowed tool exactly, so prose containing parentheses stays
-    rejected.
+    would write in code instead of the requested JSON object, packs several of
+    them into one marker pair, and repeats the closing ``})`` after the last
+    one. Every segment must name an allowed tool and carry one strict JSON
+    object, so prose containing parentheses stays rejected.
     """
-    match = _PYTHON_CALL_PATTERN.match(body.strip())
+    stripped = body.strip()
+    calls: list[dict[str, Any]] = []
+    index = 0
+    while len(calls) < _MAX_PACKED_CALLS:
+        parsed = _decode_python_call_segment(stripped, index, allowed_tool_names)
+        if parsed is None:
+            return None
+        call, index = parsed
+        calls.append(call)
+        index = _skip_call_residue(stripped, index)
+        if index == len(stripped):
+            return calls
+        if stripped.startswith(TOOL_CALL_OPEN, index):
+            index = _skip_call_residue(stripped, index + len(TOOL_CALL_OPEN))
+            if index == len(stripped):
+                return None
+    return None
+
+
+def _decode_python_call_segment(
+    segment: str,
+    index: int,
+    allowed_tool_names: frozenset[str],
+) -> tuple[dict[str, Any], int] | None:
+    match = _PYTHON_CALL_PATTERN.match(segment, index)
     if match is None:
         return None
     name = match.group(1)
     if name not in allowed_tool_names:
         return None
-    arguments = _decode_json_object(match.group(2))
-    if arguments is None:
+    try:
+        arguments, end = raw_decode_strict(segment, match.end())
+    except (json.JSONDecodeError, ValueError):
         return None
-    return [{"name": name, "arguments": arguments}]
+    end = _skip_whitespace(segment, end)
+    if not segment.startswith(")", end):
+        return None
+    return {"name": name, "arguments": arguments}, end + 1
+
+
+def _skip_call_residue(value: str, index: int) -> int:
+    index = _skip_whitespace(value, index)
+    while index < len(value) and value[index] in _CALL_RESIDUE:
+        index = _skip_whitespace(value, index + 1)
+    return index
 
 
 _BARE_CALL_PATTERN = re.compile(r"([A-Za-z_][\w.-]*)\s*(?=\{)")
 # Past this many segments the payload is malformed beyond any tool-call limit
 # an operator can configure, and the parser's byte cap alone would let a
 # pathological turn cost far more work than it can ever be worth.
-_MAX_PACKED_BARE_CALLS = 64
+_MAX_PACKED_CALLS = 64
 
 
 def _decode_bare_call(
@@ -678,7 +718,7 @@ def _decode_bare_call(
     stripped = body.strip()
     calls: list[dict[str, Any]] = []
     index = 0
-    while len(calls) < _MAX_PACKED_BARE_CALLS:
+    while len(calls) < _MAX_PACKED_CALLS:
         parsed = _decode_bare_call_segment(stripped, index, allowed_tool_names)
         if parsed is None:
             return None
