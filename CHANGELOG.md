@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.6.12](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.11...v1.6.12) (2026-08-14)
+
+
+### Bug Fixes
+
+* **protocol:** harden tool-call recovery ([f8e3354](https://github.com/mrwogu/factory-droid-openai/commit/f8e33543d717209e4c12b1b6df3dd074f3336440))
+* **protocol:** preserve packed JSON boundaries ([031967e](https://github.com/mrwogu/factory-droid-openai/commit/031967ecdc20ba907ed638d578cf7d985e638138))
+* **protocol:** reject alias collisions in lost-prefix repair ([aa598aa](https://github.com/mrwogu/factory-droid-openai/commit/aa598aa3b092100e3f3f9facff4060b85328a3c5))
+* **protocol:** repair JSON calls packed by open marker ([b801af5](https://github.com/mrwogu/factory-droid-openai/commit/b801af595cbf9e14a1ce2355accce08ce251a5ce))
+* **protocol:** stabilize JSON nesting limit ([460647c](https://github.com/mrwogu/factory-droid-openai/commit/460647c2132a3fb01f1d36ff2189047978162e83))
+
 ## [1.6.11](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.10...v1.6.11) (2026-08-13)
 
 
