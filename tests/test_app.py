@@ -1844,6 +1844,80 @@ async def test_streaming_protocol_error_uses_sse_error_shape(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_model_tool_json_over_the_depth_limit_never_returns_500(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    nested = "[" * 8 + "0" + "]" * 8
+    runner = FakeRunner(
+        [
+            TextDelta(
+                f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"value":{nested}}}}}'
+                f"{TOOL_CALL_CLOSE}"
+            ),
+            RunComplete(Usage()),
+        ]
+    )
+    payload = _payload(
+        stream=stream,
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ],
+    )
+    async with _client(_feature_app(tmp_path, runner, max_json_depth=8)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code != 500
+    if not stream:
+        assert response.status_code == 502
+        assert response.json()["error"]["type"] == "factory_protocol_error"
+        return
+    events = [
+        line.removeprefix("data: ")
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    assert json.loads(events[-2])["error"]["type"] == "factory_protocol_error"
+    assert events[-1] == "[DONE]"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_model_lone_surrogate_never_returns_500(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    runner = FakeRunner(
+        [
+            TextDelta("invalid\ud800text"),
+            RunComplete(Usage()),
+        ]
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(stream=stream),
+        )
+
+    assert response.status_code != 500
+    if not stream:
+        assert response.status_code == 502
+        assert response.json()["error"]["type"] == "factory_protocol_error"
+        return
+    events = [
+        line.removeprefix("data: ")
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    assert json.loads(events[-2])["error"]["type"] == "factory_protocol_error"
+    assert events[-1] == "[DONE]"
+
+
+@pytest.mark.asyncio
 async def test_streaming_malformed_tool_call_stops_with_note(tmp_path: Path) -> None:
     runner = FakeRunner(
         [
@@ -3751,6 +3825,50 @@ async def test_structured_output_over_the_byte_cap_fails_closed(
     ]
     assert chunks[-1]["error"]["type"] == "factory_protocol_error"
     assert "exceeds maximum" in chunks[-1]["error"]["message"]
+    assert not [
+        choice
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+        if choice["delta"].get("content")
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_structured_output_over_the_depth_limit_fails_closed(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    nested: object = 0
+    for _ in range(8):
+        nested = {"value": nested}
+    runner = FakeRunner(
+        [
+            TextDelta(json.dumps({"result": nested})),
+            RunComplete(Usage()),
+        ]
+    )
+    app = _feature_app(tmp_path, runner, max_json_depth=8)
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(
+                stream=stream,
+                response_format={"type": "json_object"},
+            ),
+        )
+
+    if not stream:
+        assert response.status_code == 502
+        assert "maximum JSON depth" in response.json()["error"]["message"]
+        return
+    chunks = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: {")
+    ]
+    assert chunks[-1]["error"]["type"] == "factory_protocol_error"
+    assert "maximum JSON depth" in chunks[-1]["error"]["message"]
     assert not [
         choice
         for chunk in chunks

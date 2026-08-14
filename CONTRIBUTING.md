@@ -110,6 +110,10 @@ Each fixture in `tests/fixtures/events/` holds one recorded Droid event stream
 plus the contract it satisfied, and `tests/test_replay.py` replays all of them
 through the ASGI app on every test run. Live runs stay in `traces/`, which is
 gitignored: rows and traces carry model output and account-specific denials.
+Every recovery path justified by live output should include its sanitized
+full-trace fixture. Use `seed` as the recorded model for hand-seeded fixtures;
+a seed can extend negative coverage but does not replace a production capture.
+Keep one fixture per scenario, model, and stream mode so replay IDs stay unique.
 
 Reasoning deltas are dropped from fixtures, because models quote the operator's
 instructions back inside them; `--keep-reasoning` overrides that for local

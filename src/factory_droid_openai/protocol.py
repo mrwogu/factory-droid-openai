@@ -10,6 +10,7 @@ from factory_droid_openai.attachments import AttachmentSet, extract_attachments
 from factory_droid_openai.dialects import (
     LOST_PREFIX_DECODER,
     MARKER_DIALECTS,
+    MAX_PACKED_CALLS,
     NATIVE_DIALECT,
     PAYLOAD_DECODERS,
     TOOL_CALL_CLOSE,
@@ -27,7 +28,12 @@ from factory_droid_openai.errors import (
 from factory_droid_openai.logs import debug as log_debug
 from factory_droid_openai.logs import trace as log_trace
 from factory_droid_openai.payloadlog import NULL_PAYLOAD_TRACER
-from factory_droid_openai.strictjson import decode_json_values, parse_strict_json
+from factory_droid_openai.strictjson import (
+    JsonNestingError,
+    decode_json_values,
+    json_depth_exceeds,
+    parse_strict_json,
+)
 
 if TYPE_CHECKING:
     from typing import Protocol
@@ -49,6 +55,8 @@ if TYPE_CHECKING:
 
 _MAX_TOOL_PAYLOAD_BYTES = 1_000_000
 _ARGUMENT_KEYS = ("arguments", "parameters", "args", "input")
+_ARG_KEY_REPAIR_MARKER = "<arg_key>"
+_ARG_VALUE_REPAIR_CLOSE = "</arg_value>"
 _UNPARSED_HEAD_CHARS = 64
 _MESSAGE_JSON_PATTERN = re.compile(r'\{\s*"(?:role|content|tool_calls|id|type)"\s*:')
 _MESSAGE_JSON_KEYS = ("role", "content", "tool_calls", "id", "type")
@@ -130,7 +138,7 @@ def build_prompt(
     tool_schema_bytes = 0
     for tool in selected_tools:
         payload = tool.model_dump(mode="json")
-        if _json_depth_exceeds(payload, max_json_depth):
+        if json_depth_exceeds(payload, max_json_depth):
             raise RequestTooLargeError(
                 f"tool schema exceeds maximum JSON depth of {max_json_depth}"
             )
@@ -157,7 +165,7 @@ def build_prompt(
             max_attachments=max_attachments,
             max_attachment_bytes=max_attachment_bytes,
         )
-        if _json_depth_exceeds(payload, max_json_depth):
+        if json_depth_exceeds(payload, max_json_depth):
             raise RequestTooLargeError(f"message exceeds maximum JSON depth of {max_json_depth}")
         serialized, serialized_bytes = _serialize_json(payload)
         message_bytes += serialized_bytes
@@ -326,6 +334,7 @@ class ToolCallStreamParser:
         *,
         require_tool_call: bool = False,
         max_tool_calls: int = 1,
+        max_json_depth: int = 32,
         repair_lost_prefix: bool = False,
         parse_message_json: bool = True,
         trace_payload: PayloadTrace | None = None,
@@ -334,6 +343,7 @@ class ToolCallStreamParser:
         self._allowed_tool_names = allowed_tool_names
         self._require_tool_call = require_tool_call
         self._max_tool_calls = max(1, max_tool_calls)
+        self._max_json_depth = max(1, max_json_depth)
         self._payload_decoders: tuple[PayloadDecoder, ...] = PAYLOAD_DECODERS
         if repair_lost_prefix:
             self._payload_decoders = (*PAYLOAD_DECODERS, LOST_PREFIX_DECODER)
@@ -344,6 +354,11 @@ class ToolCallStreamParser:
         self._payload_chunks: list[str] = []
         self._payload_bytes = 0
         self._close_tail = ""
+        self._payload_in_string = False
+        self._payload_escaped = False
+        self._payload_previous_significant: str | None = None
+        self._payload_quoted_close = False
+        self._payload_arg_key_repair = False
         self._message_json_chunks: list[str] = []
         self._message_json_bytes = 0
         self._message_json_depth = 0
@@ -365,6 +380,10 @@ class ToolCallStreamParser:
             error = self._pending_transcript_error
             self._pending_transcript_error = None
             raise error
+        try:
+            chunk.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ProtocolError("model output contains invalid Unicode") from exc
         if self._done:
             if self._ignore_transcript_tail:
                 return []
@@ -499,7 +518,7 @@ class ToolCallStreamParser:
             raise self._transcript_error(raw) from exc
 
         role = parsed.get("role")
-        if role in {"tool", "user"}:
+        if isinstance(role, str) and role in {"tool", "user"}:
             raise self._transcript_error(raw)
         if role != "assistant" or not parsed.get("tool_calls"):
             return self._emit_plain_json(raw, trailing)
@@ -523,6 +542,9 @@ class ToolCallStreamParser:
                 self._message_json_in_string = True
             elif char in "{[":
                 self._message_json_depth += 1
+                if self._message_json_depth > self._max_json_depth:
+                    self._reset_message_json()
+                    raise self._transcript_error("")
             elif char in "}]":
                 self._message_json_depth -= 1
                 if self._message_json_depth == 0:
@@ -583,6 +605,8 @@ class ToolCallStreamParser:
                         raise self._transcript_error(raw) from exc
             if not isinstance(arguments, dict):
                 raise self._transcript_error(raw)
+            if json_depth_exceeds(arguments, self._max_json_depth):
+                raise self._transcript_error(raw)
             emissions.extend(
                 self._emit_tool_calls(
                     [{"name": name, "arguments": arguments}],
@@ -640,35 +664,78 @@ class ToolCallStreamParser:
     def _consume_tool_payload(self, chunk: str) -> list[ProtocolEmission]:
         close_marker = self._dialect.close_marker
         value = self._close_tail + chunk
-        close_index = value.find(close_marker)
+        if self._dialect.json_quoted_close:
+            if not self._payload_arg_key_repair and _ARG_KEY_REPAIR_MARKER in value:
+                repair_index, _, _, _, _ = _find_marker_outside_json_string(
+                    value,
+                    _ARG_KEY_REPAIR_MARKER,
+                    in_string=self._payload_in_string,
+                    escaped=self._payload_escaped,
+                    previous_significant=self._payload_previous_significant,
+                )
+                self._payload_arg_key_repair = repair_index >= 0
+            close_index, _, _, _, quoted_close = _find_marker_outside_json_string(
+                value,
+                close_marker,
+                in_string=self._payload_in_string,
+                escaped=self._payload_escaped,
+                previous_significant=self._payload_previous_significant,
+                repair_value_close=self._payload_arg_key_repair,
+            )
+            self._payload_quoted_close = self._payload_quoted_close or quoted_close
+        else:
+            close_index = value.find(close_marker)
         if close_index < 0:
             held = _partial_marker_suffix_length(value, close_marker)
+            if self._dialect.json_quoted_close and not self._payload_arg_key_repair:
+                held = max(
+                    held,
+                    _partial_marker_suffix_length(value, _ARG_KEY_REPAIR_MARKER),
+                )
             committed = value[:-held] if held else value
-            self._append_payload(committed)
+            if self._dialect.json_quoted_close:
+                (
+                    _,
+                    self._payload_in_string,
+                    self._payload_escaped,
+                    self._payload_previous_significant,
+                    quoted_close,
+                ) = _find_marker_outside_json_string(
+                    committed,
+                    close_marker,
+                    in_string=self._payload_in_string,
+                    escaped=self._payload_escaped,
+                    previous_significant=self._payload_previous_significant,
+                    repair_value_close=self._payload_arg_key_repair,
+                )
+                self._payload_quoted_close = self._payload_quoted_close or quoted_close
+            try:
+                self._append_payload(committed)
+            except ProtocolError:
+                self._reset_tool_payload()
+                raise
             self._close_tail = value[-held:] if held else ""
             return []
 
         payload = value[:close_index]
-        self._append_payload(payload)
-        trailing = value[close_index + len(close_marker) :]
-        complete_payload = "".join(self._payload_chunks)
         try:
+            self._append_payload(payload)
+            complete_payload = "".join(self._payload_chunks)
+            if self._payload_arg_key_repair and self._payload_quoted_close:
+                raise MalformedToolCallError(
+                    "ambiguous close marker inside arg_key repair payload",
+                    tool_name=_guess_tool_name(
+                        complete_payload,
+                        self._allowed_tool_names,
+                    ),
+                    payload_bytes=len(complete_payload.encode("utf-8")),
+                )
             payload_objects = self._tool_payload_objects(complete_payload)
-        except MalformedToolCallError:
-            # The payload is garbage but complete: reset the capture state so
-            # finish() does not re-raise it as a truncated call.
-            self._payload_chunks.clear()
-            self._payload_bytes = 0
-            self._close_tail = ""
-            self._capturing = False
+        except ProtocolError:
+            self._reset_tool_payload()
             raise
-        self._payload_chunks.clear()
-        # The size limit is per payload, so the bounded call count is what caps
-        # the total bytes a single turn can buffer.
-        self._payload_bytes = 0
-        self._close_tail = ""
-        self._capturing = False
-
+        trailing = value[close_index + len(close_marker) :]
+        self._reset_tool_payload()
         emissions: list[ProtocolEmission] = list(
             self._emit_tool_calls(payload_objects, complete_payload)
         )
@@ -700,18 +767,31 @@ class ToolCallStreamParser:
             raise self._trailing_output_error()
         self._text_tail = value[-held:] if held else ""
 
-    def _recover_unclosed_tool_call(self) -> list[dict[str, Any]] | None:
-        """Repairs a tool call whose closing marker never arrived."""
-        # A held suffix is a verified close-marker prefix, not payload data.
-        payload = "".join(self._payload_chunks)
-        try:
-            objects = self._tool_payload_objects(payload)
-        except ProtocolError:
-            return None
+    def _reset_tool_payload(self) -> None:
         self._payload_chunks.clear()
         self._payload_bytes = 0
         self._close_tail = ""
+        self._payload_in_string = False
+        self._payload_escaped = False
+        self._payload_previous_significant = None
+        self._payload_quoted_close = False
+        self._payload_arg_key_repair = False
         self._capturing = False
+
+    def _recover_unclosed_tool_call(self) -> list[dict[str, Any]] | None:
+        """Repairs a tool call whose closing marker never arrived."""
+        # Only a close-marker prefix is verified framing; other held prefixes
+        # may be truncated payload data and must fail closed.
+        if self._close_tail and not self._dialect.close_marker.startswith(self._close_tail):
+            return None
+        payload = "".join(self._payload_chunks)
+        if self._payload_arg_key_repair and self._payload_quoted_close:
+            return None
+        try:
+            objects = self._tool_payload_objects(payload, enforce_call_limit=False)
+        except ProtocolError:
+            return None
+        self._reset_tool_payload()
         return objects
 
     def _emit_tool_calls(
@@ -770,7 +850,12 @@ class ToolCallStreamParser:
             raise ProtocolError("tool-call payload is too large")
         self._payload_chunks.append(value)
 
-    def _tool_payload_objects(self, payload: str) -> list[dict[str, Any]]:
+    def _tool_payload_objects(
+        self,
+        payload: str,
+        *,
+        enforce_call_limit: bool = True,
+    ) -> list[dict[str, Any]]:
         """Returns the tool-call objects a marker payload carries.
 
         Strict JSON first, then the decoders in
@@ -783,8 +868,18 @@ class ToolCallStreamParser:
         if not self._allowed_tool_names:
             raise ProtocolError("the model requested a tool when none are available")
         body = strip_code_fence(payload.strip())
+        object_limit = (
+            min(self._max_tool_calls, MAX_PACKED_CALLS) if enforce_call_limit else MAX_PACKED_CALLS
+        )
+        if _top_level_json_array_exceeds(body, MAX_PACKED_CALLS):
+            raise self._tool_call_limit_error(body, MAX_PACKED_CALLS + 1)
         try:
-            values = decode_json_values(body)
+            values = decode_json_values(
+                body,
+                max_values=object_limit,
+            )
+        except JsonNestingError as exc:
+            raise ProtocolError("tool-call JSON nesting exceeds the parser limit") from exc
         except (json.JSONDecodeError, ValueError) as exc:
             decoded = self._decode_payload(body)
             if decoded is None:
@@ -819,20 +914,41 @@ class ToolCallStreamParser:
                 log_debug("tool_call.repaired", variant="json_array")
                 self._trace_payload("tool_call.repaired", body, variant="json_array")
                 self._report_repair("tool_call.repaired", "json_array")
+                requested = len(objects) + len(value)
+                if requested > object_limit:
+                    self._report_packed_objects(body)
+                    raise self._tool_call_limit_error(body, requested)
+                if json_depth_exceeds(value, self._max_json_depth):
+                    raise ProtocolError(
+                        f"tool-call payload exceeds maximum JSON depth of {self._max_json_depth}"
+                    )
                 objects.extend(value)
                 continue
             if not isinstance(value, dict):
                 raise ProtocolError("tool-call payload must be a JSON object")
+            if len(objects) >= object_limit:
+                self._report_packed_objects(body)
+                raise self._tool_call_limit_error(body, len(objects) + 1)
+            if json_depth_exceeds(value, self._max_json_depth):
+                raise ProtocolError(
+                    f"tool-call payload exceeds maximum JSON depth of {self._max_json_depth}"
+                )
             objects.append(value)
         if len(objects) > 1:
-            log_debug("tool_call.repaired", variant="packed_objects")
-            self._trace_payload("tool_call.repaired", body, variant="packed_objects")
-            self._report_repair("tool_call.repaired", "packed_objects")
+            self._report_packed_objects(body)
         return objects
+
+    def _report_packed_objects(self, body: str) -> None:
+        log_debug("tool_call.repaired", variant="packed_objects")
+        self._trace_payload("tool_call.repaired", body, variant="packed_objects")
+        self._report_repair("tool_call.repaired", "packed_objects")
 
     def _decode_payload(self, body: str) -> list[Any] | None:
         for decoder in self._payload_decoders:
-            decoded = decoder.decode(body, self._allowed_tool_names)
+            try:
+                decoded = decoder.decode(body, self._allowed_tool_names)
+            except JsonNestingError as exc:
+                raise ProtocolError("tool-call JSON nesting exceeds the parser limit") from exc
             if decoded is not None:
                 log_debug("tool_call.repaired", variant=decoder.name)
                 self._trace_payload("tool_call.repaired", body, variant=decoder.name)
@@ -842,18 +958,24 @@ class ToolCallStreamParser:
 
     def _tool_call_from_object(self, parsed: dict[str, Any]) -> ToolCallEmission:
         name = parsed.get("name")
-        arguments = _tool_arguments(parsed)
+        argument_keys = [key for key in _ARGUMENT_KEYS if key in parsed]
         if not isinstance(name, str) or not name:
             raise ProtocolError("tool-call name must be a non-empty string")
         if name not in self._allowed_tool_names:
             raise ProtocolError(f"tool '{name}' is not available")
+        if not argument_keys:
+            raise ProtocolError("tool-call arguments must be a JSON object")
+        if len(argument_keys) > 1:
+            raise ProtocolError("tool call must contain exactly one arguments field")
+        arguments = parsed[argument_keys[0]]
         if not isinstance(arguments, dict):
             raise ProtocolError("tool-call arguments must be a JSON object")
+        arguments_json, _ = _serialize_json(arguments)
 
         return ToolCallEmission(
             id=f"call_{uuid.uuid4().hex[:24]}",
             name=name,
-            arguments=json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
+            arguments=arguments_json,
         )
 
 
@@ -907,28 +1029,37 @@ class StopSequenceBuffer:
         return held
 
 
-def _tool_arguments(parsed: dict[str, Any]) -> Any:
-    for key in _ARGUMENT_KEYS:
-        if key in parsed:
-            return parsed[key]
-    return None
-
-
 def _serialize_json(value: Any) -> tuple[str, int]:
     serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     return serialized, len(serialized.encode("utf-8"))
 
 
-def _json_depth_exceeds(value: Any, max_depth: int) -> bool:
-    stack: list[tuple[Any, int]] = [(value, 1)]
-    while stack:
-        current, depth = stack.pop()
-        if not isinstance(current, (dict, list)):
+def _top_level_json_array_exceeds(value: str, max_items: int) -> bool:
+    if not value.startswith("["):
+        return False
+    depth = 0
+    in_string = False
+    escaped = False
+    separators = 0
+    for char in value:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
             continue
-        if depth > max_depth:
-            return True
-        children = current.values() if isinstance(current, dict) else current
-        stack.extend((child, depth + 1) for child in children)
+        if char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+        elif char in "]}":
+            depth -= 1
+        elif char == "," and depth == 1:
+            separators += 1
+            if separators >= max_items:
+                return True
     return False
 
 
@@ -952,6 +1083,46 @@ def _guess_tool_name(payload: str, allowed_tool_names: frozenset[str]) -> str | 
     if match and match.group(1) in allowed_tool_names:
         return match.group(1)
     return None
+
+
+def _find_marker_outside_json_string(
+    value: str,
+    marker: str,
+    *,
+    in_string: bool,
+    escaped: bool,
+    previous_significant: str | None,
+    repair_value_close: bool = False,
+) -> tuple[int, bool, bool, str | None, bool]:
+    index = 0
+    quoted_marker = False
+    while index < len(value):
+        char = value[index]
+        if in_string:
+            if repair_value_close and value.startswith(_ARG_VALUE_REPAIR_CLOSE, index):
+                in_string = False
+                escaped = False
+                previous_significant = ">"
+                index += len(_ARG_VALUE_REPAIR_CLOSE)
+                continue
+            if value.startswith(marker, index):
+                quoted_marker = True
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if value.startswith(marker, index):
+            return index, in_string, escaped, previous_significant, quoted_marker
+        if char == '"' and previous_significant in {None, "{", "[", ":", ","}:
+            in_string = True
+        if not char.isspace():
+            previous_significant = char
+        index += 1
+    return -1, in_string, escaped, previous_significant, quoted_marker
 
 
 def _partial_marker_suffix_length(value: str, marker: str) -> int:
