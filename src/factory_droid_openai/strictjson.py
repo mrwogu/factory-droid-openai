@@ -20,7 +20,10 @@ class DuplicateKeyError(ValueError):
 
 
 class JsonNestingError(ValueError):
-    """Raised when Python's JSON decoder cannot safely traverse the input."""
+    """Raised when JSON exceeds the bridge's safe nesting limit."""
+
+
+_MAX_JSON_NESTING = 512
 
 
 def check_no_duplicate_keys(text: str) -> None:
@@ -49,6 +52,8 @@ def parse_strict_json(text: str) -> Any:
         )
     except RecursionError as exc:
         raise JsonNestingError("JSON nesting exceeds the parser limit") from exc
+    if json_depth_exceeds(parsed, _MAX_JSON_NESTING):
+        raise JsonNestingError("JSON nesting exceeds the parser limit")
     _check_utf8_strings(parsed)
     return parsed
 
@@ -84,6 +89,8 @@ def raw_decode_strict(text: str, index: int) -> tuple[Any, int]:
         parsed, end = _STRICT_DECODER.raw_decode(text, index)
     except RecursionError as exc:
         raise JsonNestingError("JSON nesting exceeds the parser limit") from exc
+    if json_depth_exceeds(parsed, _MAX_JSON_NESTING):
+        raise JsonNestingError("JSON nesting exceeds the parser limit")
     _check_utf8_strings(parsed)
     return parsed, end
 

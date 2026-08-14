@@ -501,8 +501,9 @@ def test_strict_json_keeps_finite_numbers() -> None:
     assert parse_strict_json('{"amount":1.5,"count":2}') == {"amount": 1.5, "count": 2}
 
 
-def test_strict_json_contains_excessive_nesting() -> None:
-    payload = "[" * 1100 + "0" + "]" * 1100
+@pytest.mark.parametrize("depth", [600, 1100])
+def test_strict_json_contains_excessive_nesting(depth: int) -> None:
+    payload = "[" * depth + "0" + "]" * depth
 
     with pytest.raises(ValueError, match="nesting exceeds"):
         parse_strict_json(payload)
@@ -558,9 +559,10 @@ def test_stream_parser_rejects_tool_arguments_over_the_json_depth_limit() -> Non
         parser.feed(f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE}")
 
 
-def test_stream_parser_contains_excessively_nested_tool_json() -> None:
+@pytest.mark.parametrize("depth", [600, 1100])
+def test_stream_parser_contains_excessively_nested_tool_json(depth: int) -> None:
     parser = ToolCallStreamParser(frozenset({"weather"}))
-    nested = "[" * 1100 + "0" + "]" * 1100
+    nested = "[" * depth + "0" + "]" * depth
 
     with pytest.raises(ProtocolError, match="nesting exceeds"):
         parser.feed(
