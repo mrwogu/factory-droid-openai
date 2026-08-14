@@ -1356,6 +1356,7 @@ def test_stream_parser_lost_prefix_keeps_scalar_wrapper_key() -> None:
         'unknown","city":"Gdansk"}',
         'weather","city":"Gdansk"',
         'weather","city":"A","city":"B"}',
+        'weather","arguments":{"city":"A"},"parameters":{"city":"B"}}',
     ],
 )
 def test_stream_parser_lost_prefix_stays_fail_closed(body: str) -> None:

@@ -1016,13 +1016,15 @@ def _decode_lost_prefix(
             except (json.JSONDecodeError, ValueError):
                 return None
             arguments: Any = parsed
-            if len(parsed) == 1:
-                for key in _WRAPPER_KEYS:
-                    if key in parsed and isinstance(parsed[key], dict):
-                        # The wrapped form survived as ``"arguments":{...}``;
-                        # a single-key mapping unwraps back to the arguments.
-                        arguments = parsed[key]
-                        break
+            wrapper_keys = [key for key in _WRAPPER_KEYS if key in parsed]
+            if len(wrapper_keys) > 1:
+                # Two argument aliases in one payload is ambiguous, so the
+                # repair fails closed like the strict path does.
+                return None
+            if len(parsed) == 1 and wrapper_keys and isinstance(parsed[wrapper_keys[0]], dict):
+                # The wrapped form survived as ``"arguments":{...}``;
+                # a single-key mapping unwraps back to the arguments.
+                arguments = parsed[wrapper_keys[0]]
             return [{"name": name, "arguments": arguments}]
     return None
 
