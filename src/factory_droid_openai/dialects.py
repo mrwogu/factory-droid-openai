@@ -24,7 +24,11 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from factory_droid_openai.strictjson import parse_strict_json, raw_decode_strict
+from factory_droid_openai.strictjson import (
+    JsonNestingError,
+    parse_strict_json,
+    raw_decode_strict,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -36,6 +40,7 @@ _ARG_KEY_OPEN = "<arg_key>"
 _ARG_KEY_CLOSE = "</arg_key>"
 _ARG_VALUE_OPEN = "<arg_value>"
 _ARG_VALUE_CLOSE = "</arg_value>"
+_ARG_CONTROL_PREFIXES = ("<arg_", "</arg_", "<tool_call", "</tool_call")
 
 _PIPE_TAG_TOOLS_OPEN = "<|open|>tools<|sep|>"
 _PIPE_TAG_TOOLS_CLOSE = "<|close|>tools"
@@ -98,7 +103,7 @@ _QWEN_FUNCTION_OPEN = "<function="
 _QWEN_FUNCTION_CLOSE = "</function>"
 _QWEN_PARAMETER_OPEN = "<parameter="
 _QWEN_PARAMETER_CLOSE = "</parameter>"
-_QWEN_PARAMETER_TOKEN = re.compile(r"</parameter>|<parameter=")
+_QWEN_PARAMETER_TOKEN = re.compile(r"</parameter>")
 
 _HARMONY_COMMENTARY_OPEN = "<|channel|>commentary to="
 _HARMONY_CALL_CLOSE = "<|call|>"
@@ -117,6 +122,7 @@ _FUNCTIONS_PREFIX = "functions."
 __all__ = [
     "LOST_PREFIX_DECODER",
     "MARKER_DIALECTS",
+    "MAX_PACKED_CALLS",
     "PAYLOAD_DECODERS",
     "TOOL_CALL_CLOSE",
     "TOOL_CALL_OPEN",
@@ -135,6 +141,7 @@ class MarkerDialect:
     open_marker: str
     close_marker: str
     control_tokens: tuple[str, ...] = ()
+    json_quoted_close: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,7 +152,27 @@ class PayloadDecoder:
     decode: Callable[[str, frozenset[str]], list[dict[str, Any]] | None]
 
 
-NATIVE_DIALECT = MarkerDialect("native", TOOL_CALL_OPEN, TOOL_CALL_CLOSE)
+# Past this many segments a malformed payload can only exceed every supported
+# operator limit, so every packing decoder stops before doing unbounded work.
+MAX_PACKED_CALLS = 64
+
+
+def _append_packed_call(
+    calls: list[dict[str, Any]],
+    call: dict[str, Any],
+) -> bool:
+    if len(calls) >= MAX_PACKED_CALLS:
+        return False
+    calls.append(call)
+    return True
+
+
+NATIVE_DIALECT = MarkerDialect(
+    "native",
+    TOOL_CALL_OPEN,
+    TOOL_CALL_CLOSE,
+    json_quoted_close=True,
+)
 # Observed on Kimi K3 turns served through Droid. Named after the token shape
 # rather than the model, because the same scaffolding shows up whenever a model
 # answers in its own template.
@@ -160,18 +187,21 @@ KIMI_K2_DIALECT = MarkerDialect(
     _KIMI_SECTION_OPEN,
     _KIMI_SECTION_CLOSE,
     _KIMI_CONTROL_TOKENS,
+    json_quoted_close=True,
 )
 HARMONY_DIALECT = MarkerDialect(
     "harmony",
     _HARMONY_COMMENTARY_OPEN,
     _HARMONY_CALL_CLOSE,
     _HARMONY_CONTROL_TOKENS,
+    json_quoted_close=True,
 )
 DEEPSEEK_DIALECT = MarkerDialect(
     "deepseek",
     _DEEPSEEK_SECTION_OPEN,
     _DEEPSEEK_SECTION_CLOSE,
     _DEEPSEEK_CONTROL_TOKENS,
+    json_quoted_close=True,
 )
 # The InternLM2 template selects a target right after the opening token, so the
 # tool form is the two-token sequence rather than <|action_start|> alone; the
@@ -181,6 +211,7 @@ INTERNLM2_DIALECT = MarkerDialect(
     _INTERNLM_ACTION_OPEN,
     _INTERNLM_ACTION_CLOSE,
     _INTERNLM_CONTROL_TOKENS,
+    json_quoted_close=True,
 )
 MARKER_DIALECTS: tuple[MarkerDialect, ...] = (
     NATIVE_DIALECT,
@@ -210,7 +241,11 @@ def strip_code_fence(payload: str) -> str:
         return payload
     body = payload[newline + 1 :]
     closing = body.rfind("```")
-    return body[:closing].strip() if closing >= 0 else body.strip()
+    if closing < 0:
+        return body.strip()
+    if body[closing + 3 :].strip():
+        return payload
+    return body[:closing].strip()
 
 
 def _decode_pipe_tag_tokens(
@@ -248,7 +283,8 @@ def _decode_pipe_tag_tokens(
         trailing = body[call_end + len(_PIPE_TAG_CALL_CLOSE) : block_end]
         if arguments is None or not _pipe_tag_noise_only(trailing):
             return None
-        calls.append({"name": name, "arguments": arguments})
+        if not _append_packed_call(calls, {"name": name, "arguments": arguments}):
+            return None
         index = next_index
     return calls
 
@@ -274,7 +310,10 @@ def _pipe_tag_arguments(block: str) -> dict[str, Any] | None:
             # A truncated value would silently drop data, so fail closed.
             return None
         raw = block[header_end + len(_PIPE_TAG_SEP) : value_end]
-        arguments[key] = _coerce_pipe_tag_value(raw, attributes.get("type"))
+        valid, decoded = _decode_pipe_tag_value(raw, attributes.get("type"))
+        if not valid:
+            return None
+        arguments[key] = decoded
         next_index = block.find(_PIPE_TAG_ARG_OPEN, value_end + len(_PIPE_TAG_ARG_CLOSE))
         trailing_end = next_index if next_index >= 0 else len(block)
         if not _pipe_tag_noise_only(block[value_end + len(_PIPE_TAG_ARG_CLOSE) : trailing_end]):
@@ -305,12 +344,29 @@ def _pipe_tag_attributes(
     return attributes if not header[cursor:].strip() else None
 
 
-def _coerce_pipe_tag_value(raw: str, kind: str | None) -> Any:
+def _decode_pipe_tag_value(raw: str, kind: str | None) -> tuple[bool, Any]:
     # A declared string type is authoritative: coercing "1" to a number there
     # would change the argument the client receives.
     if kind == "string":
-        return raw
-    return _coerce_arg_value(raw.strip())
+        return True, raw
+    candidate = raw.strip()
+    try:
+        parsed = parse_strict_json(candidate)
+    except JsonNestingError:
+        raise
+    except (json.JSONDecodeError, ValueError):
+        return (True, candidate) if kind is None else (False, None)
+    if kind is None:
+        return True, parsed
+    matches = {
+        "array": isinstance(parsed, list),
+        "boolean": isinstance(parsed, bool),
+        "integer": isinstance(parsed, int) and not isinstance(parsed, bool),
+        "null": parsed is None,
+        "number": isinstance(parsed, (int, float)) and not isinstance(parsed, bool),
+        "object": isinstance(parsed, dict),
+    }
+    return matches.get(kind, False), parsed
 
 
 def _decode_kimi_sections(
@@ -341,7 +397,8 @@ def _decode_kimi_sections(
         arguments = _decode_json_object(raw)
         if arguments is None:
             return None
-        calls.append({"name": name, "arguments": arguments})
+        if not _append_packed_call(calls, {"name": name, "arguments": arguments}):
+            return None
         call_end += len(_KIMI_CALL_CLOSE)
         next_index = body.find(_KIMI_CALL_OPEN, call_end)
         trailing_end = next_index if next_index >= 0 else len(body)
@@ -408,7 +465,8 @@ def _decode_deepseek_calls(
         arguments = _decode_json_object(raw) if name else None
         if name is None or arguments is None:
             return None
-        calls.append({"name": name, "arguments": arguments})
+        if not _append_packed_call(calls, {"name": name, "arguments": arguments}):
+            return None
         call_end += len(_DEEPSEEK_CALL_CLOSE)
         next_index = body.find(_DEEPSEEK_CALL_OPEN, call_end)
         trailing_end = next_index if next_index >= 0 else len(body)
@@ -461,7 +519,8 @@ def _decode_function_parameter_tags(
             return None
         if body[close + len(_QWEN_FUNCTION_CLOSE) : trailing_end].strip():
             return None
-        calls.append({"name": name, "arguments": arguments})
+        if not _append_packed_call(calls, {"name": name, "arguments": arguments}):
+            return None
         index = next_index
     return calls
 
@@ -483,12 +542,11 @@ def _qwen_call(body: str, name_end: int) -> tuple[int, dict[str, Any]] | None:
         parameter_token = _QWEN_PARAMETER_TOKEN.search(body, key_end + 1)
         if parameter_token is None or not key or key in arguments:
             return None
-        arguments[key] = _qwen_value(body[key_end + 1 : parameter_token.start()])
-        cursor = (
-            parameter_token.end()
-            if parameter_token.group() == _QWEN_PARAMETER_CLOSE
-            else parameter_token.start()
-        )
+        raw_value = body[key_end + 1 : parameter_token.start()]
+        if _QWEN_PARAMETER_OPEN in raw_value:
+            return None
+        arguments[key] = _qwen_value(raw_value)
+        cursor = parameter_token.end()
 
 
 def _qwen_value(raw: str) -> Any:
@@ -501,6 +559,8 @@ def _qwen_value(raw: str) -> Any:
         # wrote instead of being guessed into another type.
         try:
             return parse_strict_json(candidate)
+        except JsonNestingError:
+            raise
         except (json.JSONDecodeError, ValueError):
             return value
     return value
@@ -555,7 +615,8 @@ def _decode_json_arg_value_close(
             or parsed["name"] not in allowed_tool_names
         ):
             return None
-        calls.append(parsed)
+        if not _append_packed_call(calls, parsed):
+            return None
         index = _skip_whitespace(stripped, end)
         if stripped.startswith(_ARG_VALUE_CLOSE, index):
             index = _skip_whitespace(stripped, index + len(_ARG_VALUE_CLOSE))
@@ -586,7 +647,7 @@ def _decode_arg_key_value(
             return None
         key = body[index + len(_ARG_KEY_OPEN) : key_end].strip()
         value_start = body.find(_ARG_VALUE_OPEN, key_end)
-        if not key or key in arguments or value_start < 0:
+        if not key or _has_arg_control_markup(key) or key in arguments or value_start < 0:
             return None
         key_trailing = body[key_end + len(_ARG_KEY_CLOSE) : value_start]
         if key_trailing.strip():
@@ -629,9 +690,15 @@ def _decode_bare_name(
 def _coerce_arg_value(raw: str) -> Any:
     try:
         parsed = parse_strict_json(raw)
+    except JsonNestingError:
+        raise
     except (json.JSONDecodeError, ValueError):
         return raw
     return parsed
+
+
+def _has_arg_control_markup(value: str) -> bool:
+    return any(prefix in value for prefix in _ARG_CONTROL_PREFIXES)
 
 
 _PYTHON_CALL_PATTERN = re.compile(r"([A-Za-z_][\w.-]*)\(\s*(?=\{)")
@@ -656,7 +723,7 @@ def _decode_python_call(
     stripped = body.strip()
     calls: list[dict[str, Any]] = []
     index = 0
-    while len(calls) < _MAX_PACKED_CALLS:
+    while len(calls) < MAX_PACKED_CALLS:
         parsed = _decode_python_call_segment(stripped, index, allowed_tool_names)
         if parsed is None:
             return None
@@ -701,10 +768,6 @@ def _skip_call_residue(value: str, index: int) -> int:
 
 
 _BARE_CALL_PATTERN = re.compile(r"([A-Za-z_][\w.-]*)\s*(?=\{)")
-# Past this many segments the payload is malformed beyond any tool-call limit
-# an operator can configure, and the parser's byte cap alone would let a
-# pathological turn cost far more work than it can ever be worth.
-_MAX_PACKED_CALLS = 64
 
 
 def _decode_bare_call(
@@ -723,7 +786,7 @@ def _decode_bare_call(
     stripped = body.strip()
     calls: list[dict[str, Any]] = []
     index = 0
-    while len(calls) < _MAX_PACKED_CALLS:
+    while len(calls) < MAX_PACKED_CALLS:
         parsed = _decode_bare_call_segment(stripped, index, allowed_tool_names)
         if parsed is None:
             return None
@@ -766,7 +829,7 @@ def _skip_whitespace(value: str, index: int) -> int:
     return index
 
 
-_ARG_KEY_REPAIR_TERMINATORS = ("<arg_key>", _ARG_VALUE_CLOSE, "<tool_call>")
+_ARG_KEY_REPAIR_TERMINATORS = ("<arg_key>", _ARG_VALUE_CLOSE)
 
 
 def _decode_arg_key_value_repair(
@@ -785,14 +848,11 @@ def _decode_arg_key_value_repair(
     """
     if _ARG_KEY_OPEN not in body:
         return None
-    segments = [
-        segment.strip()
-        for segment in body.replace(TOOL_CALL_CLOSE, TOOL_CALL_OPEN).split(TOOL_CALL_OPEN)
-    ]
+    segments = _arg_key_repair_segments(body)
+    if segments is None:
+        return None
     calls: list[dict[str, Any]] = []
     for segment in segments:
-        if not segment:
-            continue
         parsed = _arg_key_repair_segment(segment, allowed_tool_names)
         if parsed is None:
             return None
@@ -800,11 +860,71 @@ def _decode_arg_key_value_repair(
     return calls or None
 
 
+def _arg_key_repair_segments(body: str) -> list[str] | None:
+    value = body.replace(TOOL_CALL_CLOSE, TOOL_CALL_OPEN).strip()
+    start = 0
+    if value.startswith(TOOL_CALL_OPEN):
+        start = _skip_whitespace(value, len(TOOL_CALL_OPEN))
+    if start >= len(value) or value.startswith(TOOL_CALL_OPEN, start):
+        return None
+    segments: list[str] = []
+    while True:
+        marker = _find_arg_key_separator(value, start)
+        if marker < 0:
+            segment = value[start:].strip()
+            if not segment or len(segments) >= MAX_PACKED_CALLS:
+                return None
+            segments.append(segment)
+            return segments
+        segment = value[start:marker].strip()
+        valid_end = (
+            segment.endswith(_ARG_VALUE_CLOSE)
+            if _ARG_VALUE_OPEN in segment
+            else segment.endswith("}")
+        )
+        if not segment or not valid_end or len(segments) >= MAX_PACKED_CALLS:
+            return None
+        segments.append(segment)
+        start = _skip_whitespace(value, marker + len(TOOL_CALL_OPEN))
+        if start >= len(value) or value.startswith(TOOL_CALL_OPEN, start):
+            return None
+
+
+def _find_arg_key_separator(value: str, start: int) -> int:
+    in_string = False
+    escaped = False
+    previous_significant: str | None = None
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if index >= start and value.startswith(TOOL_CALL_OPEN, index):
+            return index
+        if char == '"' and previous_significant in {None, "{", "[", ":", ","}:
+            in_string = True
+        if not char.isspace():
+            previous_significant = char
+        index += 1
+    return -1
+
+
 def _arg_key_repair_segment(
     segment: str,
     allowed_tool_names: frozenset[str],
 ) -> dict[str, Any] | None:
+    if TOOL_CALL_OPEN in segment or TOOL_CALL_CLOSE in segment:
+        return None
     index = segment.find(_ARG_KEY_OPEN)
+    if index < 0:
+        return None
     name = segment[:index].strip()
     if not name or name not in allowed_tool_names:
         return None
@@ -826,9 +946,6 @@ def _arg_key_repair_segment(
     return {"name": name, "arguments": arguments}
 
 
-_ARG_KEY_NAME_PATTERN = re.compile(r"^[A-Za-z_][\w.-]*$")
-
-
 def _arg_key_repair_entry(rest: str) -> tuple[str, Any, str] | None:
     key_close = rest.find(_ARG_KEY_CLOSE)
     json_sep = rest.find('":"')
@@ -848,7 +965,7 @@ def _arg_key_repair_entry(rest: str) -> tuple[str, Any, str] | None:
         value, remainder = _arg_key_repair_value(rest[json_sep + 3 :], quoted=True)
     else:
         return None
-    if not _ARG_KEY_NAME_PATTERN.match(key):
+    if not key or _has_arg_control_markup(key):
         return None
     return key, value, remainder
 

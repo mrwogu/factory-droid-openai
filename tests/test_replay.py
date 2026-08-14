@@ -107,6 +107,23 @@ def test_the_fixture_directory_is_not_empty() -> None:
     assert FIXTURES, "replay fixtures are the offline safety net; do not delete them all"
 
 
+def test_replay_fixture_identities_are_unique() -> None:
+    identities: dict[tuple[str, str, bool], Path] = {}
+    for path in FIXTURES:
+        first = path.read_text(encoding="utf-8").splitlines()[0]
+        meta = json.loads(first)
+        assert meta["kind"] == "meta"
+        identity = (
+            meta["scenario"],
+            meta["recorded_model"],
+            meta["stream"],
+        )
+        assert identity not in identities, (
+            f"{path.name} duplicates replay identity from {identities[identity].name}"
+        )
+        identities[identity] = path
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", FIXTURES, ids=lambda path: path.stem)
 async def test_recorded_events_keep_satisfying_the_contract(

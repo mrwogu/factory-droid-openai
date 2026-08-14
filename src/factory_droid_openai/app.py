@@ -82,6 +82,7 @@ from factory_droid_openai.runner import (
 from factory_droid_openai.strictjson import (
     DuplicateKeyError,
     check_no_duplicate_keys,
+    json_depth_exceeds,
 )
 from factory_droid_openai.telemetry import DEFAULT_TELEMETRY_ENDPOINT, TelemetryReporter
 
@@ -230,6 +231,7 @@ class StructuredOutput:
     payload: dict[str, Any]
     validator: Validator
     max_bytes: int
+    max_depth: int = 32
 
 
 class StructuredOutputBuffer:
@@ -1247,6 +1249,7 @@ def create_app(
                 payload,
                 max_schema_bytes=resolved_settings.max_tool_schema_bytes,
                 max_output_bytes=resolved_settings.max_structured_output_bytes,
+                max_json_depth=resolved_settings.max_json_depth,
             )
             plan = build_prompt(
                 payload,
@@ -1388,6 +1391,7 @@ def create_app(
                 max_tool_calls=(
                     resolved_settings.max_tool_calls if payload.parallel_tool_calls else 1
                 ),
+                max_json_depth=resolved_settings.max_json_depth,
                 repair_lost_prefix=resolved_settings.repair_lost_prefix,
                 parse_message_json=structured is None,
                 trace_payload=payload_tracer.trace,
@@ -2354,6 +2358,7 @@ def _prepare_output_format(
     *,
     max_schema_bytes: int,
     max_output_bytes: int,
+    max_json_depth: int,
 ) -> StructuredOutput | None:
     response_format = payload.response_format
     if response_format is None:
@@ -2389,6 +2394,7 @@ def _prepare_output_format(
         payload={"type": "json_schema", "schema": schema},
         validator=validator_class(schema),
         max_bytes=max_output_bytes,
+        max_depth=max_json_depth,
     )
 
 
@@ -2401,6 +2407,10 @@ def _validate_structured_output(text: str, structured: StructuredOutput) -> None
         value = parse_strict_json(text)
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ProtocolError("Factory Droid returned invalid structured JSON output") from exc
+    if json_depth_exceeds(value, structured.max_depth):
+        raise ProtocolError(
+            f"Factory Droid structured output exceeds maximum JSON depth of {structured.max_depth}"
+        )
     try:
         structured.validator.validate(value)
     except JsonSchemaValidationError as exc:

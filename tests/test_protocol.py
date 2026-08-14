@@ -8,8 +8,8 @@ import pytest
 
 from factory_droid_openai import logs, protocol
 from factory_droid_openai.dialects import (
-    _MAX_PACKED_CALLS,
     MARKER_DIALECTS,
+    MAX_PACKED_CALLS,
     MarkerDialect,
 )
 from factory_droid_openai.models import ChatCompletionRequest
@@ -501,6 +501,25 @@ def test_strict_json_keeps_finite_numbers() -> None:
     assert parse_strict_json('{"amount":1.5,"count":2}') == {"amount": 1.5, "count": 2}
 
 
+def test_strict_json_contains_excessive_nesting() -> None:
+    payload = "[" * 1100 + "0" + "]" * 1100
+
+    with pytest.raises(ValueError, match="nesting exceeds"):
+        parse_strict_json(payload)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"value":"\\ud800"}',
+        '{"\\udfff":"value"}',
+    ],
+)
+def test_strict_json_rejects_lone_unicode_surrogates(payload: str) -> None:
+    with pytest.raises(ValueError, match="invalid Unicode surrogate"):
+        parse_strict_json(payload)
+
+
 def test_check_no_duplicate_keys_rejects_repeated_keys() -> None:
     with pytest.raises(DuplicateKeyError, match="duplicate key 'model'"):
         check_no_duplicate_keys('{"model":"a","model":"b"}')
@@ -529,6 +548,46 @@ def test_stream_parser_rejects_non_finite_tool_arguments() -> None:
         parser.feed(
             f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"lat":1e999}}}}{TOOL_CALL_CLOSE}'
         )
+
+
+def test_stream_parser_rejects_tool_arguments_over_the_json_depth_limit() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}), max_json_depth=4)
+    payload = '{"name":"weather","arguments":{"values":[[[0]]]}}'
+
+    with pytest.raises(ProtocolError, match="maximum JSON depth"):
+        parser.feed(f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE}")
+
+
+def test_stream_parser_contains_excessively_nested_tool_json() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    nested = "[" * 1100 + "0" + "]" * 1100
+
+    with pytest.raises(ProtocolError, match="nesting exceeds"):
+        parser.feed(
+            f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"value":{nested}}}}}'
+            f"{TOOL_CALL_CLOSE}"
+        )
+
+
+def test_stream_parser_rejects_lone_surrogate_in_repaired_arguments() -> None:
+    parser = ToolCallStreamParser(frozenset({"write_file"}))
+    payload = (
+        f"{_PIPE_TAG_OPEN}"
+        '<|open|>call tool="write_file"<|sep|>'
+        '<|open|>argument key="content" type="string"<|sep|>'
+        "\ud800<|close|>argument<|sep|><|close|>call<|sep|>"
+        f"{_PIPE_TAG_CLOSE}"
+    )
+
+    with pytest.raises(ProtocolError, match="invalid Unicode"):
+        parser.feed(payload)
+
+
+def test_stream_parser_rejects_lone_surrogate_in_plain_text() -> None:
+    parser = ToolCallStreamParser(frozenset())
+
+    with pytest.raises(ProtocolError, match="invalid Unicode"):
+        parser.feed("plain\udffftext")
 
 
 def test_stream_parser_requires_object_arguments() -> None:
@@ -575,6 +634,10 @@ def test_stream_parser_accepts_whitespace_after_tool_call() -> None:
     ("value", "message"),
     [
         (f"{TOOL_CALL_OPEN}{{", "incomplete tool-call marker"),
+        (
+            f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{}}}}<arg_',
+            "incomplete tool-call marker",
+        ),
         (
             f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{}}}}{TOOL_CALL_CLOSE}trailing',
             "unexpected text after tool call",
@@ -1191,9 +1254,47 @@ def test_stream_parser_rejects_non_finite_message_values(payload: str) -> None:
         parser.feed(payload)
 
 
+def test_stream_parser_rejects_message_json_over_the_depth_limit() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}), max_json_depth=3)
+    payload = '{"role":"assistant","metadata":{"nested":{"value":{"deep":0}}}}'
+
+    with pytest.raises(MalformedToolCallError, match="echoed an OpenAI transcript"):
+        parser.feed(payload)
+
+
+def test_stream_parser_rejects_string_arguments_over_the_depth_limit() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}), max_json_depth=4)
+    arguments = json.dumps({"values": [[[[0]]]]})
+    payload = json.dumps(
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "arguments": arguments,
+                    },
+                }
+            ],
+        },
+        separators=(",", ":"),
+    )
+
+    with pytest.raises(MalformedToolCallError, match="echoed an OpenAI transcript"):
+        parser.feed(payload)
+
+
 def test_stream_parser_preserves_non_message_json() -> None:
     parser = ToolCallStreamParser(frozenset({"weather"}))
     payload = '{"role":1.5}'
+
+    assert parser.feed(payload) == [TextEmission(payload)]
+
+
+@pytest.mark.parametrize("payload", ['{"role":[]}', '{"role":{}}'])
+def test_stream_parser_preserves_json_with_non_string_role(payload: str) -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
 
     assert parser.feed(payload) == [TextEmission(payload)]
 
@@ -1270,6 +1371,7 @@ def test_stream_parser_lost_prefix_stays_fail_closed(body: str) -> None:
         "weather<arg_key></arg_key><arg_value>Gdansk</arg_value>",
         "weather<arg_key>city</arg_key><arg_value>A</arg_value>"
         "<arg_key>city</arg_key><arg_value>B</arg_value>",
+        "weather<arg_key>bad<arg_value>key</arg_key><arg_value>x</arg_value>",
         "<arg_key>city</arg_key><arg_value>Gdansk</arg_value>",
     ],
 )
@@ -1393,6 +1495,17 @@ def test_stream_parser_repairs_arg_key_payload_with_leading_separator() -> None:
     assert json.loads(emissions[0].arguments) == {"name": "apple-notes"}
 
 
+def test_stream_parser_repairs_arg_key_payload_with_space_in_key() -> None:
+    parser = ToolCallStreamParser(frozenset({"skill_view"}))
+
+    emissions = parser.feed(
+        f'{TOOL_CALL_OPEN}skill_view<arg_key>file path":"notes.txt"}}{TOOL_CALL_CLOSE}'
+    )
+
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == {"file path": "notes.txt"}
+
+
 def test_stream_parser_repairs_arg_key_mangled_two_call_payload() -> None:
     parser = ToolCallStreamParser(
         frozenset({"skill_view", "terminal"}),
@@ -1419,7 +1532,7 @@ def test_stream_parser_repairs_arg_key_mangled_two_call_payload() -> None:
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [
-        ('skill_view<arg_key>count":"3}', {"count": 3}),
+        ('skill_view<arg_key>count":"3"}', {"count": 3}),
         ('skill_view<arg_key>name":"abc"', {"name": "abc"}),
     ],
 )
@@ -1436,14 +1549,31 @@ def test_stream_parser_repairs_arg_key_value_endings(
     assert json.loads(emissions[0].arguments) == expected
 
 
+def test_stream_parser_repairs_proper_arg_key_value_with_packed_residue() -> None:
+    parser = ToolCallStreamParser(frozenset({"skill_view"}), max_tool_calls=2)
+    payload = (
+        "skill_view<arg_key>count</arg_key><arg_value>3}</arg_value>"
+        f"{TOOL_CALL_OPEN}"
+        'skill_view<arg_key>name":"abc"}'
+    )
+
+    emissions = parser.feed(f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE}")
+
+    calls = [emission for emission in emissions if isinstance(emission, ToolCallEmission)]
+    assert [json.loads(call.arguments) for call in calls] == [
+        {"count": 3},
+        {"name": "abc"},
+    ]
+
+
 @pytest.mark.parametrize(
     "payload",
     [
         'unknown<arg_key>name":"apple-notes"}',
-        'skill_view<arg_key>na me":"apple-notes"}',
         'skill_view<arg_key>name":"a"}<arg_key>name":"b"}',
         'skill_view<arg_key>name":"a"}</arg_value> junk',
         'skill_view<arg_key>name":"a"}<tool_call>unknown<arg_key>k":"v"}',
+        'skill_view<arg_key>bad<arg_key>key":"x"',
     ],
 )
 def test_stream_parser_rejects_unrepairable_arg_key_repair_payloads(payload: str) -> None:
@@ -1476,6 +1606,17 @@ def test_stream_parser_repairs_unterminated_fence() -> None:
 
     assert len(emissions) == 1
     assert isinstance(emissions[0], ToolCallEmission)
+
+
+def test_stream_parser_rejects_data_after_a_closed_code_fence() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    with pytest.raises(ProtocolError, match="invalid tool-call JSON"):
+        parser.feed(
+            f"{TOOL_CALL_OPEN}```json\n"
+            '{"name":"weather","arguments":{"city":"Sopot"}}\n'
+            f"```garbage{TOOL_CALL_CLOSE}"
+        )
 
 
 def test_stream_parser_keeps_single_line_fence_unrepaired() -> None:
@@ -1823,9 +1964,14 @@ def test_stream_parser_recovers_pipe_tag_call_without_close_marker() -> None:
     [
         ('key="city" type="string"', "123", "123"),
         ('key="days" type="number"', "3", 3),
+        ('key="days" type="integer"', "3", 3),
         ('key="metric" type="boolean"', "true", True),
         ('key="filter" type="object"', '{"unit":"c"}', {"unit": "c"}),
+        ('key="cities" type="array"', '["Gdansk","Sopot"]', ["Gdansk", "Sopot"]),
+        ('key="value" type="null"', "null", None),
         ('key="days"', "7", 7),
+        ('key="city"', "Gdansk", "Gdansk"),
+        ('key="city"', "  Gdansk  ", "Gdansk"),
     ],
 )
 def test_stream_parser_coerces_pipe_tag_argument_values(
@@ -1845,6 +1991,64 @@ def test_stream_parser_coerces_pipe_tag_argument_values(
 
     assert isinstance(emissions[0], ToolCallEmission)
     assert list(json.loads(emissions[0].arguments).values()) == [expected]
+
+
+@pytest.mark.parametrize(
+    ("declared_type", "raw"),
+    [
+        ("number", "true"),
+        ("integer", "1.5"),
+        ("boolean", "yes"),
+        ("object", "[]"),
+        ("array", "{}"),
+        ("null", "false"),
+        ("unknown", '"value"'),
+        ("number", "many"),
+    ],
+)
+def test_stream_parser_rejects_mismatched_pipe_tag_argument_types(
+    declared_type: str,
+    raw: str,
+) -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    with pytest.raises(ProtocolError, match="invalid tool-call JSON"):
+        parser.feed(
+            f"{_PIPE_TAG_OPEN}"
+            '<|open|>call tool="weather"<|sep|>'
+            f'<|open|>argument key="value" type="{declared_type}"<|sep|>'
+            f"{raw}<|close|>argument<|sep|><|close|>call<|sep|>"
+            f"{_PIPE_TAG_CLOSE}"
+        )
+
+
+@pytest.mark.parametrize("decoder", ["pipe-tag", "qwen", "arg-key"])
+def test_recovery_decoders_do_not_downgrade_excessive_json_nesting(
+    decoder: str,
+) -> None:
+    nested = "[" * 1100 + "0" + "]" * 1100
+    if decoder == "pipe-tag":
+        stream = (
+            f"{_PIPE_TAG_OPEN}"
+            '<|open|>call tool="weather"<|sep|>'
+            '<|open|>argument key="value" type="array"<|sep|>'
+            f"{nested}<|close|>argument<|sep|><|close|>call<|sep|>"
+            f"{_PIPE_TAG_CLOSE}"
+        )
+    elif decoder == "qwen":
+        stream = (
+            f"{TOOL_CALL_OPEN}<function=weather><parameter=value>{nested}"
+            f"</parameter></function>{TOOL_CALL_CLOSE}"
+        )
+    else:
+        stream = (
+            f"{TOOL_CALL_OPEN}weather<arg_key>value</arg_key>"
+            f"<arg_value>{nested}</arg_value>{TOOL_CALL_CLOSE}"
+        )
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    with pytest.raises(ProtocolError, match="nesting exceeds"):
+        parser.feed(stream)
 
 
 def test_stream_parser_preserves_pipe_tag_string_whitespace() -> None:
@@ -2423,18 +2627,15 @@ def test_stream_parser_preserves_qwen_function_tags_inside_values() -> None:
     }
 
 
-def test_stream_parser_recovers_a_qwen_parameter_without_its_close_tag() -> None:
-    # The next parameter tag still delimits the value, so the call survives.
+def test_stream_parser_rejects_qwen_parameter_without_its_close_tag() -> None:
     parser = ToolCallStreamParser(frozenset({"get_current_weather"}))
 
-    emissions = parser.feed(
-        f"{TOOL_CALL_OPEN}\n<function=get_current_weather>\n"
-        "<parameter=city>\nDallas\n<parameter=state>\nTX\n</parameter>\n"
-        f"</function>\n{TOOL_CALL_CLOSE}"
-    )
-
-    assert isinstance(emissions[0], ToolCallEmission)
-    assert json.loads(emissions[0].arguments) == {"city": "Dallas", "state": "TX"}
+    with pytest.raises(ProtocolError, match="invalid tool-call JSON"):
+        parser.feed(
+            f"{TOOL_CALL_OPEN}\n<function=get_current_weather>\n"
+            "<parameter=city>\nDallas\n<parameter=state>\nTX\n</parameter>\n"
+            f"</function>\n{TOOL_CALL_CLOSE}"
+        )
 
 
 @pytest.mark.parametrize(
@@ -2541,6 +2742,46 @@ def test_stream_parser_accepts_a_json_array_of_calls() -> None:
     assert [json.loads(call.arguments)["city"] for call in calls] == ["Gdansk", "Sopot"]
 
 
+def test_stream_parser_rejects_json_array_over_the_configured_call_limit() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}), max_tool_calls=1)
+    payload = (
+        '[{"name":"weather","arguments":{"city":"Gdansk"}},'
+        '{"name":"weather","arguments":{"city":"Sopot"}}]'
+    )
+
+    with pytest.raises(ProtocolError, match="configured maximum"):
+        parser.feed(f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE}")
+
+
+def test_stream_parser_rejects_nested_json_array_over_the_depth_limit() -> None:
+    parser = ToolCallStreamParser(
+        frozenset({"weather"}),
+        max_tool_calls=1,
+        max_json_depth=3,
+    )
+    payload = '[{"name":"weather","arguments":{"values":[0]}}]'
+
+    with pytest.raises(ProtocolError, match="maximum JSON depth"):
+        parser.feed(f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE}")
+
+
+def test_stream_parser_rejects_json_array_over_the_global_repair_cap() -> None:
+    calls = [
+        {
+            "name": "weather",
+            "arguments": ({"text": 'slash\\"quote'} if index == 0 else {"index": index}),
+        }
+        for index in range(MAX_PACKED_CALLS + 1)
+    ]
+    parser = ToolCallStreamParser(
+        frozenset({"weather"}),
+        max_tool_calls=MAX_PACKED_CALLS + 1,
+    )
+
+    with pytest.raises(ProtocolError, match="configured maximum"):
+        parser.feed(f"{TOOL_CALL_OPEN}{json.dumps(calls, separators=(',', ':'))}{TOOL_CALL_CLOSE}")
+
+
 @pytest.mark.parametrize("payload", ["[]", '[{"name":"weather","arguments":{}},7]'])
 def test_stream_parser_rejects_invalid_json_arrays(payload: str) -> None:
     parser = ToolCallStreamParser(frozenset({"weather"}))
@@ -2565,6 +2806,22 @@ def test_stream_parser_reads_argument_key_aliases() -> None:
 
     assert isinstance(emissions[0], ToolCallEmission)
     assert json.loads(emissions[0].arguments) == {"city": "Hel"}
+
+
+@pytest.mark.parametrize("alias", ["parameters", "args", "input"])
+def test_stream_parser_rejects_multiple_argument_aliases(alias: str) -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+    payload = json.dumps(
+        {
+            "name": "weather",
+            "arguments": {"city": "Gdansk"},
+            alias: {"city": "Sopot"},
+        },
+        separators=(",", ":"),
+    )
+
+    with pytest.raises(ProtocolError, match="exactly one arguments field"):
+        parser.feed(f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE}")
 
 
 def test_stream_parser_requires_an_arguments_key() -> None:
@@ -2791,15 +3048,28 @@ def test_stream_parser_rejects_invalid_packed_bare_calls(payload: str) -> None:
 
 
 def test_stream_parser_rejects_packed_bare_calls_beyond_the_repair_cap() -> None:
-    segments = [f'read_file{{"filePath":"f{index}"}}' for index in range(_MAX_PACKED_CALLS + 1)]
+    segments = [f'read_file{{"filePath":"f{index}"}}' for index in range(MAX_PACKED_CALLS + 1)]
     parser = ToolCallStreamParser(
         frozenset({"read_file"}),
-        max_tool_calls=_MAX_PACKED_CALLS + 1,
+        max_tool_calls=MAX_PACKED_CALLS + 1,
     )
     parser.feed(TOOL_CALL_OPEN + TOOL_CALL_OPEN.join(segments))
 
     with pytest.raises(IncompleteToolCallError):
         parser.finish()
+
+
+def test_stream_parser_accepts_packed_bare_calls_at_the_repair_cap() -> None:
+    segments = [f'read_file{{"filePath":"f{index}"}}' for index in range(MAX_PACKED_CALLS)]
+    parser = ToolCallStreamParser(
+        frozenset({"read_file"}),
+        max_tool_calls=MAX_PACKED_CALLS,
+    )
+    parser.feed(TOOL_CALL_OPEN + TOOL_CALL_OPEN.join(segments))
+
+    emissions = parser.finish()
+
+    assert len(emissions) == MAX_PACKED_CALLS
 
 
 def test_stream_parser_recovers_packed_glm_python_read_file_calls() -> None:
@@ -2835,10 +3105,10 @@ def test_stream_parser_recovers_packed_glm_python_read_file_calls() -> None:
 
 
 def test_stream_parser_rejects_packed_python_calls_beyond_the_repair_cap() -> None:
-    segments = [f'read_file({{"filePath":"f{index}"}})' for index in range(_MAX_PACKED_CALLS + 1)]
+    segments = [f'read_file({{"filePath":"f{index}"}})' for index in range(MAX_PACKED_CALLS + 1)]
     parser = ToolCallStreamParser(
         frozenset({"read_file"}),
-        max_tool_calls=_MAX_PACKED_CALLS + 1,
+        max_tool_calls=MAX_PACKED_CALLS + 1,
     )
     parser.feed(TOOL_CALL_OPEN + "".join(segments))
 

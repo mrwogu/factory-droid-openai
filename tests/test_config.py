@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from factory_droid_openai.config import Settings
+from factory_droid_openai.dialects import MAX_PACKED_CALLS
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -440,6 +441,27 @@ def test_settings_read_feature_limits_from_environment(
     assert settings.max_tracked_sessions == 5
     assert settings.worktree == "feature-branch"
     assert settings.append_system_prompt_file == prompt_file.resolve()
+
+
+def test_settings_accepts_the_tool_call_repair_cap(tmp_path: Path) -> None:
+    settings = Settings(workdir=tmp_path, max_tool_calls=MAX_PACKED_CALLS)
+
+    assert settings.max_tool_calls == MAX_PACKED_CALLS
+
+
+def test_settings_rejects_tool_call_limit_over_the_repair_cap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_environment(monkeypatch)
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
+    monkeypatch.setenv(
+        "FACTORY_DROID_OPENAI_MAX_TOOL_CALLS",
+        str(MAX_PACKED_CALLS + 1),
+    )
+
+    with pytest.raises(ValueError, match=f"must be at most {MAX_PACKED_CALLS}"):
+        Settings.from_env()
 
 
 @pytest.mark.parametrize(

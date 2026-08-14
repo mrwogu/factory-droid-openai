@@ -7,6 +7,7 @@ from pathlib import Path
 
 from droid_sdk.schemas.enums import ReasoningEffort
 
+from factory_droid_openai.dialects import MAX_PACKED_CALLS
 from factory_droid_openai.logs import LOG_FORMATS, LOG_LEVELS
 from factory_droid_openai.payloadlog import PAYLOAD_TRACE_MODES
 
@@ -75,6 +76,8 @@ class Settings:
     trace_payload_file: Path | None = None
 
     def __post_init__(self) -> None:
+        if self.max_tool_calls > MAX_PACKED_CALLS:
+            raise ValueError(f"max_tool_calls must be at most {MAX_PACKED_CALLS}")
         # The warm pool keys sessions by this value, so it has to match the
         # normalized effort the request path sends to Droid, and a bad value
         # has to fail at construction instead of on every request.

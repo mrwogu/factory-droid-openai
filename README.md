@@ -289,6 +289,11 @@ format, because anything it named would itself be tool-call-shaped text in
 assistant content: recovery is the client's retry, not the model's next turn.
 When an earlier call in the same turn did complete, the turn keeps
 `finish_reason="tool_calls"` so the client runs the call it already received.
+Close markers inside JSON strings are argument data, not framing. Ambiguous
+repairs fail closed, including multiple argument aliases, trailing data after
+a code fence, missing Qwen parameter close tags, and pipe-tag values that do
+not match their declared type. Model-generated JSON uses the same configured
+nesting limit as request JSON.
 Qwen3's XML form declares no argument types, so a scalar value stays the
 string the model wrote unless it wrote a JSON object or array.
 
@@ -1196,12 +1201,12 @@ error types.
 | `FACTORY_DROID_OPENAI_MAX_TRANSCRIPT_BYTES` | `4194304` | Serialized transcript size limit |
 | `FACTORY_DROID_OPENAI_MAX_TOOL_SCHEMA_BYTES` | `1048576` | Serialized tool schema size limit |
 | `FACTORY_DROID_OPENAI_MAX_STRUCTURED_OUTPUT_BYTES` | `1048576` | Buffered structured output size limit |
-| `FACTORY_DROID_OPENAI_MAX_JSON_DEPTH` | `32` | Request JSON nesting limit |
+| `FACTORY_DROID_OPENAI_MAX_JSON_DEPTH` | `32` | Request and model-generated JSON nesting limit |
 | `FACTORY_DROID_OPENAI_PROCESS_GRACE_SECONDS` | `5` | Wait before killing a Droid process |
 | `FACTORY_DROID_OPENAI_CLEANUP_TIMEOUT_SECONDS` | `10` | Total budget for session cleanup |
 | `FACTORY_DROID_OPENAI_UVICORN_LIMIT_CONCURRENCY` | `64` | Uvicorn connection limit |
 | `FACTORY_DROID_OPENAI_UVICORN_BACKLOG` | `128` | Uvicorn listen backlog |
-| `FACTORY_DROID_OPENAI_MAX_TOOL_CALLS` | `8` | Tool calls accepted per Droid turn |
+| `FACTORY_DROID_OPENAI_MAX_TOOL_CALLS` | `8` | Tool calls accepted per Droid turn, from 1 through 64 |
 | `FACTORY_DROID_OPENAI_TOOL_CALL_DRAIN_SECONDS` | `0.5` | Wait for further events after a complete tool call |
 | `FACTORY_DROID_OPENAI_REPAIR_LOST_PREFIX` | `false` | Repair tool-call payloads missing their opening `{"name":"` bytes |
 | `FACTORY_DROID_OPENAI_MAX_ATTACHMENTS` | `16` | Inline attachments per request |
