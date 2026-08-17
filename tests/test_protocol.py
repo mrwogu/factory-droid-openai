@@ -827,6 +827,7 @@ def test_stream_parser_logs_unparsed_payload_details() -> None:
     assert event["tail"] == body[-64:]
     assert event["payload_bytes"] == 80
     assert event["dialect"] == "native"
+    assert event["error"].startswith("JSONDecodeError: ")
     assert "tool_name" not in event
 
 
@@ -1361,6 +1362,103 @@ def test_stream_parser_lost_prefix_keeps_scalar_wrapper_key() -> None:
 )
 def test_stream_parser_lost_prefix_stays_fail_closed(body: str) -> None:
     parser = ToolCallStreamParser(frozenset({"weather"}), repair_lost_prefix=True)
+
+    with pytest.raises(MalformedToolCallError, match="invalid tool-call JSON"):
+        parser.feed(f"{TOOL_CALL_OPEN}{body}{TOOL_CALL_CLOSE}")
+
+
+def test_stream_parser_recovers_fused_name_payload() -> None:
+    # The fused form is always-on: no repair_lost_prefix flag needed.
+    parser = ToolCallStreamParser(frozenset({"run_in_terminal"}))
+
+    emissions = parser.feed(
+        f'{TOOL_CALL_OPEN}run_in_terminalmode":"sync","command":"pwd"}}{TOOL_CALL_CLOSE}'
+    )
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert emissions[0].name == "run_in_terminal"
+    assert json.loads(emissions[0].arguments) == {"mode": "sync", "command": "pwd"}
+
+
+def test_stream_parser_recovers_fused_name_payload_at_stream_end() -> None:
+    parser = ToolCallStreamParser(frozenset({"run_in_terminal"}))
+
+    emissions = parser.feed(f'{TOOL_CALL_OPEN}run_in_terminalmode":"sync","command":"pwd"}}')
+    emissions.extend(parser.finish())
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert emissions[0].name == "run_in_terminal"
+    assert json.loads(emissions[0].arguments) == {"mode": "sync", "command": "pwd"}
+
+
+def test_stream_parser_recovers_packed_fused_name_payloads() -> None:
+    parser = ToolCallStreamParser(frozenset({"run_in_terminal"}), max_tool_calls=4)
+    body = (
+        'run_in_terminalmode":"sync","command":"pwd"}'
+        f"{TOOL_CALL_OPEN}"
+        'run_in_terminalmode":"sync","command":"ls"}'
+    )
+
+    emissions = parser.feed(f"{TOOL_CALL_OPEN}{body}")
+    emissions.extend(parser.finish())
+
+    assert len(emissions) == 2
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert isinstance(emissions[1], ToolCallEmission)
+    assert json.loads(emissions[0].arguments)["command"] == "pwd"
+    assert json.loads(emissions[1].arguments)["command"] == "ls"
+
+
+def test_stream_parser_recovers_fused_name_with_value_close_residue() -> None:
+    parser = ToolCallStreamParser(frozenset({"run_in_terminal"}))
+
+    emissions = parser.feed(
+        f'{TOOL_CALL_OPEN}run_in_terminalmode":"sync","command":"pwd"}}</arg_value>'
+        f"{TOOL_CALL_CLOSE}"
+    )
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == {"mode": "sync", "command": "pwd"}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # The name must come from the allowed set.
+        'unknownmode":"sync"}',
+        # The reconstructed object must close.
+        'run_in_terminalmode":"sync"',
+        # The fused key must be an identifier, not a digit-led fragment.
+        'run_in_terminal12":"sync"}',
+        # Prose after the value-close residue is not ignorable scaffolding.
+        'run_in_terminalmode":"sync"}</arg_value>prose',
+        # A segment left empty by a doubled marker fails closed.
+        'run_in_terminalmode":"sync"}<tool_call>',
+        # Duplicate keys in the reconstruction stay rejected.
+        'run_in_terminalmode":"a","mode":"b"}',
+    ],
+)
+def test_stream_parser_fused_name_stays_fail_closed(body: str) -> None:
+    parser = ToolCallStreamParser(frozenset({"run_in_terminal"}))
+
+    with pytest.raises(MalformedToolCallError, match="invalid tool-call JSON"):
+        parser.feed(f"{TOOL_CALL_OPEN}{body}{TOOL_CALL_CLOSE}")
+
+
+def test_stream_parser_fused_name_rejects_alias_collision() -> None:
+    # Both splits strict-parse, so the fused form is ambiguous and fails closed.
+    parser = ToolCallStreamParser(frozenset({"run", "run_in_terminal"}))
+
+    with pytest.raises(MalformedToolCallError, match="invalid tool-call JSON"):
+        parser.feed(f'{TOOL_CALL_OPEN}run_in_terminalmode":"sync"}}{TOOL_CALL_CLOSE}')
+
+
+def test_stream_parser_fused_name_bounds_packed_segments() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}), max_tool_calls=MAX_PACKED_CALLS)
+    body = TOOL_CALL_OPEN.join(['weathermode":"sync"}'] * (MAX_PACKED_CALLS + 1))
 
     with pytest.raises(MalformedToolCallError, match="invalid tool-call JSON"):
         parser.feed(f"{TOOL_CALL_OPEN}{body}{TOOL_CALL_CLOSE}")
@@ -2025,7 +2123,7 @@ def test_stream_parser_rejects_mismatched_pipe_tag_argument_types(
         )
 
 
-@pytest.mark.parametrize("decoder", ["pipe-tag", "qwen", "arg-key"])
+@pytest.mark.parametrize("decoder", ["pipe-tag", "qwen", "arg-key", "fused"])
 def test_recovery_decoders_do_not_downgrade_excessive_json_nesting(
     decoder: str,
 ) -> None:
@@ -2043,6 +2141,8 @@ def test_recovery_decoders_do_not_downgrade_excessive_json_nesting(
             f"{TOOL_CALL_OPEN}<function=weather><parameter=value>{nested}"
             f"</parameter></function>{TOOL_CALL_CLOSE}"
         )
+    elif decoder == "fused":
+        stream = f'{TOOL_CALL_OPEN}weathera":"b","c":{nested}}}{TOOL_CALL_CLOSE}'
     else:
         stream = (
             f"{TOOL_CALL_OPEN}weather<arg_key>value</arg_key>"

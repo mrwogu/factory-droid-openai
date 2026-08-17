@@ -277,6 +277,7 @@ text. Every accepted form lives in one table in
 | `name<arg_key>key</arg_key><arg_value>value</arg_value>` | GLM |
 | a JSON array of calls inside one marker pair | Mistral, Jamba, Granite and xLAM style output |
 | `name","key":"value"...}` with the opening `{"name":"` bytes lost | GLM, only with `FACTORY_DROID_OPENAI_REPAIR_LOST_PREFIX=true` |
+| `namekey":"value"...}` with both the `{"name":"` opening and the `","arguments":{"` infix lost, name fused to the first key | GLM 5.2 |
 
 Translation never widens validation. An unknown tool name, a duplicate
 argument key, or prose after a call still fails the turn. A payload truncated
