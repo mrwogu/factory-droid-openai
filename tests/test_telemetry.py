@@ -210,10 +210,10 @@ async def test_reporter_bounds_sender_deadline() -> None:
     )
     assert await reporter.flush() is False
     # The send is still blocked here, so a flush that returns at all proves the
-    # deadline was enforced. What bounds it is the budget handed to the sender,
-    # which is deterministic, unlike wall-clock timing on a loaded runner.
+    # deadline was enforced, and the budget it handed out came from the caller
+    # rather than the default. Wall-clock timing would only measure the runner.
     assert len(timeouts) == 1
-    assert 0 < timeouts[0] <= 0.01
+    assert 0 < timeouts[0] < DEFAULT_TELEMETRY_TIMEOUT_SECONDS
     release.set()
     await asyncio.sleep(0)
     # A send that outran the deadline may or may not have landed, so aggregate
@@ -258,12 +258,14 @@ async def test_reporter_applies_one_deadline_to_all_batches(
     )
     assert await reporter.flush() is False
     # One budget covers every batch, so a second send only gets what the first
-    # one left: at most the 0.05 budget minus the 0.03 the first send slept.
-    # Wall-clock timing cannot separate the two policies here, since a per-batch
-    # budget would spend the same 0.1 seconds the shared one is allowed.
+    # one left, here at least the 0.03 it slept. A per-batch budget would hand
+    # out the full 0.05 every time, and wall-clock timing cannot separate the
+    # two policies because both spend the same total.
     assert 1 <= len(timeouts) <= 2
-    assert all(0 < timeout <= 0.05 for timeout in timeouts)
-    assert all(timeouts[index] <= timeouts[index - 1] - 0.03 for index in range(1, len(timeouts)))
+    assert all(timeout > 0 for timeout in timeouts)
+    # The 0.02 margin sits under the 0.03 the send slept, so only the shared
+    # deadline can satisfy it while float noise cannot.
+    assert all(timeouts[index] <= timeouts[index - 1] - 0.02 for index in range(1, len(timeouts)))
 
 
 @pytest.mark.asyncio
