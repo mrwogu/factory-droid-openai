@@ -222,9 +222,10 @@ def build_prompt(
             # model that trusts only what it called itself would run the same
             # call again instead of answering from the result it was given.
             tool_rule += (
-                " Results of earlier calls are in the transcript below. Treat "
-                "them as final and do not repeat a call the transcript already "
-                "answers."
+                " The transcript below already carries the results of earlier "
+                "calls. Those results are final: answer the user from them, and "
+                "call a tool again only for something the transcript does not "
+                "answer yet."
             )
         if require_tool_call:
             tool_rule += (

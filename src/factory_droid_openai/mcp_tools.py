@@ -55,10 +55,26 @@ class NativeToolBinding:
 
     token: str
     url: str
+    names: frozenset[str]
 
     def server_config(self) -> dict[str, Any]:
         """Render the MCP server entry Droid's session initializer expects."""
         return {"name": MCP_SERVER_NAME, "type": "http", "url": self.url}
+
+    def resolve(self, tool_name: str) -> str | None:
+        """Return the published tool an event names, or ``None`` for a foreign one.
+
+        Droid spells one MCP tool three ways: the model calls it
+        ``<server>___<tool>``, session settings key it ``mcp_<server>_<tool>``,
+        and a tool reached through the deferred-tool loader is reported under
+        its own bare name. Membership in this request's catalog is what makes
+        the bare spelling safe to honour.
+        """
+        for prefix in (MCP_TOOL_PREFIX, MCP_TOOL_ID_PREFIX):
+            if tool_name.startswith(prefix):
+                tool_name = tool_name[len(prefix) :]
+                break
+        return tool_name if tool_name in self.names else None
 
 
 class NativeToolRegistry:
@@ -77,8 +93,13 @@ class NativeToolRegistry:
             # the life of the process. The oldest entry belongs to the oldest
             # request, whose turn is over by the time the cap is reached.
             self._catalogs.pop(next(iter(self._catalogs)))
-        self._catalogs[token] = tuple(dict(tool) for tool in tools)
-        return NativeToolBinding(token=token, url=f"{self._base_url}{MCP_ROUTE_PREFIX}/{token}")
+        catalog = tuple(dict(tool) for tool in tools)
+        self._catalogs[token] = catalog
+        return NativeToolBinding(
+            token=token,
+            url=f"{self._base_url}{MCP_ROUTE_PREFIX}/{token}",
+            names=frozenset(str(tool["name"]) for tool in catalog),
+        )
 
     def close(self, token: str) -> None:
         self._catalogs.pop(token, None)
@@ -103,18 +124,6 @@ def to_mcp_tools(tools: Iterable[Any]) -> tuple[dict[str, Any], ...]:
             entry["description"] = function.description
         published.append(entry)
     return tuple(published)
-
-
-def strip_tool_prefix(tool_name: str) -> str | None:
-    """Return the client's own tool name, or ``None`` for a foreign tool."""
-    if not tool_name.startswith(MCP_TOOL_PREFIX):
-        return None
-    return tool_name[len(MCP_TOOL_PREFIX) :] or None
-
-
-def is_bridge_tool_id(tool_id: str) -> bool:
-    """Whether a Droid tool id belongs to the tools this bridge published."""
-    return tool_id.startswith(MCP_TOOL_ID_PREFIX)
 
 
 def handle_rpc(
