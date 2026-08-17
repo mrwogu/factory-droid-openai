@@ -59,6 +59,9 @@ _ARG_KEY_REPAIR_MARKER = "<arg_key>"
 _ARG_VALUE_REPAIR_CLOSE = "</arg_value>"
 _UNPARSED_HEAD_CHARS = 64
 _UNPARSED_ERROR_CHARS = 200
+# How many parallel calls the prompt asks for at most, independent of how many
+# the parser accepts.
+_SUGGESTED_TOOL_CALLS = 8
 _MESSAGE_JSON_PATTERN = re.compile(r'\{\s*"(?:role|content|tool_calls|id|type)"\s*:')
 _MESSAGE_JSON_KEYS = ("role", "content", "tool_calls", "id", "type")
 _MAX_MESSAGE_JSON_PREFIX_CHARS = 64
@@ -195,8 +198,12 @@ def build_prompt(
 
     if tool_names:
         if max_tool_calls > 1:
+            # The prompt suggests far less than the limit accepts. A high number
+            # here reads as an invitation to burst, and a model that bursts
+            # anyway still has every call accepted up to max_tool_calls.
+            suggested = min(max_tool_calls, _SUGGESTED_TOOL_CALLS)
             count_rule = (
-                f"If tools are needed, output up to {max_tool_calls} tool requests "
+                f"If tools are needed, output up to {suggested} tool requests "
                 "back to back, each using "
             )
             trailing_rule = (
