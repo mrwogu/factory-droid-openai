@@ -1847,7 +1847,11 @@ class NativeToolClient(FakeClient):
 
 
 def _native_binding() -> NativeToolBinding:
-    return NativeToolBinding(token="tok", url="http://127.0.0.1:8787/factory/mcp/tok")
+    return NativeToolBinding(
+        token="tok",
+        url="http://127.0.0.1:8787/factory/mcp/tok",
+        names=frozenset({"get_weather", "write_file", "ping"}),
+    )
 
 
 def _tool_use(name: str, arguments: Any) -> ToolUse:
@@ -2052,4 +2056,39 @@ async def test_runner_refuses_a_warm_session_for_a_native_turn(tmp_path: Path) -
 
     with pytest.raises(RunnerError, match="warm Droid session cannot serve"):
         async for _ in runner.run(_request(native_tools=_native_binding(), warm_session=warm)):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_runner_accepts_a_published_tool_reported_under_its_bare_name(
+    tmp_path: Path,
+) -> None:
+    # A tool the model reaches through the deferred-tool loader comes back
+    # without the server prefix, and refusing it would block the client's own
+    # tool.
+    client = NativeToolClient([_tool_use("get_weather", {"city": "Gdansk"}), TurnComplete()])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    events = [event async for event in runner.run(_request(native_tools=_native_binding()))]
+
+    assert events[1] == TextDelta(
+        '<tool_call>{"name":"get_weather","arguments":{"city":"Gdansk"}}</tool_call>'
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_blocks_a_bare_tool_name_it_never_published(tmp_path: Path) -> None:
+    client = NativeToolClient([_tool_use("Read", {"path": "/etc/hosts"}), TurnComplete()])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    with pytest.raises(RunnerError, match="native tool 'Read'"):
+        async for _ in runner.run(_request(native_tools=_native_binding())):
             pass

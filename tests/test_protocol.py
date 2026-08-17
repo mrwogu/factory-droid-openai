@@ -3956,5 +3956,5 @@ def test_build_prompt_tells_a_native_turn_that_tool_results_are_final() -> None:
     )
     without_result = build_prompt(_request(), native_tools=True)
 
-    assert "do not repeat a call the transcript already answers" in with_result.prompt
-    assert "do not repeat a call" not in without_result.prompt
+    assert "Those results are final: answer the user from them" in with_result.prompt
+    assert "Those results are final" not in without_result.prompt

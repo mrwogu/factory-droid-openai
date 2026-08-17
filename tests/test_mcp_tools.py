@@ -13,8 +13,6 @@ from factory_droid_openai.mcp_tools import (
     NativeToolRegistry,
     build_router,
     handle_rpc,
-    is_bridge_tool_id,
-    strip_tool_prefix,
     to_mcp_tools,
 )
 from factory_droid_openai.models import ToolDefinition
@@ -125,21 +123,23 @@ def test_openai_tools_become_mcp_descriptors() -> None:
 @pytest.mark.parametrize(
     ("tool_name", "expected"),
     [
+        # Every spelling Droid uses for a published tool resolves to the name
+        # the OpenAI client knows.
         (f"{MCP_SERVER_NAME}___get_weather", "get_weather"),
+        (f"mcp_{MCP_SERVER_NAME}_get_weather", "get_weather"),
+        ("get_weather", "get_weather"),
         (f"{MCP_SERVER_NAME}___", None),
-        ("get_weather", None),
+        (f"{MCP_SERVER_NAME}___read-cli", None),
         ("other-server___get_weather", None),
+        ("read-cli", None),
     ],
 )
-def test_only_the_bridge_prefix_names_a_published_tool(
+def test_a_binding_resolves_only_the_tools_it_published(
     tool_name: str, expected: str | None
 ) -> None:
-    assert strip_tool_prefix(tool_name) == expected
+    binding = NativeToolRegistry(base_url="http://127.0.0.1:8787").open(_catalog())
 
-
-def test_only_the_bridge_prefix_names_a_published_tool_id() -> None:
-    assert is_bridge_tool_id(f"mcp_{MCP_SERVER_NAME}_get_weather")
-    assert not is_bridge_tool_id("read-cli")
+    assert binding.resolve(tool_name) == expected
 
 
 def test_initialize_answers_with_the_negotiated_protocol() -> None:

@@ -51,7 +51,6 @@ from factory_droid_openai.logs import warning as log_warning
 from factory_droid_openai.mcp_tools import (
     MCP_TOOL_ID_PREFIX,
     NativeToolBinding,
-    strip_tool_prefix,
 )
 
 # droid exec flags the SDK's ProcessTransport always passes. Overriding
@@ -613,7 +612,7 @@ class DroidRunner:
                         yield RunComplete(usage)
                     elif isinstance(event, (ToolUse, ToolResult, ToolProgress)):
                         if request.native_tools is not None:
-                            published = strip_tool_prefix(event.tool_name)
+                            published = request.native_tools.resolve(event.tool_name)
                             if published is not None:
                                 if isinstance(event, ToolUse):
                                     native_tool_calls += 1

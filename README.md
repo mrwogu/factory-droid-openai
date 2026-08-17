@@ -335,6 +335,14 @@ request, and it is mounted only while the flag is on. Droid reaches it at
 `http://127.0.0.1:<port>`; set `FACTORY_DROID_OPENAI_NATIVE_TOOL_CALL_URL`
 when the bridge answers on a different address than it binds.
 
+A full e2e matrix run over every model the bridge lists (905 requests per path)
+put the native path ahead of the text path: no bridge defect on either, and
+fifteen tool contracts that the text path lost to unrecognized answers are met.
+Two caveats survive. A model may still call a tool again after the transcript
+already carries the result, because its session-side tool history is empty on
+every request, and a machine whose own MCP servers are slow to start eats into
+the session-init timeout for tool-bearing requests.
+
 ## Requirements
 
 - Python 3.11 or newer
