@@ -1587,6 +1587,83 @@ def test_stream_parser_repaired_fused_value_rejects_prefixed_tool_name() -> None
         parser.feed(f'{TOOL_CALL_OPEN}run_in_terminalcommand":"echo "x""}}{TOOL_CALL_CLOSE}')
 
 
+def test_stream_parser_repairs_arg_key_form_with_lost_openers() -> None:
+    # GLM kept every closing tag but dropped all <arg_key> openers, and the
+    # name is separated from the first key by the template's stray close.
+    parser = ToolCallStreamParser(frozenset({"read_file"}))
+    body = (
+        "read_file</arg_value>filePath</arg_key><arg_value>/srv/content.json</arg_value>"
+        "startLine</arg_key><arg_value>1</arg_value>"
+        "endLine</arg_key><arg_value>400</arg_value>"
+    )
+
+    emissions = parser.feed(f"{TOOL_CALL_OPEN}{body}{TOOL_CALL_CLOSE}")
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert emissions[0].name == "read_file"
+    assert json.loads(emissions[0].arguments) == {
+        "filePath": "/srv/content.json",
+        "startLine": 1,
+        "endLine": 400,
+    }
+
+
+def test_stream_parser_repairs_packed_arg_key_forms_with_lost_openers() -> None:
+    parser = ToolCallStreamParser(frozenset({"read_file", "list_dir"}), max_tool_calls=2)
+    body = (
+        "read_file</arg_value>filePath</arg_key><arg_value>/srv/a.json</arg_value>"
+        f"{TOOL_CALL_OPEN}"
+        "list_dir</arg_value>path</arg_key><arg_value>/srv</arg_value>"
+    )
+
+    emissions = parser.feed(f"{TOOL_CALL_OPEN}{body}{TOOL_CALL_CLOSE}")
+
+    assert [emission.name for emission in emissions if isinstance(emission, ToolCallEmission)] == [
+        "read_file",
+        "list_dir",
+    ]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # Without the stray close the name and the first key cannot be split.
+        "read_filefilePath</arg_key><arg_value>/srv/a.json</arg_value>",
+        # A truncated value would silently drop argument data.
+        "read_file</arg_value>filePath</arg_key><arg_value>/srv/a.json",
+        # The value has to open with its own tag, not bare text.
+        "read_file</arg_value>filePath</arg_key>/srv/a.json</arg_value>",
+        # Duplicate keys stay rejected here too.
+        "read_file</arg_value>filePath</arg_key><arg_value>a</arg_value>"
+        "filePath</arg_key><arg_value>b</arg_value>",
+        # Leaked prose after the last value still fails the turn.
+        "read_file</arg_value>filePath</arg_key><arg_value>a</arg_value>then I will read more",
+        # A key carrying prose is not an argument name.
+        "read_file</arg_value>let me read</arg_key><arg_value>a</arg_value>",
+        # An unknown name never dispatches, however clean the markup is.
+        "delete_file</arg_value>filePath</arg_key><arg_value>a</arg_value>",
+    ],
+)
+def test_stream_parser_arg_key_lost_openers_stay_fail_closed(body: str) -> None:
+    parser = ToolCallStreamParser(frozenset({"read_file"}))
+
+    with pytest.raises(MalformedToolCallError, match="invalid tool-call JSON"):
+        parser.feed(f"{TOOL_CALL_OPEN}{body}{TOOL_CALL_CLOSE}")
+
+
+def test_stream_parser_arg_key_lost_openers_reject_marker_inside_a_value() -> None:
+    # Values are raw text, so a literal <tool_call> inside one is
+    # indistinguishable from the packing separator and fails closed.
+    parser = ToolCallStreamParser(frozenset({"read_file"}), max_tool_calls=2)
+    body = (
+        f"read_file</arg_value>filePath</arg_key><arg_value>/srv/{TOOL_CALL_OPEN}a.json</arg_value>"
+    )
+
+    with pytest.raises(MalformedToolCallError, match="invalid tool-call JSON"):
+        parser.feed(f"{TOOL_CALL_OPEN}{body}{TOOL_CALL_CLOSE}")
+
+
 def test_stream_parser_fused_name_bounds_packed_segments() -> None:
     parser = ToolCallStreamParser(frozenset({"weather"}), max_tool_calls=MAX_PACKED_CALLS)
     body = TOOL_CALL_OPEN.join(['weathermode":"sync"}'] * (MAX_PACKED_CALLS + 1))

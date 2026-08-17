@@ -275,6 +275,7 @@ text. Every accepted form lives in one table in
 | `<｜tool▁calls▁begin｜>` … `<｜tool▁calls▁end｜>` | DeepSeek V3 and V3.1 |
 | `<\|action_start\|><\|plugin\|>{"name":...}<\|action_end\|>` | InternLM2 |
 | `name<arg_key>key</arg_key><arg_value>value</arg_value>` | GLM |
+| the same arg_key form with every `<arg_key>` opener lost, so `name</arg_value>key</arg_key><arg_value>value</arg_value>` arrives | GLM |
 | a JSON array of calls inside one marker pair | Mistral, Jamba, Granite and xLAM style output |
 | `name","key":"value"...}` with the opening `{"name":"` bytes lost | GLM, only with `FACTORY_DROID_OPENAI_REPAIR_LOST_PREFIX=true` |
 | `namekey":"value"...}` with both the `{"name":"` opening and the `","arguments":{"` infix lost, name fused to the first key | GLM 5.2 |
