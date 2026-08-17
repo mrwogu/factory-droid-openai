@@ -389,3 +389,63 @@ async def test_protocol_engine_contract_carries_no_default_behavior() -> None:
     engine: _ProtocolEngine = FakeProtocol(lambda _method, _params: {"result": {}})
 
     assert not await _ProtocolEngine.send_request(engine, "droid.list_tools", {})
+
+
+@pytest.mark.asyncio
+async def test_disable_native_tools_spares_the_tools_the_bridge_published() -> None:
+    disabled: set[str] = set()
+    enabled: set[str] = set()
+
+    def handler(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if method == "droid.list_tools":
+            return {
+                "result": {
+                    "tools": [
+                        {"id": "read-cli", "currentlyAllowed": "read-cli" not in disabled},
+                        {"id": "exit-spec-mode", "currentlyAllowed": True},
+                        # Droid keeps its deferred-tool loader callable in a
+                        # session that still has a tool to load.
+                        {"id": "tool-search-cli", "currentlyAllowed": True},
+                        {"id": "mcp_openai-bridge_get_weather", "currentlyAllowed": True},
+                    ]
+                }
+            }
+        if method == "droid.update_session_settings":
+            disabled.update(params["disabledToolIds"])
+            enabled.update(params["enabledToolIds"])
+            return {"result": {}}
+        raise AssertionError(method)
+
+    protocol = FakeProtocol(handler)
+
+    await DroidRpcExtension().disable_native_tools(
+        _client(protocol),
+        keep_tool_prefix="mcp_openai-bridge_",
+    )
+
+    assert enabled == {"mcp_openai-bridge_get_weather"}
+    assert disabled == {"exit-spec-mode", "read-cli", "tool-search-cli"}
+
+
+@pytest.mark.asyncio
+async def test_disable_native_tools_still_fails_on_a_tool_that_stays_callable() -> None:
+    def handler(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        del params
+        if method == "droid.list_tools":
+            return {
+                "result": {
+                    "tools": [
+                        {"id": "execute-cli", "currentlyAllowed": True},
+                        {"id": "mcp_openai-bridge_get_weather", "currentlyAllowed": True},
+                    ]
+                }
+            }
+        if method == "droid.update_session_settings":
+            return {"result": {}}
+        raise AssertionError(method)
+
+    with pytest.raises(DroidClientError, match="execute-cli"):
+        await DroidRpcExtension().disable_native_tools(
+            _client(FakeProtocol(handler)),
+            keep_tool_prefix="mcp_openai-bridge_",
+        )

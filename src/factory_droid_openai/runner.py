@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import re
 import signal
 import time
@@ -33,6 +34,7 @@ from droid_sdk.schemas.enums import (
 )
 
 from factory_droid_openai.config import DEFAULT_MODEL_ALIAS
+from factory_droid_openai.dialects import TOOL_CALL_CLOSE, TOOL_CALL_OPEN
 from factory_droid_openai.droid_rpc import (
     CompactionResult,
     ContextBreakdown,
@@ -46,6 +48,11 @@ from factory_droid_openai.logs import enabled as log_enabled
 from factory_droid_openai.logs import millis as _millis
 from factory_droid_openai.logs import trace as log_trace
 from factory_droid_openai.logs import warning as log_warning
+from factory_droid_openai.mcp_tools import (
+    MCP_TOOL_ID_PREFIX,
+    NativeToolBinding,
+    strip_tool_prefix,
+)
 
 # droid exec flags the SDK's ProcessTransport always passes. Overriding
 # exec_args replaces this list wholesale, so extra flags must be appended
@@ -86,6 +93,20 @@ _MODEL_FAMILY_PREFIXES = (
 def _is_ignorable_native_tool(tool_name: str) -> bool:
     """Report whether an event names a Droid meta tool the bridge tolerates."""
     return tool_name.replace("-", "").replace("_", "").casefold() in _IGNORED_NATIVE_TOOLS
+
+
+def _native_tool_marker(name: str, arguments: Any) -> str:
+    """Render a structured tool call in the bridge's own marker form."""
+    payload = json.dumps(
+        {"name": name, "arguments": arguments if isinstance(arguments, dict) else {}},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    # An argument value may legitimately contain marker text. Escaping every
+    # "<" keeps the markers the only ones in the stream and decodes back to the
+    # value the model sent.
+    escaped = payload.replace("<", "\\u003c")
+    return f"{TOOL_CALL_OPEN}{escaped}{TOOL_CALL_CLOSE}"
 
 
 def model_family(model: str) -> str:
@@ -179,6 +200,9 @@ class RunRequest:
     session_id: str | None = None
     output_format: dict[str, Any] | None = None
     warm_session: WarmSession | None = None
+    # Set when the request's tools are published to Droid over MCP instead of
+    # being described in the prompt.
+    native_tools: NativeToolBinding | None = None
 
     def session_key(self) -> SessionKey:
         return SessionKey.from_request(
@@ -430,10 +454,18 @@ class DroidRunner:
             client.set_ask_user_handler(
                 lambda _params: {"cancelled": True, "answers": []},
             )
+        if warm is not None and request.native_tools is not None:
+            # A warm session was initialized without the request's MCP server,
+            # and Droid attaches those only when a session starts.
+            raise RunnerError(
+                "A warm Droid session cannot serve a native tool-calling turn.",
+            )
+        mcp_servers = [] if request.native_tools is None else [request.native_tools.server_config()]
         initialized = warm is not None
         completed = False
         ignored_native_tool = False
         saw_assistant_text = False
+        native_tool_calls = 0
         unmapped_event_kind: str | None = None
         usage = Usage()
 
@@ -463,13 +495,13 @@ class DroidRunner:
                         # the new turn is sent instead of the whole transcript.
                         await client.load_session(
                             session_id=request.session_id,
-                            mcp_servers=[],
+                            mcp_servers=mcp_servers,
                         )
                     else:
                         await client.initialize_session(
                             machine_id="factory-droid-openai",
                             cwd=str(self._workdir),
-                            mcp_servers=[],
+                            mcp_servers=mcp_servers,
                             model_id=_resolve_model_id(request.model, request.model_alias),
                             reasoning_effort=reasoning_effort,
                             interaction_mode=DroidInteractionMode.Auto,
@@ -478,7 +510,12 @@ class DroidRunner:
                             enabled_tool_ids=[],
                         )
                     initialized = True
-                    await self._rpc.disable_native_tools(client)
+                    await self._rpc.disable_native_tools(
+                        client,
+                        keep_tool_prefix=(
+                            None if request.native_tools is None else MCP_TOOL_ID_PREFIX
+                        ),
+                    )
                 else:
                     await self._retune(warm, request.session_key())
                 session_timeline = current_timeline()
@@ -544,8 +581,10 @@ class DroidRunner:
                         usage = _map_usage(event)
                         yield UsageUpdate(usage)
                     elif isinstance(event, TurnComplete):
-                        if not saw_assistant_text and (
-                            ignored_native_tool or unmapped_event_kind is not None
+                        if (
+                            not saw_assistant_text
+                            and not native_tool_calls
+                            and (ignored_native_tool or unmapped_event_kind is not None)
                         ):
                             reason = (
                                 "a disabled Droid meta-tool attempt"
@@ -573,6 +612,24 @@ class DroidRunner:
                         )
                         yield RunComplete(usage)
                     elif isinstance(event, (ToolUse, ToolResult, ToolProgress)):
+                        if request.native_tools is not None:
+                            published = strip_tool_prefix(event.tool_name)
+                            if published is not None:
+                                if isinstance(event, ToolUse):
+                                    native_tool_calls += 1
+                                    log_debug("droid.native_tool_call", tool=published)
+                                    # Reusing the marker form runs the call
+                                    # through the same validation, cap and
+                                    # de-duplication path as a text answer.
+                                    yield TextDelta(
+                                        _native_tool_marker(published, event.tool_input)
+                                    )
+                                continue
+                            if native_tool_calls and not event.tool_name:
+                                # The bridge refuses the call so the OpenAI
+                                # client can run it, and Droid reports that
+                                # refusal as a nameless result.
+                                continue
                         if _is_ignorable_native_tool(event.tool_name):
                             ignored_native_tool = True
                             log_debug("droid.native_tool_ignored", tool=event.tool_name)

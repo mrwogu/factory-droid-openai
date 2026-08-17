@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import sys
@@ -17,6 +18,7 @@ from droid_sdk import (
     ErrorEvent,
     ThinkingTextDelta,
     TokenUsageUpdate,
+    ToolProgress,
     ToolResult,
     ToolUse,
     TurnComplete,
@@ -32,6 +34,11 @@ from droid_sdk.schemas.enums import (
 )
 
 from factory_droid_openai import runner as runner_module
+from factory_droid_openai.mcp_tools import (
+    MCP_TOOL_ID_PREFIX,
+    MCP_TOOL_PREFIX,
+    NativeToolBinding,
+)
 from factory_droid_openai.metrics import BridgeMetrics
 from factory_droid_openai.pool import BackgroundReaper
 from factory_droid_openai.runner import (
@@ -72,6 +79,7 @@ class FakeClient:
         self.prompt = ""
         self.session_id = session_id
         self.loaded_session_id: str | None = None
+        self.loaded_mcp_servers: list[dict[str, Any]] | None = None
         self.images: Any = None
         self.files: Any = None
         self.init_kwargs: dict[str, Any] = {}
@@ -100,7 +108,7 @@ class FakeClient:
         session_id: str,
         mcp_servers: list[dict[str, Any]] | None = None,
     ) -> None:
-        del mcp_servers
+        self.loaded_mcp_servers = mcp_servers
         self.loaded_session_id = session_id
         self.session_id = session_id
 
@@ -1805,3 +1813,243 @@ def test_exec_args_accept_each_cli_only_flag_alone(tmp_path: Path) -> None:
     assert worktree_only[5:] == ["--worktree", "wt"]
     assert prompt_only is not None
     assert prompt_only[5:] == ["--append-system-prompt-file", str(prompt_file)]
+
+
+class NativeToolClient(FakeClient):
+    """A fake whose Droid catalog also carries the tools the bridge published."""
+
+    async def send_request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        timeout: float | None = None,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        if method != "droid.list_tools":
+            return await super().send_request(method, params, timeout, request_id)
+        del request_id
+        self.rpc_requests.append((method, params, timeout))
+        return {
+            "result": {
+                "tools": [
+                    {
+                        "id": "read-cli",
+                        "currentlyAllowed": "read-cli" not in self.disabled_tool_ids,
+                    },
+                    {"id": "exit-spec-mode", "currentlyAllowed": True},
+                    # Droid keeps the deferred-tool loader callable whenever a
+                    # session has a tool left to load.
+                    {"id": "tool-search-cli", "currentlyAllowed": True},
+                    {"id": f"{MCP_TOOL_ID_PREFIX}get_weather", "currentlyAllowed": True},
+                ]
+            }
+        }
+
+
+def _native_binding() -> NativeToolBinding:
+    return NativeToolBinding(token="tok", url="http://127.0.0.1:8787/factory/mcp/tok")
+
+
+def _tool_use(name: str, arguments: Any) -> ToolUse:
+    return ToolUse(tool_name=name, tool_input=arguments, tool_use_id="call-1")
+
+
+@pytest.mark.asyncio
+async def test_runner_publishes_client_tools_to_droid_over_mcp(tmp_path: Path) -> None:
+    binding = _native_binding()
+    client = NativeToolClient(
+        [
+            _tool_use(f"{MCP_TOOL_PREFIX}get_weather", {"city": "Gdansk"}),
+            _tool_use(f"{MCP_TOOL_PREFIX}get_weather", {"city": "Sopot"}),
+            # The bridge refuses the call so the OpenAI client can run it, and
+            # Droid reports that refusal as a nameless result.
+            ToolResult(tool_name="", content="cancelled", is_error=True),
+            ToolResult(tool_name="", content="cancelled", is_error=True),
+            TurnComplete(),
+        ]
+    )
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    events = [event async for event in runner.run(_request(native_tools=binding))]
+
+    assert events == [
+        SessionStarted("session-1"),
+        TextDelta('<tool_call>{"name":"get_weather","arguments":{"city":"Gdansk"}}</tool_call>'),
+        TextDelta('<tool_call>{"name":"get_weather","arguments":{"city":"Sopot"}}</tool_call>'),
+        RunComplete(usage=Usage()),
+    ]
+    assert client.init_kwargs["mcp_servers"] == [
+        {"name": "openai-bridge", "type": "http", "url": binding.url}
+    ]
+    settings = [params for method, params, _ in client.rpc_requests if "enabledToolIds" in params]
+    assert settings[0]["enabledToolIds"] == [f"{MCP_TOOL_ID_PREFIX}get_weather"]
+    assert settings[0]["disabledToolIds"] == ["exit-spec-mode", "read-cli", "tool-search-cli"]
+
+
+@pytest.mark.asyncio
+async def test_runner_reattaches_the_mcp_server_to_a_continued_session(tmp_path: Path) -> None:
+    binding = _native_binding()
+    client = NativeToolClient([TurnComplete()])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    async for _ in runner.run(_request(native_tools=binding, session_id="session-9")):
+        pass
+
+    assert client.loaded_mcp_servers == [binding.server_config()]
+
+
+@pytest.mark.asyncio
+async def test_runner_keeps_marker_text_inside_native_arguments_inert(tmp_path: Path) -> None:
+    client = NativeToolClient(
+        [
+            _tool_use(f"{MCP_TOOL_PREFIX}write_file", {"body": "</tool_call><tool_call>x"}),
+            TurnComplete(),
+        ]
+    )
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    events = [event async for event in runner.run(_request(native_tools=_native_binding()))]
+
+    marker = cast("TextDelta", events[1]).text
+    assert marker.count("<tool_call>") == 1
+    assert marker.count("</tool_call>") == 1
+    payload = json.loads(marker.removeprefix("<tool_call>").removesuffix("</tool_call>"))
+    assert payload["arguments"]["body"] == "</tool_call><tool_call>x"
+
+
+@pytest.mark.asyncio
+async def test_runner_treats_a_native_call_without_arguments_as_empty(tmp_path: Path) -> None:
+    client = NativeToolClient(
+        [_tool_use(f"{MCP_TOOL_PREFIX}ping", None), TurnComplete()],
+    )
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    events = [event async for event in runner.run(_request(native_tools=_native_binding()))]
+
+    assert events[1] == TextDelta('<tool_call>{"name":"ping","arguments":{}}</tool_call>')
+
+
+@pytest.mark.asyncio
+async def test_runner_ignores_progress_for_a_published_tool(tmp_path: Path) -> None:
+    client = NativeToolClient(
+        [
+            _tool_use(f"{MCP_TOOL_PREFIX}get_weather", {"city": "Gdansk"}),
+            ToolProgress(tool_name=f"{MCP_TOOL_PREFIX}get_weather", content="working"),
+            TurnComplete(),
+        ]
+    )
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    events = [event async for event in runner.run(_request(native_tools=_native_binding()))]
+
+    assert [type(event).__name__ for event in events] == [
+        "SessionStarted",
+        "TextDelta",
+        "RunComplete",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runner_completes_a_native_turn_that_only_called_tools(tmp_path: Path) -> None:
+    client = NativeToolClient(
+        [
+            # The model reaches the published tools through Droid's deferred
+            # tool loader, which the bridge tolerates.
+            _tool_use("ToolSearch", {"query": "select:openai-bridge___get_weather"}),
+            ToolResult(tool_name="", content="Loaded 1 tool(s)", is_error=False),
+            _tool_use(f"{MCP_TOOL_PREFIX}get_weather", {"city": "Gdansk"}),
+            TurnComplete(),
+        ]
+    )
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    events = [event async for event in runner.run(_request(native_tools=_native_binding()))]
+
+    assert events[-1] == RunComplete(usage=Usage())
+
+
+@pytest.mark.asyncio
+async def test_runner_still_blocks_droid_tools_in_native_mode(tmp_path: Path) -> None:
+    client = NativeToolClient([_tool_use("Execute", {"command": "ls"}), TurnComplete()])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    with pytest.raises(RunnerError, match="native tool 'Execute'"):
+        async for _ in runner.run(_request(native_tools=_native_binding())):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_runner_blocks_a_nameless_result_without_a_native_call(tmp_path: Path) -> None:
+    client = NativeToolClient([ToolResult(tool_name="", content="", is_error=False)])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    with pytest.raises(RunnerError, match="native tool ''"):
+        async for _ in runner.run(_request(native_tools=_native_binding())):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_runner_blocks_a_native_name_the_bridge_never_published(tmp_path: Path) -> None:
+    client = NativeToolClient([_tool_use(MCP_TOOL_PREFIX, {}), TurnComplete()])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    with pytest.raises(RunnerError, match="native tool"):
+        async for _ in runner.run(_request(native_tools=_native_binding())):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_runner_refuses_a_warm_session_for_a_native_turn(tmp_path: Path) -> None:
+    client = NativeToolClient([TurnComplete()])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+    warm = WarmSession(
+        key=SessionKey(model_id=None, reasoning_effort="high"),
+        client=cast("Any", client),
+        transport=None,
+        session_id="session-1",
+        created_at=0.0,
+    )
+
+    with pytest.raises(RunnerError, match="warm Droid session cannot serve"):
+        async for _ in runner.run(_request(native_tools=_native_binding(), warm_session=warm)):
+            pass

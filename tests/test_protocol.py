@@ -3882,3 +3882,79 @@ def test_streaming_parser_keeps_a_bounded_tail_for_large_payloads() -> None:
     call = emissions[0]
     assert isinstance(call, ToolCallEmission)
     assert json.loads(call.arguments)["q"] == "x" * 200_000
+
+
+def test_build_prompt_moves_tool_schemas_off_the_prompt_for_native_calling() -> None:
+    plan = build_prompt(_request(), native_tools=True)
+
+    transcript = plan.prompt.split("OPENAI_TRANSCRIPT_JSON\n", 1)[1].split(
+        "\nEND_OPENAI_TRANSCRIPT_JSON",
+        1,
+    )[0]
+    assert json.loads(transcript)["tools"] == []
+    assert "They are registered as tools in this session" in plan.prompt
+    assert "Read the weather." not in plan.prompt
+    assert TOOL_CALL_OPEN in plan.prompt  # named only to forbid it
+    assert "never emit" in plan.prompt
+    assert [tool.function.name for tool in plan.native_tools] == ["weather"]
+    assert plan.allowed_tool_names == frozenset({"weather"})
+
+
+def test_build_prompt_keeps_a_required_native_tool_call_required() -> None:
+    plan = build_prompt(_request(tool_choice="required"), native_tools=True)
+
+    assert plan.require_tool_call is True
+    assert "A tool call is required for this response" in plan.prompt
+
+
+def test_build_prompt_publishes_only_the_tool_a_native_choice_allows() -> None:
+    request = _request(
+        tools=[
+            {"type": "function", "function": {"name": "weather", "parameters": {}}},
+            {"type": "function", "function": {"name": "clock", "parameters": {}}},
+        ],
+        tool_choice={"type": "function", "function": {"name": "clock"}},
+    )
+
+    plan = build_prompt(request, native_tools=True)
+
+    assert [tool.function.name for tool in plan.native_tools] == ["clock"]
+
+
+def test_build_prompt_publishes_nothing_when_a_native_choice_forbids_tools() -> None:
+    plan = build_prompt(_request(tool_choice="none"), native_tools=True)
+
+    assert plan.native_tools == ()
+    assert "No tools are available" in plan.prompt
+
+
+def test_build_prompt_still_measures_schemas_it_leaves_out_of_the_prompt() -> None:
+    with pytest.raises(RequestTooLargeError, match="tool schemas exceed"):
+        build_prompt(_request(), max_tool_schema_bytes=10, native_tools=True)
+
+
+def test_build_prompt_tells_a_native_turn_that_tool_results_are_final() -> None:
+    with_result = build_prompt(
+        _request(
+            messages=[
+                {"role": "user", "content": "Weather in Gdansk?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "weather", "arguments": '{"city":"Gdansk"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": '{"temp":19}'},
+            ]
+        ),
+        native_tools=True,
+    )
+    without_result = build_prompt(_request(), native_tools=True)
+
+    assert "do not repeat a call the transcript already answers" in with_result.prompt
+    assert "do not repeat a call" not in without_result.prompt

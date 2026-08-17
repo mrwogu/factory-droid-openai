@@ -22,6 +22,11 @@ _MCP_POLL_SECONDS = 0.1
 _TOOL_DISABLE_RETRIES = 3
 _TOOL_DISABLE_RETRY_SECONDS = 0.1
 _UNAVOIDABLE_TOOL_IDS = frozenset({"exit-spec-mode"})
+# Droid keeps the deferred-tool loader callable in any session that has a tool
+# left to load, which is every session that publishes tools over MCP. It only
+# fetches a schema Droid already holds, and the model needs it to reach those
+# tools at all.
+_DEFERRED_TOOL_LOADER_IDS = frozenset({"tool-search-cli"})
 
 
 class _ProtocolEngine(Protocol):
@@ -115,22 +120,37 @@ class DroidRpcExtension:
             params,
         )
 
-    async def disable_native_tools(self, client: DroidClient) -> None:
+    async def disable_native_tools(
+        self,
+        client: DroidClient,
+        *,
+        keep_tool_prefix: str | None = None,
+    ) -> None:
+        """Disable every Droid tool, optionally sparing one id prefix.
+
+        ``keep_tool_prefix`` leaves the tools the bridge itself published over
+        MCP callable. Everything Droid owns still goes away, so a turn can only
+        reach tools the OpenAI client asked for.
+        """
         await self._wait_for_mcp_catalog(client)
         tools = await self._list_tools(client)
         if not tools:
             raise DroidClientError("Droid returned an empty native tool catalog")
         tool_ids = {_required_str(tool, "id") for tool in tools}
+        tolerated = _UNAVOIDABLE_TOOL_IDS
+        if keep_tool_prefix is not None:
+            tolerated = tolerated | _DEFERRED_TOOL_LOADER_IDS
         unexpected: set[str] = set()
         for attempt in range(_TOOL_DISABLE_RETRIES):
+            kept = _matching(tool_ids, keep_tool_prefix)
             await self._request(
                 client,
                 DroidServerMethod.UPDATE_SESSION_SETTINGS.value,
                 {
                     "interactionMode": DroidInteractionMode.Auto.value,
                     "autonomyLevel": AutonomyLevel.Off.value,
-                    "enabledToolIds": [],
-                    "disabledToolIds": sorted(tool_ids),
+                    "enabledToolIds": sorted(kept),
+                    "disabledToolIds": sorted(tool_ids - kept),
                 },
             )
             remaining: set[str] = set()
@@ -139,7 +159,7 @@ class DroidRpcExtension:
                 tool_ids.add(tool_id)
                 if _required_bool(tool, "currentlyAllowed"):
                     remaining.add(tool_id)
-            unexpected = remaining - _UNAVOIDABLE_TOOL_IDS
+            unexpected = remaining - tolerated - _matching(remaining, keep_tool_prefix)
             if not unexpected:
                 return
             if attempt + 1 < _TOOL_DISABLE_RETRIES:
@@ -245,6 +265,12 @@ class DroidRpcExtension:
         if not isinstance(result, dict):
             raise DroidClientError(f"{method} returned a malformed result")
         return result
+
+
+def _matching(tool_ids: set[str], prefix: str | None) -> set[str]:
+    if prefix is None:
+        return set()
+    return {tool_id for tool_id in tool_ids if tool_id.startswith(prefix)}
 
 
 def _protocol(client: DroidClient) -> _ProtocolEngine:

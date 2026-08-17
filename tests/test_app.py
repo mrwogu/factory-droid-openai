@@ -4746,3 +4746,164 @@ def test_request_outcome_falls_back_to_the_status_code() -> None:
     scope = cast("Any", {"state": {"stream_outcome": "pending"}})
 
     assert _request_outcome(200, scope) == "success"
+
+
+def _native_settings(tmp_path: Path) -> Settings:
+    return Settings(
+        droid_path="droid",
+        workdir=tmp_path,
+        timeout_seconds=30.0,
+        native_tool_calls=True,
+    )
+
+
+def _weather_payload(**overrides: object) -> dict[str, object]:
+    return _payload(
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "description": "Read the weather.",
+                    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+                },
+            }
+        ],
+        **overrides,
+    )
+
+
+class CatalogWatchingRunner(FakeRunner):
+    """Records what the MCP endpoint would serve while the turn is running."""
+
+    def __init__(self, events: list[RunEvent], registry: Any) -> None:
+        super().__init__(events)
+        self.registry = registry
+        self.catalog_in_flight: tuple[dict[str, Any], ...] | None = None
+
+    async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
+        if request.native_tools is not None:
+            self.catalog_in_flight = self.registry.catalog(request.native_tools.token)
+        async for event in super().run(request):
+            yield event
+
+
+@pytest.mark.asyncio
+async def test_native_tool_calls_publish_the_request_tools_for_the_turn(tmp_path: Path) -> None:
+    marker = (
+        f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Gdansk"}}}}{TOOL_CALL_CLOSE}'
+    )
+    runner = CatalogWatchingRunner([TextDelta(marker), RunComplete(Usage())], registry=None)
+    app = create_app(
+        _native_settings(tmp_path),
+        runner_factory=cast("RunnerFactory", lambda: runner),
+    )
+    runner.registry = app.state.native_tools
+
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=_weather_payload())
+
+    assert response.status_code == 200
+    message = response.json()["choices"][0]["message"]
+    assert message["tool_calls"][0]["function"] == {
+        "name": "weather",
+        "arguments": '{"city":"Gdansk"}',
+    }
+    assert response.json()["choices"][0]["finish_reason"] == "tool_calls"
+    assert runner.catalog_in_flight == (
+        {
+            "name": "weather",
+            "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}},
+            "description": "Read the weather.",
+        },
+    )
+    # The prompt no longer has to describe the tools, and the catalog is gone
+    # once the turn that published it is over.
+    assert "Read the weather." not in runner.requests[0].prompt
+    assert runner.requests[0].warm_session is None
+    assert len(app.state.native_tools) == 0
+
+
+@pytest.mark.asyncio
+async def test_native_tool_calls_serve_the_catalog_over_the_mcp_endpoint(tmp_path: Path) -> None:
+    app = create_app(
+        _native_settings(tmp_path),
+        runner_factory=cast("RunnerFactory", lambda: FakeRunner([RunComplete(Usage())])),
+    )
+    binding = app.state.native_tools.open(({"name": "weather", "inputSchema": {}},))
+
+    async with _client(app) as client:
+        response = await client.post(
+            f"/factory/mcp/{binding.token}",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["result"]["tools"] == [{"name": "weather", "inputSchema": {}}]
+
+
+@pytest.mark.asyncio
+async def test_the_mcp_endpoint_stays_unmounted_by_default(tmp_path: Path) -> None:
+    app = _app(tmp_path, FakeRunner([RunComplete(Usage())]))
+
+    async with _client(app) as client:
+        response = await client.post(
+            "/factory/mcp/anything",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        )
+
+    assert response.status_code == 404
+    assert "mcp" not in json.dumps(app.openapi()["paths"])
+
+
+@pytest.mark.asyncio
+async def test_a_streamed_native_turn_closes_its_catalog(tmp_path: Path) -> None:
+    marker = (
+        f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Gdansk"}}}}{TOOL_CALL_CLOSE}'
+    )
+    runner = FakeRunner([TextDelta(marker), RunComplete(Usage())])
+    app = create_app(
+        _native_settings(tmp_path),
+        runner_factory=cast("RunnerFactory", lambda: runner),
+    )
+
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_weather_payload(stream=True),
+        )
+
+    assert response.status_code == 200
+    assert '"tool_calls"' in response.text
+    assert runner.requests[0].native_tools is not None
+    assert len(app.state.native_tools) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_failed_native_turn_closes_its_catalog(tmp_path: Path) -> None:
+    runner = FakeRunner([], error=RunnerError("droid failed"))
+    app = create_app(
+        _native_settings(tmp_path),
+        runner_factory=cast("RunnerFactory", lambda: runner),
+    )
+
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=_weather_payload())
+
+    assert response.status_code == 502
+    assert len(app.state.native_tools) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_native_request_without_tools_publishes_nothing(tmp_path: Path) -> None:
+    runner = FakeRunner([TextDelta("hello"), RunComplete(Usage())])
+    app = create_app(
+        _native_settings(tmp_path),
+        runner_factory=cast("RunnerFactory", lambda: runner),
+    )
+
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=_payload())
+
+    assert response.status_code == 200
+    assert runner.requests[0].native_tools is None
