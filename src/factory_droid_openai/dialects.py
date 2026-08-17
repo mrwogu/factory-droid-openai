@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from factory_droid_openai.strictjson import (
     JsonNestingError,
@@ -834,8 +834,21 @@ def _skip_whitespace(value: str, index: int) -> int:
 # still a plain identifier followed by the JSON ``":"`` separator, the only
 # shape observed on the wire: a first argument that is not a string stays
 # rejected rather than guessed at.
-_FUSED_FIRST_KEY_PATTERN = re.compile(r'[A-Za-z_][A-Za-z0-9_]*":"')
+_FUSED_KEY_PATTERN = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)":"')
+_FUSED_NEXT_PAIR_PATTERN = re.compile(r'","[A-Za-z_][A-Za-z0-9_]*":"')
 _FUSED_OBJECT_OPEN = '{"'
+_FUSED_PAIR_SEPARATOR = '","'
+_FUSED_VALUE_CLOSE = '"}'
+# A raw control character is data the model failed to escape, not a value
+# terminator, so the repair scan re-escapes the five JSON names for them and
+# rejects every other control byte.
+_FUSED_CONTROL_ESCAPES = {
+    "\b": "\\b",
+    "\f": "\\f",
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+}
 
 
 def _decode_lost_prefix_fused(
@@ -862,11 +875,20 @@ def _decode_lost_prefix_fused(
     strict JSON object and a single surviving reading, where that repair only
     has the name and the ``","`` the wire kept.
     """
+    return _walk_fused_calls(body, allowed_tool_names, _decode_fused_segment)
+
+
+def _walk_fused_calls(
+    body: str,
+    allowed_tool_names: frozenset[str],
+    decode_segment: Callable[[str, int, frozenset[str]], tuple[dict[str, Any], int] | None],
+) -> list[dict[str, Any]] | None:
+    """Walks the fused segments a payload packs, one per decoded call."""
     stripped = body.strip()
     calls: list[dict[str, Any]] = []
     index = 0
     while len(calls) < MAX_PACKED_CALLS:
-        parsed = _decode_fused_segment(stripped, index, allowed_tool_names)
+        parsed = decode_segment(stripped, index, allowed_tool_names)
         if parsed is None:
             return None
         call, index = parsed
@@ -907,7 +929,7 @@ def _decode_fused_segment(
                 name,
                 arguments,
                 start + end - len(_FUSED_OBJECT_OPEN),
-                _FUSED_FIRST_KEY_PATTERN.match(segment, start) is not None,
+                _FUSED_KEY_PATTERN.match(segment, start) is not None,
             )
         )
     if len(candidates) != 1:
@@ -920,6 +942,149 @@ def _decode_fused_segment(
     if not fused_key:
         return None
     return {"name": name, "arguments": arguments}, end
+
+
+def _decode_lost_prefix_fused_repair(
+    body: str,
+    allowed_tool_names: frozenset[str],
+) -> list[dict[str, Any]] | None:
+    """Rebuilds fused GLM calls whose string values lost their escaping.
+
+    Observed on the same GLM-5.2 turns as the strict fused form: a ``command``
+    value carries bare ``"`` and raw newlines, so no reading of the segment
+    parses as JSON. A segment is scanned this way only after its strict reading
+    fails, and then the template shape has to carry it alone: identifier keys
+    joined by ``","``, string values only, and a closing ``"}`` that a segment
+    boundary follows. Bare quotes stay data while backslash escapes keep their
+    JSON meaning, so an invalid escape, a duplicate key, a value that is not a
+    string, a control byte JSON cannot name or a missing terminator still fails
+    the turn.
+
+    A name another allowed name prefixes fails closed here. The strict split
+    can weigh two readings against each other byte for byte; this scan cannot,
+    so it refuses rather than picking one.
+
+    The value ends at the first ``","key":"`` or boundary-anchored ``"}``, which
+    is what keeps the packed segments aligned. A value that itself contains one
+    of those sequences therefore splits early, so the repair widens what the
+    bridge accepts, never what it forwards unvalidated.
+    """
+    return _walk_fused_calls(body, allowed_tool_names, _decode_fused_segment_repair)
+
+
+def _decode_fused_segment_repair(
+    segment: str,
+    index: int,
+    allowed_tool_names: frozenset[str],
+) -> tuple[dict[str, Any], int] | None:
+    strict = _decode_fused_segment(segment, index, allowed_tool_names)
+    if strict is not None and _at_fused_boundary(segment, strict[1]):
+        # The exact reading wins where it ends on a boundary, keeping the value
+        # types and escapes the model wrote. Ending short of one means the
+        # strict decoder stopped inside a value that holds a ``"}`` of its own,
+        # so the scan below gets to read the whole segment instead.
+        return strict
+    prefixes = [name for name in allowed_tool_names if segment.startswith(name, index)]
+    if len(prefixes) != 1:
+        return None
+    name = prefixes[0]
+    scanned = _scan_fused_pairs(segment, index + len(name))
+    if scanned is None:
+        return None
+    arguments, end = scanned
+    return {"name": name, "arguments": arguments}, end
+
+
+def _scan_fused_pairs(segment: str, index: int) -> tuple[dict[str, Any], int] | None:
+    arguments: dict[str, Any] = {}
+    cursor = index
+    while True:
+        pair = _FUSED_KEY_PATTERN.match(segment, cursor)
+        if pair is None:
+            return None
+        key = pair.group(1)
+        if key in arguments:
+            return None
+        bounds = _find_fused_value_end(segment, pair.end())
+        if bounds is None:
+            return None
+        value_end, cursor = bounds
+        value = _repair_fused_string(segment[pair.end() : value_end])
+        if value is None:
+            return None
+        arguments[key] = value
+        if cursor < 0:
+            return arguments, value_end + len(_FUSED_VALUE_CLOSE)
+
+
+def _find_fused_value_end(segment: str, start: int) -> tuple[int, int] | None:
+    """Returns where a scanned value ends and where the next key starts.
+
+    A negative second element means the closing ``"}`` ended the segment.
+    """
+    terminator = _find_fused_terminator(segment, start)
+    pair = _FUSED_NEXT_PAIR_PATTERN.search(segment, start)
+    if pair is not None and (terminator < 0 or pair.start() < terminator):
+        return pair.start(), pair.start() + len(_FUSED_PAIR_SEPARATOR)
+    if terminator < 0:
+        return None
+    return terminator, -1
+
+
+def _find_fused_terminator(segment: str, start: int) -> int:
+    """Finds the ``"}`` a segment boundary follows, or -1.
+
+    A ``"}`` inside a value is only a terminator when the payload continues
+    with its own packing marker or ends, so quoted braces stay data.
+    """
+    index = segment.find(_FUSED_VALUE_CLOSE, start)
+    while index >= 0:
+        if _at_fused_boundary(segment, index + len(_FUSED_VALUE_CLOSE)):
+            return index
+        index = segment.find(_FUSED_VALUE_CLOSE, index + 1)
+    return -1
+
+
+def _at_fused_boundary(segment: str, index: int) -> bool:
+    """Reports whether a reading ends where the packing lets a segment end."""
+    after = _skip_whitespace(segment, index)
+    return (
+        after == len(segment)
+        or segment.startswith(_ARG_VALUE_CLOSE, after)
+        or segment.startswith(TOOL_CALL_OPEN, after)
+    )
+
+
+def _repair_fused_string(raw: str) -> str | None:
+    """Reads a scanned value as the JSON string the model meant to write.
+
+    Escapes the model lost are restored, escapes it wrote keep their meaning,
+    and strict JSON still decides the result, so ``\\q`` or a trailing
+    backslash fails closed instead of reaching the client mangled.
+    """
+    parts: list[str] = []
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if char == "\\" and index + 1 < len(raw):
+            parts.append(raw[index : index + 2])
+            index += 2
+            continue
+        if char == '"':
+            parts.append('\\"')
+        elif char in _FUSED_CONTROL_ESCAPES:
+            parts.append(_FUSED_CONTROL_ESCAPES[char])
+        elif char < " ":
+            return None
+        else:
+            parts.append(char)
+        index += 1
+    try:
+        decoded = parse_strict_json(f'"{"".join(parts)}"')
+    except (json.JSONDecodeError, ValueError):
+        return None
+    # The forced quotes mean a successful parse is always a string.
+    return cast("str", decoded)
 
 
 _ARG_KEY_REPAIR_TERMINATORS = ("<arg_key>", _ARG_VALUE_CLOSE)
@@ -1133,6 +1298,7 @@ PAYLOAD_DECODERS: tuple[PayloadDecoder, ...] = (
     PayloadDecoder("python_call", _decode_python_call),
     PayloadDecoder("arg_key_value_repair", _decode_arg_key_value_repair),
     PayloadDecoder("lost_prefix_fused", _decode_lost_prefix_fused),
+    PayloadDecoder("lost_prefix_fused_repair", _decode_lost_prefix_fused_repair),
     PayloadDecoder("bare_name", _decode_bare_name),
     PayloadDecoder("bare_call", _decode_bare_call),
 )

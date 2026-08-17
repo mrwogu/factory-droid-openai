@@ -1481,6 +1481,111 @@ def test_stream_parser_fused_name_rejects_digit_led_key_alias_collision() -> Non
         parser.feed(f'{TOOL_CALL_OPEN}read_file2fa":"on"}}{TOOL_CALL_CLOSE}')
 
 
+def test_stream_parser_repairs_fused_value_with_lost_escaping() -> None:
+    # GLM-5.2 writes the shell quotes bare, so no reading of the segment parses.
+    parser = ToolCallStreamParser(frozenset({"run_in_terminal"}))
+    command = 'echo "CURRENT: $(git branch)" && ls'
+
+    emissions = parser.feed(
+        f'{TOOL_CALL_OPEN}run_in_terminalmode":"sync","command":"{command}"}}{TOOL_CALL_CLOSE}'
+    )
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == {"mode": "sync", "command": command}
+
+
+def test_stream_parser_repairs_fused_value_with_raw_control_characters() -> None:
+    parser = ToolCallStreamParser(frozenset({"run_in_terminal"}))
+
+    emissions = parser.feed(
+        f'{TOOL_CALL_OPEN}run_in_terminalcommand":"echo "one"\n\tls"}}{TOOL_CALL_CLOSE}'
+    )
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == {"command": 'echo "one"\n\tls'}
+
+
+def test_stream_parser_repaired_fused_value_keeps_written_escapes() -> None:
+    # A value mixing bare quotes with escapes the model did write keeps both
+    # readings: the escape decodes, the bare quote stays data.
+    parser = ToolCallStreamParser(frozenset({"run_in_terminal"}))
+
+    emissions = parser.feed(
+        f'{TOOL_CALL_OPEN}run_in_terminalcommand":"echo "raw" \\"kept\\" \\u0041"}}'
+        f"{TOOL_CALL_CLOSE}"
+    )
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == {"command": 'echo "raw" "kept" A'}
+
+
+def test_stream_parser_repaired_fused_value_keeps_unanchored_value_close() -> None:
+    # The inner "} is followed by more value, so only the anchored one ends it.
+    parser = ToolCallStreamParser(frozenset({"run_in_terminal"}))
+
+    emissions = parser.feed(
+        f'{TOOL_CALL_OPEN}run_in_terminalcommand":"echo "}} && ls "x""}}{TOOL_CALL_CLOSE}'
+    )
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == {"command": 'echo "} && ls "x"'}
+
+
+def test_stream_parser_repairs_packed_fused_values_after_one_strict_segment() -> None:
+    parser = ToolCallStreamParser(frozenset({"run_in_terminal"}), max_tool_calls=4)
+    body = (
+        'run_in_terminalcommand":"pwd"}'
+        f"{TOOL_CALL_OPEN}"
+        'run_in_terminalcommand":"echo "hi""}</arg_value>'
+    )
+
+    emissions = parser.feed(f"{TOOL_CALL_OPEN}{body}")
+    emissions.extend(parser.finish())
+
+    assert len(emissions) == 2
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert isinstance(emissions[1], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == {"command": "pwd"}
+    assert json.loads(emissions[1].arguments) == {"command": 'echo "hi"'}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # An escape JSON does not define stays rejected.
+        'run_in_terminalcommand":"echo "x" \\q"}',
+        # A value ending on a lone backslash is truncated, not repairable.
+        'run_in_terminalcommand":"echo "x" \\"}',
+        # A control byte JSON cannot name is not argument data.
+        'run_in_terminalcommand":"echo "x" \x00"}',
+        # The scan needs the closing "} the packing anchors.
+        'run_in_terminalmode":"sync","command":"echo "x"',
+        # Duplicate keys stay rejected on the scanned path too.
+        'run_in_terminalcommand":"echo "a"","command":"echo "b""}',
+        # Prose after the value-close residue still fails the turn.
+        'run_in_terminalcommand":"echo "x""}</arg_value>prose',
+    ],
+)
+def test_stream_parser_repaired_fused_value_stays_fail_closed(body: str) -> None:
+    parser = ToolCallStreamParser(frozenset({"run_in_terminal"}))
+
+    with pytest.raises(MalformedToolCallError, match="invalid tool-call JSON"):
+        parser.feed(f"{TOOL_CALL_OPEN}{body}{TOOL_CALL_CLOSE}")
+
+
+def test_stream_parser_repaired_fused_value_rejects_prefixed_tool_name() -> None:
+    # The scan cannot weigh two readings against each other, so any allowed
+    # name prefixing another fails closed instead of guessing the split.
+    parser = ToolCallStreamParser(frozenset({"run", "run_in_terminal"}))
+
+    with pytest.raises(MalformedToolCallError, match="invalid tool-call JSON"):
+        parser.feed(f'{TOOL_CALL_OPEN}run_in_terminalcommand":"echo "x""}}{TOOL_CALL_CLOSE}')
+
+
 def test_stream_parser_fused_name_bounds_packed_segments() -> None:
     parser = ToolCallStreamParser(frozenset({"weather"}), max_tool_calls=MAX_PACKED_CALLS)
     body = TOOL_CALL_OPEN.join(['weathermode":"sync"}'] * (MAX_PACKED_CALLS + 1))
