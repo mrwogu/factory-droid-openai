@@ -1208,7 +1208,7 @@ error types.
 | `FACTORY_DROID_OPENAI_CLEANUP_TIMEOUT_SECONDS` | `10` | Total budget for session cleanup |
 | `FACTORY_DROID_OPENAI_UVICORN_LIMIT_CONCURRENCY` | `64` | Uvicorn connection limit |
 | `FACTORY_DROID_OPENAI_UVICORN_BACKLOG` | `128` | Uvicorn listen backlog |
-| `FACTORY_DROID_OPENAI_MAX_TOOL_CALLS` | `8` | Tool calls accepted per Droid turn, from 1 through 64 |
+| `FACTORY_DROID_OPENAI_MAX_TOOL_CALLS` | `64` | Tool calls accepted per Droid turn, from 1 through 64; the prompt asks the model for at most 8 at a time |
 | `FACTORY_DROID_OPENAI_TOOL_CALL_DRAIN_SECONDS` | `0.5` | Wait for further events after a complete tool call |
 | `FACTORY_DROID_OPENAI_REPAIR_LOST_PREFIX` | `false` | Repair tool-call payloads missing their opening `{"name":"` bytes |
 | `FACTORY_DROID_OPENAI_MAX_ATTACHMENTS` | `16` | Inline attachments per request |

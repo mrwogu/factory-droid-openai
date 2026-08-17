@@ -15,6 +15,7 @@ from factory_droid_openai.dialects import (
 from factory_droid_openai.models import ChatCompletionRequest
 from factory_droid_openai.protocol import (
     _MAX_TOOL_PAYLOAD_BYTES,
+    _SUGGESTED_TOOL_CALLS,
     TOOL_CALL_CLOSE,
     TOOL_CALL_OPEN,
     IncompleteToolCallError,
@@ -3696,6 +3697,15 @@ def test_multi_tool_prompt_mentions_the_cap() -> None:
     plan = build_prompt(_request(), max_tool_calls=4)
 
     assert "up to 4 tool requests" in plan.prompt
+
+
+def test_multi_tool_prompt_caps_the_suggested_call_count() -> None:
+    # The parser accepts every call up to the limit; the prompt still asks for
+    # a modest burst instead of quoting the cap back to the model.
+    plan = build_prompt(_request(), max_tool_calls=MAX_PACKED_CALLS)
+
+    assert f"up to {_SUGGESTED_TOOL_CALLS} tool requests" in plan.prompt
+    assert f"up to {MAX_PACKED_CALLS} tool requests" not in plan.prompt
 
 
 def test_continuation_prompt_sends_only_messages_after_last_assistant() -> None:

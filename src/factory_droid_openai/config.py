@@ -46,7 +46,10 @@ class Settings:
     cleanup_timeout_seconds: float = 10.0
     server_limit_concurrency: int = 64
     server_backlog: int = 128
-    max_tool_calls: int = 8
+    # Defaults to the parser's own packing cap: a model that answers with a
+    # burst of calls is asking the client for work it can run, and dropping the
+    # turn over the count alone only costs a retry.
+    max_tool_calls: int = MAX_PACKED_CALLS
     tool_call_drain_seconds: float = DEFAULT_TOOL_CALL_DRAIN_SECONDS
     max_attachments: int = 16
     max_attachment_bytes: int = 8_388_608
@@ -197,7 +200,7 @@ class Settings:
         )
         max_tool_calls = _positive_int(
             "FACTORY_DROID_OPENAI_MAX_TOOL_CALLS",
-            default=8,
+            default=MAX_PACKED_CALLS,
         )
         tool_call_drain_seconds = _positive_float(
             "FACTORY_DROID_OPENAI_TOOL_CALL_DRAIN_SECONDS",

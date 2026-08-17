@@ -449,6 +449,19 @@ def test_settings_accepts_the_tool_call_repair_cap(tmp_path: Path) -> None:
     assert settings.max_tool_calls == MAX_PACKED_CALLS
 
 
+def test_settings_default_tool_call_limit_matches_the_repair_cap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # The prompt quotes this number to the model, so the dataclass default and
+    # the environment default have to agree.
+    _clear_environment(monkeypatch)
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
+
+    assert Settings(workdir=tmp_path).max_tool_calls == MAX_PACKED_CALLS
+    assert Settings.from_env().max_tool_calls == MAX_PACKED_CALLS
+
+
 def test_settings_rejects_tool_call_limit_over_the_repair_cap(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
