@@ -257,15 +257,15 @@ async def test_reporter_applies_one_deadline_to_all_batches(
         post=post,
     )
     assert await reporter.flush() is False
-    # One budget covers every batch, so a second send only gets what the first
-    # one left, here at least the 0.03 it slept. A per-batch budget would hand
-    # out the full 0.05 every time, and wall-clock timing cannot separate the
-    # two policies because both spend the same total.
-    assert 1 <= len(timeouts) <= 2
+    # The flush stopped short of the last batch, and every send it did make got
+    # what the previous one left rather than a fresh budget. How many sends fit
+    # inside one budget depends on the platform clock granularity, so only the
+    # shrinking is asserted; the 0.01 margin clears both float noise and a
+    # coarse monotonic clock while a per-batch budget, which never shrinks,
+    # still fails it.
+    assert timeouts
     assert all(timeout > 0 for timeout in timeouts)
-    # The 0.02 margin sits under the 0.03 the send slept, so only the shared
-    # deadline can satisfy it while float noise cannot.
-    assert all(timeouts[index] <= timeouts[index - 1] - 0.02 for index in range(1, len(timeouts)))
+    assert all(timeouts[index] <= timeouts[index - 1] - 0.01 for index in range(1, len(timeouts)))
 
 
 @pytest.mark.asyncio
