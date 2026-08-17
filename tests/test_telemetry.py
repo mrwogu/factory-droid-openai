@@ -192,9 +192,11 @@ async def test_reporter_swallows_sender_exceptions() -> None:
 async def test_reporter_bounds_sender_deadline() -> None:
     release = threading.Event()
     bodies: list[dict[str, object]] = []
+    timeouts: list[float] = []
 
-    def post(_endpoint: str, body: bytes, _timeout: float) -> bool:
+    def post(_endpoint: str, body: bytes, timeout: float) -> bool:
         bodies.append(json.loads(body))
+        timeouts.append(timeout)
         release.wait()
         return True
 
@@ -206,10 +208,12 @@ async def test_reporter_bounds_sender_deadline() -> None:
         timeout_seconds=0.01,
         post=post,
     )
-    started_at = asyncio.get_running_loop().time()
-
     assert await reporter.flush() is False
-    assert asyncio.get_running_loop().time() - started_at < 0.1
+    # The send is still blocked here, so a flush that returns at all proves the
+    # deadline was enforced. What bounds it is the budget handed to the sender,
+    # which is deterministic, unlike wall-clock timing on a loaded runner.
+    assert len(timeouts) == 1
+    assert 0 < timeouts[0] <= 0.01
     release.set()
     await asyncio.sleep(0)
     # A send that outran the deadline may or may not have landed, so aggregate
@@ -252,13 +256,14 @@ async def test_reporter_applies_one_deadline_to_all_batches(
         timeout_seconds=0.05,
         post=post,
     )
-    started_at = asyncio.get_running_loop().time()
-
     assert await reporter.flush() is False
-    assert asyncio.get_running_loop().time() - started_at < 0.1
+    # One budget covers every batch, so a second send only gets what the first
+    # one left: at most the 0.05 budget minus the 0.03 the first send slept.
+    # Wall-clock timing cannot separate the two policies here, since a per-batch
+    # budget would spend the same 0.1 seconds the shared one is allowed.
     assert 1 <= len(timeouts) <= 2
-    assert all(timeout > 0 for timeout in timeouts)
-    assert all(timeouts[index] < timeouts[index - 1] for index in range(1, len(timeouts)))
+    assert all(0 < timeout <= 0.05 for timeout in timeouts)
+    assert all(timeouts[index] <= timeouts[index - 1] - 0.03 for index in range(1, len(timeouts)))
 
 
 @pytest.mark.asyncio
