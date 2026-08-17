@@ -58,6 +58,7 @@ _ARGUMENT_KEYS = ("arguments", "parameters", "args", "input")
 _ARG_KEY_REPAIR_MARKER = "<arg_key>"
 _ARG_VALUE_REPAIR_CLOSE = "</arg_value>"
 _UNPARSED_HEAD_CHARS = 64
+_UNPARSED_ERROR_CHARS = 200
 _MESSAGE_JSON_PATTERN = re.compile(r'\{\s*"(?:role|content|tool_calls|id|type)"\s*:')
 _MESSAGE_JSON_KEYS = ("role", "content", "tool_calls", "id", "type")
 _MAX_MESSAGE_JSON_PREFIX_CHARS = 64
@@ -893,6 +894,10 @@ class ToolCallStreamParser:
                     tool_name=tool_name,
                     dialect=self._dialect.name,
                     payload_bytes=len(body.encode("utf-8")),
+                    # Strict-decode failure class and position only; the
+                    # message never carries payload content, so the recovery
+                    # path (which swallows the exception) stays diagnosable.
+                    error=f"{type(exc).__name__}: {exc}"[:_UNPARSED_ERROR_CHARS],
                 )
                 self._trace_payload("tool_call.unparsed", body)
                 self._report_repair("tool_call.unparsed")

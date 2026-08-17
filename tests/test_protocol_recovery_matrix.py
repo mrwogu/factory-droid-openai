@@ -166,6 +166,11 @@ _DECODER_FIXTURES = (
         'weather<arg_key>city":"Gdansk"}',
         {"city": "Gdansk"},
     ),
+    RecoveryFixture(
+        "lost_prefix_fused",
+        'weathercity":"Gdansk"}',
+        {"city": "Gdansk"},
+    ),
     RecoveryFixture("bare_name", 'weather\n{"city":"Gdansk"}', {"city": "Gdansk"}),
     RecoveryFixture("bare_call", 'weather{"city":"Gdansk"}', {"city": "Gdansk"}),
 )
@@ -242,6 +247,13 @@ _PACKED_DECODER_FIXTURES = (
         "python-mixed",
         "python_call",
         f'weather({{"city":"Gdansk"}}){TOOL_CALL_OPEN}forecast({{"city":"Sopot"}})',
+        _PACKED_NAMES,
+        _PACKED_ARGUMENTS,
+    ),
+    PackedRecoveryFixture(
+        "fused-open-separator",
+        "lost_prefix_fused",
+        f'weathercity":"Gdansk"}}{TOOL_CALL_OPEN}forecastcity":"Sopot"}}',
         _PACKED_NAMES,
         _PACKED_ARGUMENTS,
     ),
@@ -394,6 +406,12 @@ _OVER_CAP_STREAMS = (
         + TOOL_CALL_OPEN.join(
             'weather<arg_key>city":"Gdansk"}' for _ in range(MAX_PACKED_CALLS + 1)
         )
+        + TOOL_CALL_CLOSE,
+    ),
+    (
+        "fused",
+        TOOL_CALL_OPEN
+        + TOOL_CALL_OPEN.join('weathercity":"Gdansk"}' for _ in range(MAX_PACKED_CALLS + 1))
         + TOOL_CALL_CLOSE,
     ),
 )
