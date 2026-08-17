@@ -309,6 +309,32 @@ Two forms are not supported:
 
 Both stay out until a captured sample justifies the added parsing surface.
 
+### Native tool calling
+
+`FACTORY_DROID_OPENAI_NATIVE_TOOL_CALLS=true` takes tool calling off the text
+channel entirely. The bridge serves the request's tools to Droid as an MCP
+server on its own HTTP port, Droid registers them as real tools, and the model
+calls them through its own tool slot. The bridge then reports the call as
+`tool_calls` exactly as before.
+
+What changes with the flag on:
+
+- Tool schemas leave the prompt. They are published over MCP instead, so a
+  request carrying a large toolset sends far fewer prompt bytes.
+- No dialect has to be recognized, because no tool call is written as text.
+  The dialect table above still applies to the default path.
+- A tool-bearing request no longer uses a warm session, because Droid attaches
+  MCP servers only when a session starts. Requests without tools still do.
+- Droid's own tools stay disabled, apart from the deferred-tool loader the
+  model needs to reach the published tools at all.
+- The bridge refuses every published call at Droid's permission gate. The
+  OpenAI client runs the tool and resubmits the result, as it always has.
+
+The endpoint lives at `/factory/mcp/{token}` with a single-use token per
+request, and it is mounted only while the flag is on. Droid reaches it at
+`http://127.0.0.1:<port>`; set `FACTORY_DROID_OPENAI_NATIVE_TOOL_CALL_URL`
+when the bridge answers on a different address than it binds.
+
 ## Requirements
 
 - Python 3.11 or newer
@@ -1212,6 +1238,8 @@ error types.
 | `FACTORY_DROID_OPENAI_MAX_TOOL_CALLS` | `64` | Tool calls accepted per Droid turn, from 1 through 64; the prompt asks the model for at most 8 at a time |
 | `FACTORY_DROID_OPENAI_TOOL_CALL_DRAIN_SECONDS` | `0.5` | Wait for further events after a complete tool call |
 | `FACTORY_DROID_OPENAI_REPAIR_LOST_PREFIX` | `false` | Repair tool-call payloads missing their opening `{"name":"` bytes |
+| `FACTORY_DROID_OPENAI_NATIVE_TOOL_CALLS` | `false` | Publish client tools to Droid over MCP instead of describing them in the prompt |
+| `FACTORY_DROID_OPENAI_NATIVE_TOOL_CALL_URL` | unset | Base URL Droid uses to reach the bridge's MCP endpoint |
 | `FACTORY_DROID_OPENAI_MAX_ATTACHMENTS` | `16` | Inline attachments per request |
 | `FACTORY_DROID_OPENAI_MAX_ATTACHMENT_BYTES` | `8388608` | Total encoded attachment bytes |
 | `FACTORY_DROID_OPENAI_MAX_CHOICES` | `4` | Upper bound for `n` |

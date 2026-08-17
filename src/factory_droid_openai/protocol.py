@@ -101,6 +101,10 @@ class PromptPlan:
     allowed_tool_names: frozenset[str]
     require_tool_call: bool
     attachments: AttachmentSet = field(default_factory=AttachmentSet)
+    # Populated only for a native tool-calling request: the tools tool_choice
+    # left callable, for the caller to publish over MCP instead of in the
+    # prompt.
+    native_tools: tuple[ToolDefinition, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +134,7 @@ def build_prompt(
     max_attachments: int = 16,
     max_attachment_bytes: int = 8_388_608,
     continuation: bool = False,
+    native_tools: bool = False,
 ) -> PromptPlan:
     if len(request.messages) > max_messages:
         raise RequestTooLargeError(f"request exceeds maximum of {max_messages} messages")
@@ -175,13 +180,18 @@ def build_prompt(
         message_bytes += serialized_bytes
         serialized_messages.append(serialized)
 
+    # Native tool calling publishes the schemas over MCP, so repeating them in
+    # the transcript would only spend context. They are still serialized above,
+    # which is what enforces the schema size and depth limits.
+    transcript_tools = [] if native_tools else serialized_tools
+    transcript_tool_bytes = 0 if native_tools else tool_schema_bytes
     transcript_bytes = (
         len(b'{"messages":[')
         + message_bytes
         + max(0, len(serialized_messages) - 1)
         + len(b'],"tools":[')
-        + tool_schema_bytes
-        + max(0, len(serialized_tools) - 1)
+        + transcript_tool_bytes
+        + max(0, len(transcript_tools) - 1)
         + len(b"]}")
     )
     if transcript_bytes > max_transcript_bytes:
@@ -191,12 +201,37 @@ def build_prompt(
         '{"messages":['
         + ",".join(serialized_messages)
         + '],"tools":['
-        + ",".join(serialized_tools)
+        + ",".join(transcript_tools)
         + "]}"
     )
     tool_names = frozenset(tool.function.name for tool in selected_tools)
 
-    if tool_names:
+    if tool_names and native_tools:
+        # Droid registers these as real tools, so the prompt only has to keep
+        # the model from answering in the text dialect the other path needs.
+        available = ", ".join(sorted(tool_names))
+        tool_rule = (
+            f"The client provides these callable tools: {available}. "
+            "They are registered as tools in this session, so call them the way "
+            "you call any tool. Never write a tool call as text, never emit "
+            f"{TOOL_CALL_OPEN} or {TOOL_CALL_CLOSE}, and do not call "
+            "Droid-native tools."
+        )
+        if any(message.role == "tool" for message in prompt_messages):
+            # The session's own tool history is empty on every request, so a
+            # model that trusts only what it called itself would run the same
+            # call again instead of answering from the result it was given.
+            tool_rule += (
+                " Results of earlier calls are in the transcript below. Treat "
+                "them as final and do not repeat a call the transcript already "
+                "answers."
+            )
+        if require_tool_call:
+            tool_rule += (
+                " A tool call is required for this response: call a tool instead "
+                "of explaining or asking a question."
+            )
+    elif tool_names:
         if max_tool_calls > 1:
             # The prompt suggests far less than the limit accepts. A high number
             # here reads as an invitation to burst, and a model that bursts
@@ -271,6 +306,7 @@ def build_prompt(
         allowed_tool_names=tool_names,
         require_tool_call=require_tool_call,
         attachments=attachments,
+        native_tools=tuple(selected_tools) if native_tools else (),
     )
 
 

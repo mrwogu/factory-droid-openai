@@ -691,3 +691,47 @@ def test_settings_trace_file_rejects_symlink(
 
     with pytest.raises(ValueError, match="must not be a symlink"):
         Settings.from_env()
+
+
+def test_native_tool_calls_are_off_until_the_environment_asks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
+
+    default = Settings.from_env()
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_NATIVE_TOOL_CALLS", "true")
+    enabled = Settings.from_env()
+
+    assert default.native_tool_calls is False
+    assert enabled.native_tool_calls is True
+
+
+def test_native_tool_call_url_defaults_to_the_bridge_port(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_PORT", "9001")
+    # A wildcard bind address is not a target Droid can call back on.
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_HOST", "0.0.0.0")
+
+    settings = Settings.from_env()
+
+    assert settings.native_tool_call_url is None
+    assert settings.native_tool_call_base_url() == "http://127.0.0.1:9001"
+
+
+def test_native_tool_call_url_can_be_overridden(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(tmp_path))
+    monkeypatch.setenv(
+        "FACTORY_DROID_OPENAI_NATIVE_TOOL_CALL_URL",
+        "http://bridge.internal:8080",
+    )
+
+    settings = Settings.from_env()
+
+    assert settings.native_tool_call_base_url() == "http://bridge.internal:8080"

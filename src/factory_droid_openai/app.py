@@ -27,6 +27,12 @@ from factory_droid_openai.logs import bind_request, current_timeline
 from factory_droid_openai.logs import debug as log_debug
 from factory_droid_openai.logs import info as log_info
 from factory_droid_openai.logs import warning as log_warning
+from factory_droid_openai.mcp_tools import (
+    NativeToolBinding,
+    NativeToolRegistry,
+    build_router,
+    to_mcp_tools,
+)
 from factory_droid_openai.metrics import BridgeMetrics
 from factory_droid_openai.models import (
     ChatCompletionRequest,
@@ -750,6 +756,10 @@ def create_app(
         endpoint=DEFAULT_TELEMETRY_ENDPOINT,
         enabled=resolved_settings.telemetry,
     )
+    native_tools = NativeToolRegistry(
+        base_url=resolved_settings.native_tool_call_base_url(),
+        max_sessions=resolved_settings.max_tracked_sessions,
+    )
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -825,6 +835,12 @@ def create_app(
     application.state.reaper = reaper
     application.state.quarantine = quarantine
     application.state.telemetry = telemetry
+    application.state.native_tools = native_tools
+    if resolved_settings.native_tool_calls:
+        # The token in each path is the credential, so the endpoint carries no
+        # API-key dependency: only the Droid process this bridge started is
+        # ever told the URL.
+        application.include_router(build_router(native_tools))
 
     async def require_auth(credentials: BearerCredentials) -> None:
         expected = resolved_settings.api_key
@@ -1264,6 +1280,7 @@ def create_app(
                 max_attachments=resolved_settings.max_attachments,
                 max_attachment_bytes=resolved_settings.max_attachment_bytes,
                 continuation=session_id is not None,
+                native_tools=resolved_settings.native_tool_calls,
             )
         except RequestTooLargeError as exc:
             metrics.increment_payload_rejections()
@@ -1368,7 +1385,24 @@ def create_app(
                     session_use.release()
             raise
 
-        if session_id is None:
+        native_binding: NativeToolBinding | None = None
+        if plan.native_tools:
+            native_binding = native_tools.open(to_mcp_tools(plan.native_tools))
+            metrics.record_features(("native_tool_calls",))
+            run_request = replace(run_request, native_tools=native_binding)
+            log_debug(
+                "chat.native_tools_published",
+                tools=len(plan.native_tools),
+                open_catalogs=len(native_tools),
+            )
+
+        def release_native_tools() -> None:
+            if native_binding is not None:
+                native_tools.close(native_binding.token)
+
+        # Droid attaches MCP servers when a session starts, so a session warmed
+        # without this request's tools cannot serve the turn.
+        if session_id is None and native_binding is None:
             warm_session = pool.acquire(requested_key)
             if warm_session is not None:
                 metrics.record_features(("warm_session",))
@@ -1447,6 +1481,7 @@ def create_app(
                     reaper=reaper,
                     runner_factory=resolved_runner_factory,
                     session_use=session_use,
+                    release_native_tools=release_native_tools,
                 ),
                 headers={
                     "Cache-Control": "no-cache",
@@ -1513,8 +1548,11 @@ def create_app(
             note_runner_failure(payload.model, exc)
             return _error_response(str(exc), exc.status_code, exc.error_type)
         finally:
-            if session_use is not None:
-                session_use.release()
+            try:
+                if session_use is not None:
+                    session_use.release()
+            finally:
+                release_native_tools()
 
         log_info(
             "chat.completed",
@@ -2143,6 +2181,7 @@ async def _finalize_stream(
     reaper: BackgroundReaper | None = None,
     runner_factory: RunnerFactory | None = None,
     session_use: SessionUseLease | None = None,
+    release_native_tools: Callable[[], None] | None = None,
 ) -> None:
     close = getattr(stream, "aclose", None)
     try:
@@ -2163,8 +2202,12 @@ async def _finalize_stream(
         try:
             await lease.release()
         finally:
-            if session_use is not None:
-                session_use.release()
+            try:
+                if session_use is not None:
+                    session_use.release()
+            finally:
+                if release_native_tools is not None:
+                    release_native_tools()
 
 
 def _apply_emissions(

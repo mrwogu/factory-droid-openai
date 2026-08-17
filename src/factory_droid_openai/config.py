@@ -74,6 +74,14 @@ class Settings:
     # Off by default: the payload lost bytes, so the repair trusts less of the
     # wire than the always-on decoders do.
     repair_lost_prefix: bool = False
+    # Off by default: publishing tools over MCP moves tool calling off the text
+    # channel, which changes how a turn ends and costs a warm session per
+    # tool-bearing request.
+    native_tool_calls: bool = False
+    # Where the Droid process reaches this bridge back. The bind host can be a
+    # wildcard, which is not a usable target, so the loopback address is the
+    # default and an override exists for a bridge behind a different port.
+    native_tool_call_url: str | None = None
     # Off by default: prompts and tool payloads are private user content.
     trace_payloads: str = "off"
     trace_payload_file: Path | None = None
@@ -135,6 +143,11 @@ class Settings:
             "FACTORY_DROID_OPENAI_REPAIR_LOST_PREFIX",
             default=False,
         )
+        native_tool_calls = _boolean(
+            "FACTORY_DROID_OPENAI_NATIVE_TOOL_CALLS",
+            default=False,
+        )
+        native_tool_call_url = os.getenv("FACTORY_DROID_OPENAI_NATIVE_TOOL_CALL_URL") or None
         telemetry = _telemetry_enabled()
         max_queue_size = _non_negative_int(
             "FACTORY_DROID_OPENAI_MAX_QUEUE_SIZE",
@@ -320,9 +333,17 @@ class Settings:
             detached_cleanup=detached_cleanup,
             telemetry=telemetry,
             repair_lost_prefix=repair_lost_prefix,
+            native_tool_calls=native_tool_calls,
+            native_tool_call_url=native_tool_call_url,
             trace_payloads=trace_payloads,
             trace_payload_file=trace_payload_file,
         )
+
+    def native_tool_call_base_url(self) -> str:
+        """Base URL the Droid process uses to reach the bridge's MCP endpoint."""
+        if self.native_tool_call_url is not None:
+            return self.native_tool_call_url
+        return f"http://127.0.0.1:{self.port}"
 
 
 def _positive_float(name: str, *, default: float) -> float:
