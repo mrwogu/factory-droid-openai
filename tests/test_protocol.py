@@ -1433,6 +1433,8 @@ def test_stream_parser_recovers_fused_name_with_value_close_residue() -> None:
         'run_in_terminalmode":"sync"',
         # The fused key must be an identifier, not a digit-led fragment.
         'run_in_terminal12":"sync"}',
+        # The first fused argument must be a string, the only observed shape.
+        'run_in_terminaltimeout":30}',
         # Prose after the value-close residue is not ignorable scaffolding.
         'run_in_terminalmode":"sync"}</arg_value>prose',
         # A segment left empty by a doubled marker fails closed.
@@ -1448,12 +1450,35 @@ def test_stream_parser_fused_name_stays_fail_closed(body: str) -> None:
         parser.feed(f"{TOOL_CALL_OPEN}{body}{TOOL_CALL_CLOSE}")
 
 
+def test_stream_parser_recovers_fused_name_value_holding_open_marker() -> None:
+    # The marker inside the value is argument data, not a packing separator.
+    parser = ToolCallStreamParser(frozenset({"run_in_terminal"}))
+
+    emissions = parser.feed(
+        f'{TOOL_CALL_OPEN}run_in_terminalcommand":"echo {TOOL_CALL_OPEN}"}}{TOOL_CALL_CLOSE}'
+    )
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == {"command": f"echo {TOOL_CALL_OPEN}"}
+
+
 def test_stream_parser_fused_name_rejects_alias_collision() -> None:
     # Both splits strict-parse, so the fused form is ambiguous and fails closed.
     parser = ToolCallStreamParser(frozenset({"run", "run_in_terminal"}))
 
     with pytest.raises(MalformedToolCallError, match="invalid tool-call JSON"):
         parser.feed(f'{TOOL_CALL_OPEN}run_in_terminalmode":"sync"}}{TOOL_CALL_CLOSE}')
+
+
+def test_stream_parser_fused_name_rejects_digit_led_key_alias_collision() -> None:
+    # The digit-led key only fails the key pattern on the longer split, so
+    # counting the ambiguity after that check would dispatch 'read' with a
+    # '_file2fa' argument instead of rejecting the payload.
+    parser = ToolCallStreamParser(frozenset({"read", "read_file"}))
+
+    with pytest.raises(MalformedToolCallError, match="invalid tool-call JSON"):
+        parser.feed(f'{TOOL_CALL_OPEN}read_file2fa":"on"}}{TOOL_CALL_CLOSE}')
 
 
 def test_stream_parser_fused_name_bounds_packed_segments() -> None:

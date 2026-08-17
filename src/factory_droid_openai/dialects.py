@@ -831,8 +831,11 @@ def _skip_whitespace(value: str, index: int) -> int:
 
 # GLM-5.2 drops both the ``{"name":"`` opening and the ``","arguments":{"``
 # infix, so the first argument key fuses onto the tool name. The fused key is
-# still a plain identifier followed by the JSON ``":"`` separator.
+# still a plain identifier followed by the JSON ``":"`` separator, the only
+# shape observed on the wire: a first argument that is not a string stays
+# rejected rather than guessed at.
 _FUSED_FIRST_KEY_PATTERN = re.compile(r'[A-Za-z_][A-Za-z0-9_]*":"')
+_FUSED_OBJECT_OPEN = '{"'
 
 
 def _decode_lost_prefix_fused(
@@ -843,55 +846,80 @@ def _decode_lost_prefix_fused(
 
     Observed on GLM-5.2 turns: the payload drops the ``{"name":"`` opening and
     the ``","arguments":{"`` infix, so ``run_in_terminalmode":"sync",...}``
-    repeats per call, packed by a bare ``<tool_call>`` without any close. The
-    split between name and key must be the single allowed tool whose remainder
-    strict-parses as a JSON object; zero or multiple parses fail closed, so an
-    alias collision or plain garbage stays rejected.
+    repeats per call, packed by a bare ``<tool_call>`` without any close. A
+    single GLM value-close residue may separate segments or terminate the
+    payload; other residue and partial calls remain rejected.
+
+    The split between name and key must be the single allowed tool whose
+    remainder strict-parses as a JSON object; zero or several parses fail
+    closed, so an alias collision or plain garbage stays rejected. Segments are
+    walked from the end offset the strict decoder reports instead of split on
+    the marker, so an argument value holding a literal ``<tool_call>`` survives
+    intact.
+
+    This form loses more bytes than the opt-in lost-prefix repair yet stays
+    always-on, because it anchors on an exact allowed tool name, a complete
+    strict JSON object and a single surviving reading, where that repair only
+    has the name and the ``","`` the wire kept.
     """
-    segments = body.split(TOOL_CALL_OPEN)
-    # The segment count bounds the work below; ``_append_packed_call`` would
-    # only repeat the same cap.
-    if len(segments) > MAX_PACKED_CALLS:
-        return None
+    stripped = body.strip()
     calls: list[dict[str, Any]] = []
-    for segment in segments:
-        parsed = _decode_fused_segment(segment, allowed_tool_names)
+    index = 0
+    while len(calls) < MAX_PACKED_CALLS:
+        parsed = _decode_fused_segment(stripped, index, allowed_tool_names)
         if parsed is None:
             return None
-        calls.append(parsed)
-    return calls
+        call, index = parsed
+        calls.append(call)
+        index = _skip_whitespace(stripped, index)
+        if stripped.startswith(_ARG_VALUE_CLOSE, index):
+            index = _skip_whitespace(stripped, index + len(_ARG_VALUE_CLOSE))
+        if index == len(stripped):
+            return calls
+        if not stripped.startswith(TOOL_CALL_OPEN, index):
+            return None
+        index = _skip_whitespace(stripped, index + len(TOOL_CALL_OPEN))
+        if index == len(stripped):
+            return None
+    return None
 
 
 def _decode_fused_segment(
     segment: str,
+    index: int,
     allowed_tool_names: frozenset[str],
-) -> dict[str, Any] | None:
-    text = segment.strip()
-    if text.endswith(_ARG_VALUE_CLOSE):
-        # One GLM value-close residue may terminate a segment; anything after
-        # it is prose and keeps the payload rejected.
-        text = text[: -len(_ARG_VALUE_CLOSE)].strip()
-    if not text:
-        return None
-    candidates: list[tuple[str, dict[str, Any]]] = []
+) -> tuple[dict[str, Any], int] | None:
+    candidates: list[tuple[str, dict[str, Any], int, bool]] = []
     for name in allowed_tool_names:
-        if not text.startswith(name):
+        if not segment.startswith(name, index):
             continue
-        remainder = text[len(name) :]
-        if not _FUSED_FIRST_KEY_PATTERN.match(remainder):
-            continue
+        start = index + len(name)
         try:
-            parsed = parse_strict_json('{"' + remainder)
+            # The forced ``{"`` opening means a successful parse is always a
+            # dict, and its end offset maps back by the two forced bytes.
+            arguments, end = raw_decode_strict(_FUSED_OBJECT_OPEN + segment[start:], 0)
         except JsonNestingError:
             raise
         except (json.JSONDecodeError, ValueError):
             continue
-        # The forced ``{"`` opening means a successful parse is always a dict.
-        candidates.append((name, parsed))
+        candidates.append(
+            (
+                name,
+                arguments,
+                start + end - len(_FUSED_OBJECT_OPEN),
+                _FUSED_FIRST_KEY_PATTERN.match(segment, start) is not None,
+            )
+        )
     if len(candidates) != 1:
+        # Ambiguity is counted before the key shape is judged: a split the key
+        # pattern would reject still proves the payload has two readings, and
+        # keeping the surviving one would dispatch a different tool than the
+        # model asked for.
         return None
-    name, arguments = candidates[0]
-    return {"name": name, "arguments": arguments}
+    name, arguments, end, fused_key = candidates[0]
+    if not fused_key:
+        return None
+    return {"name": name, "arguments": arguments}, end
 
 
 _ARG_KEY_REPAIR_TERMINATORS = ("<arg_key>", _ARG_VALUE_CLOSE)

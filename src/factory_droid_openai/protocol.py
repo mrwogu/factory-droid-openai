@@ -894,9 +894,12 @@ class ToolCallStreamParser:
                     tool_name=tool_name,
                     dialect=self._dialect.name,
                     payload_bytes=len(body.encode("utf-8")),
-                    # Strict-decode failure class and position only; the
-                    # message never carries payload content, so the recovery
-                    # path (which swallows the exception) stays diagnosable.
+                    # The strict-decode failure class plus whatever the parser
+                    # quotes from the payload, a duplicate key or a rejected
+                    # literal among them. It sits beside head and tail at the
+                    # same trace level, so it discloses nothing they do not,
+                    # and it keeps the recovery path, which swallows this
+                    # exception, diagnosable.
                     error=f"{type(exc).__name__}: {exc}"[:_UNPARSED_ERROR_CHARS],
                 )
                 self._trace_payload("tool_call.unparsed", body)
