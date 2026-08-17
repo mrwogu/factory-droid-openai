@@ -167,6 +167,11 @@ _DECODER_FIXTURES = (
         {"city": "Gdansk"},
     ),
     RecoveryFixture(
+        "arg_key_lost_open",
+        "weather</arg_value>city</arg_key><arg_value>Gdansk</arg_value>",
+        {"city": "Gdansk"},
+    ),
+    RecoveryFixture(
         "lost_prefix_fused",
         'weathercity":"Gdansk"}',
         {"city": "Gdansk"},
@@ -230,6 +235,14 @@ _PACKED_DECODER_FIXTURES = (
         "arg-key-mixed",
         "arg_key_value_repair",
         f'weather<arg_key>city":"Gdansk"}}{TOOL_CALL_OPEN}forecast<arg_key>city":"Sopot"}}',
+        _PACKED_NAMES,
+        _PACKED_ARGUMENTS,
+    ),
+    PackedRecoveryFixture(
+        "arg-key-lost-open",
+        "arg_key_lost_open",
+        "weather</arg_value>city</arg_key><arg_value>Gdansk</arg_value>"
+        f"{TOOL_CALL_OPEN}forecast</arg_value>city</arg_key><arg_value>Sopot</arg_value>",
         _PACKED_NAMES,
         _PACKED_ARGUMENTS,
     ),
@@ -351,6 +364,31 @@ _REJECTION_FIXTURES = (
         2,
     ),
     RejectionFixture(
+        "arg-key-lost-open-name-without-stray-close",
+        f"{TOOL_CALL_OPEN}weathercity</arg_key><arg_value>Gdansk</arg_value>{TOOL_CALL_CLOSE}",
+        frozenset({"weather"}),
+    ),
+    RejectionFixture(
+        "arg-key-lost-open-segment-without-key-close",
+        f"{TOOL_CALL_OPEN}weather</arg_value>city</arg_key><arg_value>Gdansk</arg_value>"
+        f'{TOOL_CALL_OPEN}weather{{"city":"Sopot"}}</arg_value>{TOOL_CALL_CLOSE}',
+        frozenset({"weather"}),
+        2,
+    ),
+    RejectionFixture(
+        "arg-key-lost-open-doubled-separator",
+        f"{TOOL_CALL_OPEN}{TOOL_CALL_OPEN}weather</arg_value>city</arg_key>"
+        f"<arg_value>Gdansk</arg_value>{TOOL_CALL_CLOSE}",
+        frozenset({"weather"}),
+    ),
+    RejectionFixture(
+        "arg-key-lost-open-marker-in-value",
+        f"{TOOL_CALL_OPEN}weather</arg_value>city</arg_key><arg_value>Gda{TOOL_CALL_OPEN}"
+        f"nsk</arg_value>{TOOL_CALL_CLOSE}",
+        frozenset({"weather"}),
+        2,
+    ),
+    RejectionFixture(
         "qwen-missing-parameter-close",
         f"{TOOL_CALL_OPEN}<function=weather><parameter=city>Gdansk"
         f"<parameter=unit>c</parameter></function>{TOOL_CALL_CLOSE}",
@@ -417,6 +455,15 @@ _OVER_CAP_STREAMS = (
         TOOL_CALL_OPEN
         + TOOL_CALL_OPEN.join(
             'weather<arg_key>city":"Gdansk"}' for _ in range(MAX_PACKED_CALLS + 1)
+        )
+        + TOOL_CALL_CLOSE,
+    ),
+    (
+        "arg-key-lost-open",
+        TOOL_CALL_OPEN
+        + TOOL_CALL_OPEN.join(
+            "weather</arg_value>city</arg_key><arg_value>Gdansk</arg_value>"
+            for _ in range(MAX_PACKED_CALLS + 1)
         )
         + TOOL_CALL_CLOSE,
     ),

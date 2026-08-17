@@ -1248,6 +1248,76 @@ def _arg_key_repair_value(text: str, *, quoted: bool) -> tuple[Any, str]:
     return _coerce_arg_value(raw.strip()), remainder
 
 
+_ARG_KEY_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*\Z")
+
+
+def _decode_arg_key_lost_open(
+    body: str,
+    allowed_tool_names: frozenset[str],
+) -> list[dict[str, Any]] | None:
+    """Rebuilds GLM's arg_key form after every ``<arg_key>`` opener is lost.
+
+    Observed shape per segment:
+    ``name</arg_value>key</arg_key><arg_value>value</arg_value>`` repeated once
+    per argument, with several calls packed behind ``<tool_call>``. Only the
+    opening key tag went missing, so ``</arg_key>`` and the value tags still
+    delimit every field and nothing has to be guessed. The stray
+    ``</arg_value>`` after the name is the same mismatched close this template
+    emits elsewhere, and it is what separates the name from the first key.
+    A payload that kept an ``<arg_key>`` belongs to the stricter decoders.
+    """
+    if _ARG_KEY_OPEN in body or _ARG_KEY_CLOSE not in body:
+        return None
+    value = body.replace(TOOL_CALL_CLOSE, TOOL_CALL_OPEN).strip()
+    # An empty segment means a doubled or dangling separator, which says the
+    # payload lost more than the key tags, so it stays rejected.
+    segments = [segment.strip() for segment in value.split(TOOL_CALL_OPEN)]
+    if len(segments) > MAX_PACKED_CALLS or not all(segments):
+        return None
+    calls: list[dict[str, Any]] = []
+    for segment in segments:
+        parsed = _decode_arg_key_lost_open_segment(segment, allowed_tool_names)
+        if parsed is None:
+            return None
+        calls.append(parsed)
+    return calls or None
+
+
+def _decode_arg_key_lost_open_segment(
+    segment: str,
+    allowed_tool_names: frozenset[str],
+) -> dict[str, Any] | None:
+    key_close = segment.find(_ARG_KEY_CLOSE)
+    if key_close < 0:
+        return None
+    name, separator, key = segment[:key_close].partition(_ARG_VALUE_CLOSE)
+    if not separator or name.strip() not in allowed_tool_names:
+        return None
+    arguments: dict[str, Any] = {}
+    index = key_close
+    while True:
+        key = key.strip()
+        if not _ARG_KEY_NAME_PATTERN.fullmatch(key) or key in arguments:
+            return None
+        index += len(_ARG_KEY_CLOSE)
+        if not segment.startswith(_ARG_VALUE_OPEN, index):
+            return None
+        index += len(_ARG_VALUE_OPEN)
+        value_end = segment.find(_ARG_VALUE_CLOSE, index)
+        if value_end < 0:
+            # A truncated value would silently drop data, so fail closed.
+            return None
+        arguments[key] = _coerce_arg_value(segment[index:value_end].strip())
+        index = value_end + len(_ARG_VALUE_CLOSE)
+        key_close = segment.find(_ARG_KEY_CLOSE, index)
+        if key_close < 0:
+            if segment[index:].strip():
+                return None
+            return {"name": name.strip(), "arguments": arguments}
+        key = segment[index:key_close]
+        index = key_close
+
+
 _WRAPPER_KEYS = ("arguments", "parameters", "args", "input")
 
 
@@ -1297,6 +1367,7 @@ PAYLOAD_DECODERS: tuple[PayloadDecoder, ...] = (
     PayloadDecoder("arg_key_value", _decode_arg_key_value),
     PayloadDecoder("python_call", _decode_python_call),
     PayloadDecoder("arg_key_value_repair", _decode_arg_key_value_repair),
+    PayloadDecoder("arg_key_lost_open", _decode_arg_key_lost_open),
     PayloadDecoder("lost_prefix_fused", _decode_lost_prefix_fused),
     PayloadDecoder("lost_prefix_fused_repair", _decode_lost_prefix_fused_repair),
     PayloadDecoder("bare_name", _decode_bare_name),
