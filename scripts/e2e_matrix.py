@@ -401,14 +401,7 @@ def native_continuation_scenarios(*, streaming: bool = True) -> list[Scenario]:
     """Continue a real tool turn and require an answer from its result."""
     scenario = Scenario(
         name="native_tool_continuation",
-        body={
-            "messages": [
-                {"role": "user", "content": _NATIVE_CONTINUATION_PROMPT},
-            ],
-            "tools": [_WEATHER_TOOL],
-            "tool_choice": "required",
-            "parallel_tool_calls": False,
-        },
+        body={},
         expect_finish=("stop",),
         expect_content=True,
     )
@@ -1070,7 +1063,7 @@ async def run_native_continuation_matrix(
                             },
                         )
                         observation = await bridge.run(model, followup)
-            elif prime_verdict != SUCCESS:
+            elif prime_verdict == BRIDGE_DEFECT:
                 observation = Observation(
                     status=prime.status,
                     error_type=prime.error_type,
@@ -1079,6 +1072,8 @@ async def run_native_continuation_matrix(
                     stream_done=prime.stream_done,
                     transport_error=(f"native continuation prime failed: {prime_detail}"),
                 )
+            elif prime_verdict != SUCCESS:
+                observation = prime
             else:
                 observation = Observation(
                     status=0,
@@ -1094,6 +1089,9 @@ async def run_native_continuation_matrix(
                     "continuation_prime_session_id": prime.session_id,
                 }
             )
+            if prime_verdict not in {SUCCESS, BRIDGE_DEFECT}:
+                record["verdict"] = prime_verdict
+                record["detail"] = f"native continuation prime failed: {prime_detail}"
             primed_calls = _tool_call_signatures(prime.tool_call_payloads)
             if (
                 followup is not None

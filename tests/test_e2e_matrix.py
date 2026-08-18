@@ -58,6 +58,7 @@ def test_scenarios_cover_both_transports_and_run_hostile_cases_once(e2e: ModuleT
     plan = e2e.scenarios()
     switch_plan = e2e.switch_scenarios()
     continuation_plan = e2e.continuation_switch_scenarios()
+    native_plan = e2e.native_continuation_scenarios()
 
     streamed = {scenario.name for scenario in plan if scenario.stream}
     hostile = [scenario for scenario in plan if not scenario.per_model]
@@ -71,6 +72,7 @@ def test_scenarios_cover_both_transports_and_run_hostile_cases_once(e2e: ModuleT
     assert len(e2e.switch_scenarios(streaming=False)) == 1
     assert {scenario.stream for scenario in continuation_plan} == {False, True}
     assert len(e2e.continuation_switch_scenarios(streaming=False)) == 1
+    assert all(scenario.body == {} for scenario in native_plan)
 
 
 @pytest.mark.parametrize(
@@ -1042,6 +1044,70 @@ def test_tool_call_signatures_ignore_ids_and_unparsable_arguments(e2e: ModuleTyp
     assert e2e._tool_call_signatures(
         [{"function": {"name": "weather", "arguments": " oops "}}]
     ) == [("weather", "oops")]
+
+
+@pytest.mark.asyncio
+async def test_native_continuation_keeps_a_model_behavior_prime_non_blocking(
+    e2e: ModuleType,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "No tool call"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    bridge = _bridge(e2e, handler)
+    async with bridge.client:
+        rows = await e2e.run_native_continuation_matrix(
+            bridge,
+            ["m1"],
+            e2e.native_continuation_scenarios(streaming=False),
+        )
+
+    assert rows[0]["continuation_prime_verdict"] == e2e.MODEL_BEHAVIOR
+    assert rows[0]["verdict"] == e2e.MODEL_BEHAVIOR
+    assert e2e.summarize(rows)["blocking"] == []
+
+
+@pytest.mark.asyncio
+async def test_native_continuation_keeps_bridge_defect_prime_blocking(
+    e2e: ModuleType,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            502,
+            json={
+                "error": {
+                    "type": "factory_protocol_error",
+                    "message": "tool call payload never closed",
+                }
+            },
+        )
+
+    bridge = _bridge(e2e, handler)
+    async with bridge.client:
+        rows = await e2e.run_native_continuation_matrix(
+            bridge,
+            ["m1"],
+            e2e.native_continuation_scenarios(streaming=False),
+        )
+
+    assert rows[0]["continuation_prime_verdict"] == e2e.BRIDGE_DEFECT
+    assert rows[0]["verdict"] == e2e.BRIDGE_DEFECT
+    assert rows[0]["detail"] == (
+        "transport error: native continuation prime failed: "
+        "unexpected status 502 (factory_protocol_error)"
+    )
+    assert e2e.summarize(rows)["blocking"] == rows
 
 
 @pytest.mark.parametrize(
