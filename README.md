@@ -1184,6 +1184,15 @@ the session; changing either returns HTTP `400`. Start a new session and resend
 the transcript when switching settings. Restarting the bridge clears the set
 of continuable sessions.
 
+Native tool calls have the same empty-history limitation in stateless mode:
+`tool_result_followup` may repeat a call that the transcript already answers.
+Do not deduplicate or suppress such calls, because retries and multi-step
+workflows are valid OpenAI behavior. For native tool loops, enable continuity,
+return the assistant tool call and client result with the bridge-issued session
+ID, and cap client iterations. The session-aware matrix check exercises this
+path with `--test-native-session-continuity`; a repeat remains model behavior,
+not a bridge-side duplicate-call decision.
+
 The same guard applies to the Factory session extension endpoints. They are
 available only when continuity is enabled and only for IDs created by the
 current bridge process:

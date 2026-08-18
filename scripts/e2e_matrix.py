@@ -394,6 +394,27 @@ def _label_argument(value: str) -> str:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+_NATIVE_CONTINUATION_PROMPT = "What is the weather in Gdansk? Use the tool."
+
+
+def native_continuation_scenarios(*, streaming: bool = True) -> list[Scenario]:
+    """Continue a real tool turn and require an answer from its result."""
+    scenario = Scenario(
+        name="native_tool_continuation",
+        body={
+            "messages": [
+                {"role": "user", "content": _NATIVE_CONTINUATION_PROMPT},
+            ],
+            "tools": [_WEATHER_TOOL],
+            "tool_choice": "required",
+            "parallel_tool_calls": False,
+        },
+        expect_finish=("stop",),
+        expect_content=True,
+    )
+    return [scenario, replace(scenario, stream=True)] if streaming else [scenario]
+
+
 @dataclass(frozen=True, slots=True)
 class Observation:
     """What one request produced, before it is judged."""
@@ -404,6 +425,7 @@ class Observation:
     content_semantic_error: str | None = None
     finish_reason: str | None = None
     tool_calls: int = 0
+    tool_call_payloads: tuple[dict[str, Any], ...] = ()
     content_chars: int = 0
     request_id: str | None = None
     session_id: str | None = None
@@ -562,6 +584,7 @@ def _completion_observation(
     choice = choices[0] if isinstance(choices, list) and choices else {}
     message = choice.get("message", {}) if isinstance(choice, dict) else {}
     tool_calls = message.get("tool_calls") or []
+    tool_call_payloads = tuple(call for call in tool_calls if isinstance(call, dict))
     content = message.get("content") or ""
     error_type, error_message = _error_fields(body)
     semantic_error = _content_semantic_error(content) if isinstance(content, str) else None
@@ -573,6 +596,7 @@ def _completion_observation(
         content_semantic_error=semantic_error,
         finish_reason=choice.get("finish_reason") if isinstance(choice, dict) else None,
         tool_calls=len(tool_calls) if isinstance(tool_calls, list) else 0,
+        tool_call_payloads=tool_call_payloads,
         content_chars=len(content) if isinstance(content, str) else 0,
         request_id=headers.get("x-request-id"),
         session_id=session_id if isinstance(session_id, str) else None,
@@ -591,6 +615,7 @@ def _stream_observation(
     tool_calls = 0
     content_chars = 0
     content_parts: list[str] = []
+    streamed_tool_calls: dict[int, dict[str, Any]] = {}
     error_type: str | None = None
     error_message = ""
     stream_done = False
@@ -627,6 +652,31 @@ def _stream_observation(
             if calls:
                 tool_calls += len(calls)
                 ttft_ms = elapsed_ms if ttft_ms is None else ttft_ms
+                for fallback_index, call in enumerate(calls):
+                    if not isinstance(call, dict):
+                        continue
+                    index = call.get("index", fallback_index)
+                    if not isinstance(index, int) or isinstance(index, bool):
+                        index = fallback_index
+                    current = streamed_tool_calls.setdefault(
+                        index,
+                        {
+                            "id": "",
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        },
+                    )
+                    if isinstance(call.get("id"), str):
+                        current["id"] = call["id"]
+                    if isinstance(call.get("type"), str):
+                        current["type"] = call["type"]
+                    function = call.get("function")
+                    if isinstance(function, dict):
+                        current_function = current["function"]
+                        if isinstance(function.get("name"), str):
+                            current_function["name"] = function["name"]
+                        if isinstance(function.get("arguments"), str):
+                            current_function["arguments"] += function["arguments"]
             finish_reason = choice.get("finish_reason") or finish_reason
     return Observation(
         status=status,
@@ -635,6 +685,9 @@ def _stream_observation(
         content_semantic_error=_content_semantic_error("".join(content_parts)),
         finish_reason=finish_reason,
         tool_calls=tool_calls,
+        tool_call_payloads=tuple(
+            streamed_tool_calls[index] for index in sorted(streamed_tool_calls)
+        ),
         content_chars=content_chars,
         request_id=headers.get("x-request-id"),
         session_id=session_id,
@@ -926,6 +979,133 @@ async def run_continuation_switch_matrix(
     return rows
 
 
+def _canonical_arguments(arguments: Any) -> str:
+    """Render tool call arguments so equal values compare equal."""
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            return arguments.strip()
+    return json.dumps(arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _tool_call_signatures(payloads: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    """What tool calls ask for, without the id the bridge mints per request.
+
+    A continuation gets fresh call ids, so comparing whole payloads would never
+    report a repeated call, which is the behavior this scenario is looking for.
+    """
+    signatures: list[tuple[str, str]] = []
+    for call in payloads:
+        function = call.get("function")
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name", ""))
+        signatures.append((name, _canonical_arguments(function.get("arguments"))))
+    return signatures
+
+
+async def run_native_continuation_matrix(
+    bridge: Bridge,
+    models: list[str],
+    plan: list[Scenario],
+    *,
+    on_row: RowCallback = None,
+    label: str | None = None,
+) -> list[dict[str, Any]]:
+    """Run a real native tool call, then continue it with its result."""
+    rows: list[dict[str, Any]] = []
+    for model in models:
+        for scenario in plan:
+            prime_scenario = _required_weather_scenario("native_continuation_prime")
+            prime_scenario = replace(
+                prime_scenario,
+                body={
+                    **prime_scenario.body,
+                    "parallel_tool_calls": False,
+                },
+                stream=scenario.stream,
+            )
+            prime = await bridge.run(model, prime_scenario)
+            prime_verdict, prime_detail = classify(prime_scenario, prime)
+            followup: Scenario | None = None
+            if prime_verdict == SUCCESS and prime.session_id is not None:
+                if len(prime.tool_call_payloads) != 1:
+                    observation = Observation(
+                        status=0,
+                        transport_error="native prime did not return exactly one tool call",
+                    )
+                else:
+                    call = prime.tool_call_payloads[0]
+                    call_id = call.get("id")
+                    function = call.get("function")
+                    if not isinstance(call_id, str) or not isinstance(function, dict):
+                        observation = Observation(
+                            status=0,
+                            transport_error="native prime returned a tool call without an id",
+                        )
+                    else:
+                        followup = replace(
+                            scenario,
+                            body={
+                                "messages": [
+                                    {
+                                        "role": "user",
+                                        "content": _NATIVE_CONTINUATION_PROMPT,
+                                    },
+                                    {
+                                        "role": "assistant",
+                                        "content": None,
+                                        "tool_calls": list(prime.tool_call_payloads),
+                                    },
+                                    {
+                                        "role": "tool",
+                                        "tool_call_id": call_id,
+                                        "content": '{"temperature_c":20}',
+                                    },
+                                ],
+                                "tools": [_WEATHER_TOOL],
+                                "parallel_tool_calls": False,
+                                "factory_droid_session_id": prime.session_id,
+                            },
+                        )
+                        observation = await bridge.run(model, followup)
+            elif prime_verdict != SUCCESS:
+                observation = Observation(
+                    status=prime.status,
+                    error_type=prime.error_type,
+                    error_message=prime.error_message,
+                    duration_ms=prime.duration_ms,
+                    stream_done=prime.stream_done,
+                    transport_error=(f"native continuation prime failed: {prime_detail}"),
+                )
+            else:
+                observation = Observation(
+                    status=0,
+                    transport_error="native continuation prime returned no session id",
+                )
+
+            record = row(model, scenario, observation, label=label)
+            record.update(
+                {
+                    "continuation_prime_status": prime.status,
+                    "continuation_prime_verdict": prime_verdict,
+                    "continuation_prime_detail": prime_detail,
+                    "continuation_prime_session_id": prime.session_id,
+                }
+            )
+            primed_calls = _tool_call_signatures(prime.tool_call_payloads)
+            if (
+                followup is not None
+                and primed_calls
+                and _tool_call_signatures(observation.tool_call_payloads) == primed_calls
+            ):
+                record["verdict"] = MODEL_BEHAVIOR
+                record["detail"] = "native continuation repeated the prime tool call"
+            _record(rows, record, on_row)
+    return rows
+
+
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Aggregate verdicts, blocking failures and latency for a run."""
     counts = dict.fromkeys(VERDICTS, 0)
@@ -1188,6 +1368,7 @@ class RunOptions:
     streaming: bool = True
     switch_settle_seconds: float = 5.0
     test_session_continuity: bool = False
+    test_native_session_continuity: bool = False
     out: Path | None = None
     label: str | None = None
 
@@ -1222,10 +1403,16 @@ async def _run_with_output(
             if options.test_session_continuity
             else []
         )
+        native_continuation_plan = (
+            native_continuation_scenarios(streaming=options.streaming)
+            if options.test_native_session_continuity
+            else []
+        )
         print(
             f"{len(models)} models x {len(plan)} scenarios + "
             f"{len(switch_plan)} warm switches + "
-            f"{len(continuation_plan)} continuation switches -> {out}",
+            f"{len(continuation_plan)} continuation switches + "
+            f"{len(native_continuation_plan)} native continuations -> {out}",
             file=sys.stderr,
         )
 
@@ -1260,6 +1447,15 @@ async def _run_with_output(
                 label=label,
             )
         )
+        rows.extend(
+            await run_native_continuation_matrix(
+                bridge,
+                models,
+                native_continuation_plan,
+                on_row=write,
+                label=label,
+            )
+        )
     print(render_report(rows))
     return 1 if summarize(rows)["blocking"] else 0
 
@@ -1275,6 +1471,7 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--no-stream", action="store_true")
     run_parser.add_argument("--switch-settle-seconds", type=float, default=5.0)
     run_parser.add_argument("--test-session-continuity", action="store_true")
+    run_parser.add_argument("--test-native-session-continuity", action="store_true")
     run_parser.add_argument("--out", type=Path, default=None)
     run_parser.add_argument("--label", type=_label_argument, default=None)
 
@@ -1307,6 +1504,7 @@ def main(argv: list[str] | None = None) -> int:
             streaming=not args.no_stream,
             switch_settle_seconds=args.switch_settle_seconds,
             test_session_continuity=args.test_session_continuity,
+            test_native_session_continuity=args.test_native_session_continuity,
             out=args.out,
             label=args.label,
         )
