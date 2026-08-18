@@ -4,7 +4,7 @@ Runs a fixed scenario set against every model the bridge lists, classifies each
 result, and writes one JSONL row per request. Results stay out of the
 repository: they carry model output and account-specific denials.
 
-    uv run python scripts/e2e_matrix.py run --out traces/run-a.jsonl
+    uv run python scripts/e2e_matrix.py run --label text --out traces/run-a.jsonl
     uv run python scripts/e2e_matrix.py report traces/run-a.jsonl
     uv run python scripts/e2e_matrix.py compare traces/run-a.jsonl traces/run-b.jsonl
 
@@ -23,7 +23,9 @@ import re
 import statistics
 import sys
 import time
-from collections.abc import Callable
+import unicodedata
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -33,8 +35,31 @@ import httpx
 
 from factory_droid_openai.dialects import strip_code_fence
 
+try:
+    import fcntl as _fcntl
+except ImportError:
+    _fcntl = None
+
+try:
+    import msvcrt as _msvcrt
+except ImportError:
+    _msvcrt = None
+
 DEFAULT_BASE_URL = "http://127.0.0.1:8787"
+_MAX_LABEL_LENGTH = 128
 RowCallback = Callable[[dict[str, Any]], None] | None
+
+
+class MatrixUsageError(ValueError):
+    """Bad invocation or bad artifact, as opposed to a run finding.
+
+    ``main`` turns this into exit code 2, so a misuse never reads as the
+    blocking failures ``run`` reports or the regressions ``compare`` reports.
+    It stays a ``ValueError`` so callers that only care about the value being
+    wrong keep working.
+    """
+
+
 _WEATHER_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
@@ -346,6 +371,27 @@ def continuation_switch_scenarios(*, streaming: bool = True) -> list[Scenario]:
         expect_error_contains="session settings do not match",
     )
     return [scenario, replace(scenario, stream=True)] if streaming else [scenario]
+
+
+def normalize_label(value: str) -> str:
+    """Trim and validate a label that identifies one matrix artifact."""
+    label = value.strip()
+    if not label:
+        raise MatrixUsageError("matrix label must not be empty")
+    if any(char in "\n\r\u2028\u2029" for char in label):
+        raise MatrixUsageError("matrix label must not contain newlines or line separators")
+    if any(unicodedata.category(char) == "Cc" for char in label):
+        raise MatrixUsageError("matrix label must not contain control characters")
+    if len(label) > _MAX_LABEL_LENGTH:
+        raise MatrixUsageError(f"matrix label must be at most {_MAX_LABEL_LENGTH} characters")
+    return label
+
+
+def _label_argument(value: str) -> str:
+    try:
+        return normalize_label(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -704,10 +750,16 @@ class Bridge:
         )
 
 
-def row(model: str, scenario: Scenario, observation: Observation) -> dict[str, Any]:
+def row(
+    model: str,
+    scenario: Scenario,
+    observation: Observation,
+    *,
+    label: str | None = None,
+) -> dict[str, Any]:
     """One JSONL record: the request, what came back, and the verdict."""
     verdict, detail = classify(scenario, observation)
-    return {
+    record: dict[str, Any] = {
         "ts": datetime.now(UTC).isoformat(),
         "model": model,
         "scenario": scenario.name,
@@ -726,6 +778,11 @@ def row(model: str, scenario: Scenario, observation: Observation) -> dict[str, A
         "verdict": verdict,
         "detail": detail,
     }
+    if label is not None:
+        # Normalized once where the label enters the process; every reader
+        # checks it again through artifact_label.
+        record["label"] = label
+    return record
 
 
 def _transition_row(
@@ -734,8 +791,10 @@ def _transition_row(
     scenario: Scenario,
     observation: Observation,
     prime: Observation,
+    *,
+    label: str | None = None,
 ) -> dict[str, Any]:
-    record = row(target, scenario, observation)
+    record = row(target, scenario, observation, label=label)
     prime_verdict, prime_detail = classify(_SWITCH_PRIME, prime)
     record.update(
         {
@@ -775,6 +834,7 @@ async def run_matrix(
     *,
     concurrency: int,
     on_row: RowCallback = None,
+    label: str | None = None,
 ) -> list[dict[str, Any]]:
     """Run every applicable (model, scenario) pair and return the rows."""
     jobs: list[tuple[str, Scenario]] = []
@@ -789,7 +849,7 @@ async def run_matrix(
     async def execute(model: str, scenario: Scenario) -> None:
         async with semaphore:
             observation = await bridge.run(model, scenario)
-        record = row(model, scenario, observation)
+        record = row(model, scenario, observation, label=label)
         _record(rows, record, on_row)
 
     await asyncio.gather(*(execute(model, scenario) for model, scenario in jobs))
@@ -803,6 +863,7 @@ async def run_switch_matrix(
     *,
     settle_seconds: float,
     on_row: RowCallback = None,
+    label: str | None = None,
 ) -> list[dict[str, Any]]:
     """Run ordered model transitions against one bridge warm pool."""
     rows: list[dict[str, Any]] = []
@@ -811,7 +872,14 @@ async def run_switch_matrix(
             prime = await bridge.run(source, _SWITCH_PRIME)
             await asyncio.sleep(max(0.0, settle_seconds))
             observation = await bridge.run(target, scenario)
-            record = _transition_row(source, target, scenario, observation, prime)
+            record = _transition_row(
+                source,
+                target,
+                scenario,
+                observation,
+                prime,
+                label=label,
+            )
             _record(rows, record, on_row)
     return rows
 
@@ -822,6 +890,7 @@ async def run_continuation_switch_matrix(
     plan: list[Scenario],
     *,
     on_row: RowCallback = None,
+    label: str | None = None,
 ) -> list[dict[str, Any]]:
     """Attempt model changes on bridge-created continuation sessions."""
     rows: list[dict[str, Any]] = []
@@ -845,7 +914,14 @@ async def run_continuation_switch_matrix(
                     },
                 )
                 observation = await bridge.run(target, continued)
-            record = _transition_row(source, target, scenario, observation, prime)
+            record = _transition_row(
+                source,
+                target,
+                scenario,
+                observation,
+                prime,
+                label=label,
+            )
             _record(rows, record, on_row)
     return rows
 
@@ -868,12 +944,91 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _display_label(label: str | None) -> str:
+    return label if label is not None else "unlabeled legacy artifact"
+
+
+def artifact_label(rows: list[dict[str, Any]]) -> str | None:
+    """Return one artifact label, rejecting mixed or malformed rows."""
+    labels: set[str | None] = set()
+    for index, record in enumerate(rows):
+        raw = record.get("label")
+        if raw is None:
+            labels.add(None)
+            continue
+        if not isinstance(raw, str):
+            raise MatrixUsageError(f"matrix row {index} label must be a string")
+        label = normalize_label(raw)
+        if label != raw:
+            raise MatrixUsageError(f"matrix row {index} label is not normalized")
+        labels.add(label)
+    if len(labels) > 1:
+        found = sorted(_display_label(label) for label in labels)
+        raise MatrixUsageError(f"matrix artifact contains mixed labels: {found}")
+    return next(iter(labels), None)
+
+
+def _validate_append_target(path: Path, label: str | None) -> None:
+    if not path.exists() or path.stat().st_size == 0:
+        return
+    rows = load_rows(path)
+    if not rows:
+        return
+    existing_label = artifact_label(rows)
+    if existing_label != label:
+        raise MatrixUsageError(
+            f"cannot append {_display_label(label)!r} run to "
+            f"{_display_label(existing_label)!r} artifact"
+        )
+
+
+@contextmanager
+def _locked_output(path: Path, label: str | None) -> Iterator[Any]:
+    if _fcntl is not None:
+        with path.open("a+", encoding="utf-8") as handle:
+            _fcntl.flock(handle.fileno(), _fcntl.LOCK_EX)
+            try:
+                _validate_append_target(path, label)
+                handle.seek(0, os.SEEK_END)
+                yield handle
+            finally:
+                _fcntl.flock(handle.fileno(), _fcntl.LOCK_UN)
+        return
+    if _msvcrt is None:
+        raise RuntimeError("matrix output locking is not supported on this platform")
+    lock_path = path.resolve().with_suffix(path.suffix + ".lock")
+    with lock_path.open("a+b") as lock:
+        lock.seek(0)
+        lock.write(b"\0")
+        lock.flush()
+        lock.seek(0)
+        while True:
+            try:
+                _msvcrt.locking(lock.fileno(), _msvcrt.LK_NBLCK, 1)
+                break
+            except OSError:
+                time.sleep(0.1)
+        try:
+            _validate_append_target(path, label)
+            with path.open("a", encoding="utf-8") as handle:
+                yield handle
+        finally:
+            lock.seek(0)
+            _msvcrt.locking(lock.fileno(), _msvcrt.LK_UNLCK, 1)
+    # A waiting run still holds this file open, and Windows refuses to unlink
+    # it then, so the leftover is swept on the run that finds it free.
+    with suppress(OSError):
+        lock_path.unlink()
+
+
 def render_report(rows: list[dict[str, Any]]) -> str:
     """Markdown summary, generated so no report is ever written by hand."""
+    label = artifact_label(rows)
     summary = summarize(rows)
     lines = [
         "# Bridge e2e run",
         "",
+        f"- Label: {_display_label(label)}",
         f"- Requests: {summary['total']}",
         f"- Pass rate: {summary['pass_rate']:.1%}",
         f"- Median completed latency: {summary['median_ms']} ms",
@@ -938,8 +1093,17 @@ def _key(record: dict[str, Any]) -> tuple[str, str, str, bool]:
     )
 
 
-def compare(before: list[dict[str, Any]], after: list[dict[str, Any]]) -> dict[str, Any]:
+def compare(
+    before: list[dict[str, Any]],
+    after: list[dict[str, Any]],
+    *,
+    allow_same_label: bool = False,
+) -> dict[str, Any]:
     """Verdict transitions and latency delta between two runs."""
+    before_label = artifact_label(before)
+    after_label = artifact_label(after)
+    if not allow_same_label and before_label is not None and before_label == after_label:
+        raise MatrixUsageError(f"cannot compare two artifacts labeled {before_label!r}")
     left = {_key(record): record for record in before}
     right = {_key(record): record for record in after}
     regressions = []
@@ -960,19 +1124,32 @@ def compare(before: list[dict[str, Any]], after: list[dict[str, Any]]) -> dict[s
         "fixes": fixes,
         "pass_rate_before": summarize(before)["pass_rate"],
         "pass_rate_after": summarize(after)["pass_rate"],
+        "before_label": before_label,
+        "after_label": after_label,
     }
 
 
 def render_comparison(result: dict[str, Any]) -> str:
+    before_label = result.get("before_label")
+    after_label = result.get("after_label")
     lines = [
         "# Bridge e2e comparison",
         "",
-        f"- Shared cases: {result['shared']}",
-        f"- Pass rate: {result['pass_rate_before']:.1%} -> {result['pass_rate_after']:.1%}",
-        f"- Regressions: {len(result['regressions'])}",
-        f"- Fixes: {len(result['fixes'])}",
-        "",
+        f"- Before label: {_display_label(before_label)}",
+        f"- After label: {_display_label(after_label)}",
+        f"- Label transition: {_display_label(before_label)} -> {_display_label(after_label)}",
     ]
+    if before_label is None or after_label is None:
+        lines.append("- Label identity is unavailable for at least one legacy artifact.")
+    lines.extend(
+        [
+            f"- Shared cases: {result['shared']}",
+            f"- Pass rate: {result['pass_rate_before']:.1%} -> {result['pass_rate_after']:.1%}",
+            f"- Regressions: {len(result['regressions'])}",
+            f"- Fixes: {len(result['fixes'])}",
+            "",
+        ]
+    )
     if result["regressions"]:
         lines.extend(["## Regressions", "", "| Case | Now | Detail |", "| --- | --- | --- |"])
         lines.extend(
@@ -988,9 +1165,18 @@ def render_comparison(result: dict[str, Any]) -> str:
 
 
 def load_rows(path: Path) -> list[dict[str, Any]]:
-    return [
-        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
-    ]
+    rows: list[dict[str, Any]] = []
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise MatrixUsageError(f"{path}:{number} is not valid JSON: {exc}") from exc
+        if not isinstance(record, dict):
+            raise MatrixUsageError(f"{path}:{number} is not a JSON object")
+        rows.append(record)
+    return rows
 
 
 @dataclass(slots=True)
@@ -1003,11 +1189,29 @@ class RunOptions:
     switch_settle_seconds: float = 5.0
     test_session_continuity: bool = False
     out: Path | None = None
+    label: str | None = None
 
 
-async def _run(options: RunOptions) -> int:
+def run_locked(options: RunOptions) -> int:
+    """Take the output lock, then run the matrix under it.
+
+    The lock is taken outside the event loop because waiting for it blocks,
+    and it is held for the whole run so a second run cannot interleave rows
+    into the same artifact.
+    """
     out = options.out or Path("traces") / f"e2e-{datetime.now(UTC):%Y%m%dT%H%M%SZ}.jsonl"
+    label = None if options.label is None else normalize_label(options.label)
     out.parent.mkdir(parents=True, exist_ok=True)
+    with _locked_output(out, label) as handle:
+        return asyncio.run(_run_with_output(options, out, label, handle))
+
+
+async def _run_with_output(
+    options: RunOptions,
+    out: Path,
+    label: str | None,
+    handle: Any,
+) -> int:
     async with httpx.AsyncClient() as client:
         bridge = Bridge(base_url=options.base_url, api_key=options.api_key, client=client)
         models = options.models or await bridge.models()
@@ -1024,36 +1228,38 @@ async def _run(options: RunOptions) -> int:
             f"{len(continuation_plan)} continuation switches -> {out}",
             file=sys.stderr,
         )
-        with out.open("a", encoding="utf-8") as handle:
 
-            def write(record: dict[str, Any]) -> None:
-                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-                handle.flush()
+        def write(record: dict[str, Any]) -> None:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.flush()
 
-            rows = await run_matrix(
+        rows = await run_matrix(
+            bridge,
+            models,
+            plan,
+            concurrency=options.concurrency,
+            on_row=write,
+            label=label,
+        )
+        rows.extend(
+            await run_switch_matrix(
                 bridge,
                 models,
-                plan,
-                concurrency=options.concurrency,
+                switch_plan,
+                settle_seconds=options.switch_settle_seconds,
                 on_row=write,
+                label=label,
             )
-            rows.extend(
-                await run_switch_matrix(
-                    bridge,
-                    models,
-                    switch_plan,
-                    settle_seconds=options.switch_settle_seconds,
-                    on_row=write,
-                )
+        )
+        rows.extend(
+            await run_continuation_switch_matrix(
+                bridge,
+                models,
+                continuation_plan,
+                on_row=write,
+                label=label,
             )
-            rows.extend(
-                await run_continuation_switch_matrix(
-                    bridge,
-                    models,
-                    continuation_plan,
-                    on_row=write,
-                )
-            )
+        )
     print(render_report(rows))
     return 1 if summarize(rows)["blocking"] else 0
 
@@ -1070,6 +1276,7 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--switch-settle-seconds", type=float, default=5.0)
     run_parser.add_argument("--test-session-continuity", action="store_true")
     run_parser.add_argument("--out", type=Path, default=None)
+    run_parser.add_argument("--label", type=_label_argument, default=None)
 
     report_parser = sub.add_parser("report", help="render a markdown report from a JSONL run")
     report_parser.add_argument("path", type=Path)
@@ -1077,26 +1284,36 @@ def main(argv: list[str] | None = None) -> int:
     compare_parser = sub.add_parser("compare", help="diff two JSONL runs")
     compare_parser.add_argument("before", type=Path)
     compare_parser.add_argument("after", type=Path)
+    compare_parser.add_argument("--allow-same-label", action="store_true")
 
     args = parser.parse_args(argv)
-    if args.command == "report":
-        print(render_report(load_rows(args.path)), end="")
-        return 0
-    if args.command == "compare":
-        result = compare(load_rows(args.before), load_rows(args.after))
-        print(render_comparison(result), end="")
-        return 1 if result["regressions"] else 0
-    options = RunOptions(
-        base_url=args.base_url,
-        api_key=os.getenv("FACTORY_DROID_OPENAI_API_KEY"),
-        models=[value for value in args.models.split(",") if value],
-        concurrency=args.concurrency,
-        streaming=not args.no_stream,
-        switch_settle_seconds=args.switch_settle_seconds,
-        test_session_continuity=args.test_session_continuity,
-        out=args.out,
-    )
-    return asyncio.run(_run(options))
+    try:
+        if args.command == "report":
+            print(render_report(load_rows(args.path)), end="")
+            return 0
+        if args.command == "compare":
+            result = compare(
+                load_rows(args.before),
+                load_rows(args.after),
+                allow_same_label=args.allow_same_label,
+            )
+            print(render_comparison(result), end="")
+            return 1 if result["regressions"] else 0
+        options = RunOptions(
+            base_url=args.base_url,
+            api_key=os.getenv("FACTORY_DROID_OPENAI_API_KEY"),
+            models=[value for value in args.models.split(",") if value],
+            concurrency=args.concurrency,
+            streaming=not args.no_stream,
+            switch_settle_seconds=args.switch_settle_seconds,
+            test_session_continuity=args.test_session_continuity,
+            out=args.out,
+            label=args.label,
+        )
+        return run_locked(options)
+    except MatrixUsageError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

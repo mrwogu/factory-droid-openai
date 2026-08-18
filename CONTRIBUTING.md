@@ -107,8 +107,8 @@ export FACTORY_HOME_OVERRIDE="$PWD/traces/profile"
 env -u FACTORY_APPEND_SYSTEM_PROMPT uv run factory-droid-openai --port 8798 &
 FACTORY_DROID_OPENAI_NATIVE_TOOL_CALLS=true \
   env -u FACTORY_APPEND_SYSTEM_PROMPT uv run factory-droid-openai --port 8799 &
-uv run python scripts/e2e_matrix.py run --base-url http://127.0.0.1:8798 --out traces/text.jsonl
-uv run python scripts/e2e_matrix.py run --base-url http://127.0.0.1:8799 --out traces/native.jsonl
+uv run python scripts/e2e_matrix.py run --label text --base-url http://127.0.0.1:8798 --out traces/text.jsonl
+uv run python scripts/e2e_matrix.py run --label native --base-url http://127.0.0.1:8799 --out traces/native.jsonl
 uv run python scripts/e2e_matrix.py compare traces/text.jsonl traces/native.jsonl
 ```
 
