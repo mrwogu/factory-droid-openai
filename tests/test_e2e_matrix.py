@@ -58,6 +58,7 @@ def test_scenarios_cover_both_transports_and_run_hostile_cases_once(e2e: ModuleT
     plan = e2e.scenarios()
     switch_plan = e2e.switch_scenarios()
     continuation_plan = e2e.continuation_switch_scenarios()
+    native_plan = e2e.native_continuation_scenarios()
 
     streamed = {scenario.name for scenario in plan if scenario.stream}
     hostile = [scenario for scenario in plan if not scenario.per_model]
@@ -71,6 +72,7 @@ def test_scenarios_cover_both_transports_and_run_hostile_cases_once(e2e: ModuleT
     assert len(e2e.switch_scenarios(streaming=False)) == 1
     assert {scenario.stream for scenario in continuation_plan} == {False, True}
     assert len(e2e.continuation_switch_scenarios(streaming=False)) == 1
+    assert all(scenario.body == {} for scenario in native_plan)
 
 
 @pytest.mark.parametrize(
@@ -407,6 +409,7 @@ async def test_bridge_reads_a_json_completion(e2e: ModuleType) -> None:
     assert observation.status == 200
     assert observation.finish_reason == "tool_calls"
     assert observation.tool_calls == 1
+    assert observation.tool_call_payloads == ({"id": "call_1"},)
     assert observation.content_chars == 5
     assert observation.request_id == "req-1"
     assert observation.session_id == "session-json"
@@ -455,6 +458,13 @@ async def test_bridge_reads_a_streamed_completion(e2e: ModuleType) -> None:
     assert observation.stream_done is True
     assert observation.finish_reason == "tool_calls"
     assert observation.tool_calls == 1
+    assert observation.tool_call_payloads == (
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "", "arguments": ""},
+        },
+    )
     assert observation.content_chars == 2
     assert observation.ttft_ms is not None
     assert observation.session_id == "session-stream"
@@ -867,6 +877,237 @@ async def test_continuation_switch_matrix_skips_an_opted_out_plan(e2e: ModuleTyp
 
     assert rows == []
     assert seen == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_native_continuation_matrix_uses_the_real_tool_call(
+    e2e: ModuleType,
+    stream: bool,
+) -> None:
+    seen: list[dict[str, Any]] = []
+
+    def response(body: dict[str, Any]) -> httpx.Response:
+        if stream:
+            chunks = [
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": body["delta"],
+                            "finish_reason": body["finish_reason"],
+                        }
+                    ]
+                }
+            ]
+            payload = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+            return httpx.Response(
+                200,
+                text=payload + "data: [DONE]\n\n",
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(200, json=body["json"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen.append(body)
+        if "factory_droid_session_id" not in body:
+            call = {
+                "id": "call_weather",
+                "type": "function",
+                "function": {"name": "weather", "arguments": '{"city":"Gdansk"}'},
+            }
+            if stream:
+                return response(
+                    {
+                        "delta": {
+                            "factory_droid_session_id": "session-native",
+                            "tool_calls": [dict(call, index=0)],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                )
+            return response(
+                {
+                    "json": {
+                        "factory_droid_session_id": "session-native",
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": None,
+                                    "tool_calls": [call],
+                                },
+                                "finish_reason": "tool_calls",
+                            }
+                        ],
+                    }
+                }
+            )
+        assert body["messages"][-1] == {
+            "role": "tool",
+            "tool_call_id": "call_weather",
+            "content": '{"temperature_c":20}',
+        }
+        if stream:
+            return response({"delta": {"content": "stop"}, "finish_reason": "stop"})
+        return response(
+            {
+                "json": {
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": "stop"},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            }
+        )
+
+    bridge = _bridge(e2e, handler)
+    async with bridge.client:
+        plan = [
+            scenario
+            for scenario in e2e.native_continuation_scenarios(streaming=True)
+            if scenario.stream is stream
+        ]
+        rows = await e2e.run_native_continuation_matrix(
+            bridge,
+            ["m1"],
+            plan,
+        )
+
+    assert len(rows) == 1
+    assert rows[0]["verdict"] == e2e.SUCCESS
+    assert len(seen) == 2
+    assert seen[1]["factory_droid_session_id"] == "session-native"
+
+
+@pytest.mark.asyncio
+async def test_native_continuation_matrix_flags_a_repeated_call_under_a_new_id(
+    e2e: ModuleType,
+) -> None:
+    """The bridge mints a fresh call id, so ids cannot be part of the compare."""
+    calls = iter(("call_prime", "call_repeat"))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json={
+                "factory_droid_session_id": "session-native",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": next(calls),
+                                    "type": "function",
+                                    "function": {
+                                        "name": "weather",
+                                        # Same request, spelled with different
+                                        # whitespace and key order.
+                                        "arguments": '{"city": "Gdansk"}',
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+            },
+        )
+
+    bridge = _bridge(e2e, handler)
+    async with bridge.client:
+        plan = e2e.native_continuation_scenarios(streaming=False)
+        rows = await e2e.run_native_continuation_matrix(bridge, ["m1"], plan, label="native")
+
+    assert len(rows) == 1
+    assert rows[0]["verdict"] == e2e.MODEL_BEHAVIOR
+    assert rows[0]["detail"] == "native continuation repeated the prime tool call"
+    assert rows[0]["label"] == "native"
+    assert e2e.artifact_label(rows) == "native"
+
+
+def test_tool_call_signatures_ignore_ids_and_unparsable_arguments(e2e: ModuleType) -> None:
+    same = e2e._tool_call_signatures(
+        [{"id": "call_1", "function": {"name": "weather", "arguments": '{"city":"Gdansk"}'}}]
+    )
+
+    assert same == e2e._tool_call_signatures(
+        [{"id": "call_2", "function": {"name": "weather", "arguments": '{ "city" : "Gdansk" }'}}]
+    )
+    assert e2e._tool_call_signatures([{"id": "call_3", "function": "not an object"}]) == []
+    assert e2e._tool_call_signatures(
+        [{"function": {"name": "weather", "arguments": " oops "}}]
+    ) == [("weather", "oops")]
+
+
+@pytest.mark.asyncio
+async def test_native_continuation_keeps_a_model_behavior_prime_non_blocking(
+    e2e: ModuleType,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "No tool call"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    bridge = _bridge(e2e, handler)
+    async with bridge.client:
+        rows = await e2e.run_native_continuation_matrix(
+            bridge,
+            ["m1"],
+            e2e.native_continuation_scenarios(streaming=False),
+        )
+
+    assert rows[0]["continuation_prime_verdict"] == e2e.MODEL_BEHAVIOR
+    assert rows[0]["verdict"] == e2e.MODEL_BEHAVIOR
+    assert e2e.summarize(rows)["blocking"] == []
+
+
+@pytest.mark.asyncio
+async def test_native_continuation_keeps_bridge_defect_prime_blocking(
+    e2e: ModuleType,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            502,
+            json={
+                "error": {
+                    "type": "factory_protocol_error",
+                    "message": "tool call payload never closed",
+                }
+            },
+        )
+
+    bridge = _bridge(e2e, handler)
+    async with bridge.client:
+        rows = await e2e.run_native_continuation_matrix(
+            bridge,
+            ["m1"],
+            e2e.native_continuation_scenarios(streaming=False),
+        )
+
+    assert rows[0]["continuation_prime_verdict"] == e2e.BRIDGE_DEFECT
+    assert rows[0]["verdict"] == e2e.BRIDGE_DEFECT
+    assert rows[0]["detail"] == (
+        "transport error: native continuation prime failed: "
+        "unexpected status 502 (factory_protocol_error)"
+    )
+    assert e2e.summarize(rows)["blocking"] == rows
 
 
 @pytest.mark.parametrize(

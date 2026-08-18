@@ -89,6 +89,12 @@ To verify explicit session continuity as well, start the bridge with
 `--test-session-continuity` to the matrix command. That phase creates a session
 with one model and confirms that continuing its ID with different settings is
 rejected instead of silently running under a stale model or reasoning effort.
+Use `--test-native-session-continuity` to create a real native tool call, append
+the returned assistant call and client result, and continue the same session.
+Run this against affected models in both transports. Keep a client-side
+iteration cap; repeated calls remain legal model behavior and must not be
+deduplicated by the bridge. The matrix recognizes a repeat by tool name and
+argument values, because every request gets its own call IDs.
 
 ```bash
 uv run python scripts/e2e_matrix.py report traces/run-a.jsonl
