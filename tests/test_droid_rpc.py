@@ -437,6 +437,7 @@ async def test_disable_native_tools_spares_the_tools_the_bridge_published() -> N
 async def test_native_tool_setup_waits_for_only_the_bridge_server() -> None:
     disabled: set[str] = set()
     expected = frozenset({f"{MCP_TOOL_ID_PREFIX}get_weather"})
+    native_server_url = "http://127.0.0.1:8787/factory/mcp/token"
 
     def handler(method: str, params: dict[str, Any]) -> dict[str, Any]:
         if method == "droid.list_mcp_servers":
@@ -444,7 +445,11 @@ async def test_native_tool_setup_waits_for_only_the_bridge_server() -> None:
                 "result": {
                     "servers": [
                         {"name": "ambient", "status": "connecting"},
-                        {"name": "openai-bridge", "status": "connected"},
+                        {
+                            "name": "openai-bridge",
+                            "status": "connected",
+                            "url": native_server_url,
+                        },
                     ]
                 }
             }
@@ -473,7 +478,7 @@ async def test_native_tool_setup_waits_for_only_the_bridge_server() -> None:
         _client(protocol),
         keep_tool_prefix="mcp_openai-bridge_",
         expected_tool_ids=expected,
-        native_server_url="http://127.0.0.1:8787/factory/mcp/token",
+        native_server_url=native_server_url,
     )
 
     assert protocol.calls[0][0] == "droid.list_mcp_servers"
@@ -548,6 +553,62 @@ async def test_native_tool_setup_reports_mcp_policy_rejection() -> None:
 
 
 @pytest.mark.asyncio
+async def test_native_tool_setup_rejects_a_mismatched_native_server_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(rpc_module, "_NATIVE_MCP_WAIT_SECONDS", 0.0)
+
+    def handler(method: str, _params: dict[str, Any]) -> dict[str, Any]:
+        if method == "droid.list_mcp_servers":
+            return {
+                "result": {
+                    "servers": [
+                        {
+                            "name": "openai-bridge",
+                            "status": "connected",
+                            "url": "http://foreign.example/mcp",
+                        }
+                    ]
+                }
+            }
+        raise AssertionError(method)
+
+    with pytest.raises(NativeToolUnavailableError, match="did not connect"):
+        await DroidRpcExtension().disable_native_tools(
+            _client(FakeProtocol(handler)),
+            expected_tool_ids=frozenset({f"{MCP_TOOL_ID_PREFIX}get_weather"}),
+            native_server_url="http://127.0.0.1:8787/factory/mcp/token",
+        )
+
+
+@pytest.mark.asyncio
+async def test_native_tool_setup_maps_permission_failure_as_connection_error() -> None:
+    def handler(method: str, _params: dict[str, Any]) -> dict[str, Any]:
+        if method == "droid.list_mcp_servers":
+            return {
+                "result": {
+                    "servers": [
+                        {
+                            "name": "openai-bridge",
+                            "status": "failed",
+                            "error": "Permission denied",
+                        }
+                    ]
+                }
+            }
+        raise AssertionError(method)
+
+    with pytest.raises(NativeToolUnavailableError, match="failed at") as error:
+        await DroidRpcExtension().disable_native_tools(
+            _client(FakeProtocol(handler)),
+            expected_tool_ids=frozenset({f"{MCP_TOOL_ID_PREFIX}get_weather"}),
+            native_server_url="http://127.0.0.1:8787/factory/mcp/token",
+        )
+
+    assert "mcpPolicy" not in str(error.value)
+
+
+@pytest.mark.asyncio
 async def test_native_tool_setup_waits_for_connecting_bridge_server(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -581,6 +642,13 @@ async def test_native_tool_setup_waits_for_connecting_bridge_server(
     )
 
     assert [method for method, _, _ in protocol.calls].count("droid.list_mcp_servers") == 2
+    timeouts = [
+        timeout for method, _, timeout in protocol.calls if method == "droid.list_mcp_servers"
+    ]
+    assert timeouts[0] is not None
+    assert timeouts[1] is not None
+    assert timeouts[0] <= 1.0
+    assert timeouts[1] < timeouts[0]
 
 
 @pytest.mark.asyncio

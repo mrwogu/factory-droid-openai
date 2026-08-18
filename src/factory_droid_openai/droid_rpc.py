@@ -33,8 +33,7 @@ _UNAVOIDABLE_TOOL_IDS = frozenset({"exit-spec-mode"})
 # tools at all.
 _DEFERRED_TOOL_LOADER_IDS = frozenset({"tool-search-cli"})
 _MCP_POLICY_PATTERN = re.compile(
-    r"(?:mcp\s*policy|allowlist|allow\s+list|organization policy|"
-    r"not allowed|disallowed|denied|blocked)",
+    r"(?:mcp\s*policy|allowlist|allow\s+list|organization\s+policy)",
     re.IGNORECASE,
 )
 
@@ -209,9 +208,15 @@ class DroidRpcExtension:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _NATIVE_MCP_WAIT_SECONDS
         while True:
-            result = await self._request(client, DroidServerMethod.LIST_MCP_SERVERS.value, {})
+            timeout = min(_RPC_TIMEOUT_SECONDS, max(0.1, deadline - loop.time()))
+            result = await self._request(
+                client,
+                DroidServerMethod.LIST_MCP_SERVERS.value,
+                {},
+                timeout=timeout,
+            )
             servers = _required_list(result, "servers")
-            target = [server for server in servers if server.get("name") == MCP_SERVER_NAME]
+            target = [server for server in servers if _native_server_matches(server, server_url)]
             if len(target) > 1:
                 raise NativeToolUnavailableError(
                     f"Droid reported multiple MCP servers named '{MCP_SERVER_NAME}'"
@@ -357,6 +362,12 @@ def _matching(tool_ids: set[str], prefix: str | None) -> set[str]:
     if prefix is None:
         return set()
     return {tool_id for tool_id in tool_ids if tool_id.startswith(prefix)}
+
+
+def _native_server_matches(server: dict[str, Any], server_url: str | None) -> bool:
+    if server.get("name") != MCP_SERVER_NAME:
+        return False
+    return all(server[field] == server_url for field in ("url", "uri") if field in server)
 
 
 def _native_server_error(
