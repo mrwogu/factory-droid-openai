@@ -100,6 +100,18 @@ def _is_ignorable_native_tool(tool_name: str) -> bool:
     return tool_name.replace("-", "").replace("_", "").casefold() in _IGNORED_NATIVE_TOOLS
 
 
+def _native_tool_ids(binding: NativeToolBinding | None) -> frozenset[str] | None:
+    """Tool ids Droid has to report for ``binding``, or ``None`` for text tools.
+
+    Both a warm session and a per-request session verify against this, so a
+    session that never published the request's catalog is never used to serve
+    a native turn.
+    """
+    if binding is None:
+        return None
+    return frozenset(f"{MCP_TOOL_ID_PREFIX}{name}" for name in binding.names)
+
+
 def _native_tool_marker(name: str, arguments: Any) -> str:
     """Render a structured tool call in the bridge's own marker form."""
     payload = json.dumps(
@@ -186,6 +198,7 @@ class WarmSession:
     transport: _ManagedProcessTransport | None
     session_id: str | None
     created_at: float
+    native_binding: NativeToolBinding | None = None
     consumed: bool = False
 
     def is_alive(self) -> bool:
@@ -363,7 +376,13 @@ class DroidRunner:
             append_system_prompt_file=append_system_prompt_file,
         )
 
-    async def warm(self, key: SessionKey, *, timeout_seconds: float) -> WarmSession:
+    async def warm(
+        self,
+        key: SessionKey,
+        *,
+        timeout_seconds: float,
+        native_tools: NativeToolBinding | None = None,
+    ) -> WarmSession:
         """Start a Droid session that is initialized but has no turn yet."""
         client, transport = self._new_client()
         client.set_permission_handler(lambda _params: "cancel")
@@ -378,7 +397,7 @@ class DroidRunner:
                 await client.initialize_session(
                     machine_id="factory-droid-openai",
                     cwd=str(self._workdir),
-                    mcp_servers=[],
+                    mcp_servers=([] if native_tools is None else [native_tools.server_config()]),
                     model_id=key.model_id,
                     reasoning_effort=_resolve_reasoning_effort(key.reasoning_effort),
                     interaction_mode=DroidInteractionMode.Auto,
@@ -386,14 +405,28 @@ class DroidRunner:
                     skip_permissions_unsafe=False,
                     enabled_tool_ids=[],
                 )
-                await self._rpc.disable_native_tools(client)
+                await self._rpc.disable_native_tools(
+                    client,
+                    keep_tool_prefix=(None if native_tools is None else MCP_TOOL_ID_PREFIX),
+                    expected_tool_ids=_native_tool_ids(native_tools),
+                    native_server_url=(None if native_tools is None else native_tools.url),
+                )
 
             await self._run_session_init(
                 asyncio.get_running_loop().time() + timeout_seconds,
                 initialize,
             )
         except BaseException:
-            await self.discard(WarmSession(key, client, transport, None, started))
+            await self.discard(
+                WarmSession(
+                    key,
+                    client,
+                    transport,
+                    None,
+                    started,
+                    native_binding=native_tools,
+                )
+            )
             raise
         if self._metrics is not None:
             self._metrics.observe_droid_startup(time.perf_counter() - started)
@@ -403,6 +436,7 @@ class DroidRunner:
             transport=transport,
             session_id=client.session_id,
             created_at=asyncio.get_running_loop().time(),
+            native_binding=native_tools,
         )
 
     async def _run_session_init(
@@ -496,6 +530,17 @@ class DroidRunner:
         started = loop.time()
         warm = request.warm_session
         if warm is not None:
+            # A binding always carries its catalog, so ``None`` here means the
+            # side publishes no tools at all, and one comparison covers both a
+            # catalog mismatch and a native session offered to a text turn.
+            warm_catalog = None if warm.native_binding is None else warm.native_binding.catalog
+            requested_catalog = (
+                None if request.native_tools is None else request.native_tools.catalog
+            )
+            if warm_catalog != requested_catalog:
+                raise RunnerError(
+                    "A warm Droid session cannot serve a different native tool catalog.",
+                )
             warm.consumed = True
             client, transport = warm.client, warm.transport
         else:
@@ -503,12 +548,6 @@ class DroidRunner:
             client.set_permission_handler(lambda _params: "cancel")
             client.set_ask_user_handler(
                 lambda _params: {"cancelled": True, "answers": []},
-            )
-        if warm is not None and request.native_tools is not None:
-            # A warm session was initialized without the request's MCP server,
-            # and Droid attaches those only when a session starts.
-            raise RunnerError(
-                "A warm Droid session cannot serve a native tool-calling turn.",
             )
         mcp_servers = [] if request.native_tools is None else [request.native_tools.server_config()]
         initialized = warm is not None
@@ -569,13 +608,7 @@ class DroidRunner:
                             keep_tool_prefix=(
                                 None if native_binding is None else MCP_TOOL_ID_PREFIX
                             ),
-                            expected_tool_ids=(
-                                None
-                                if native_binding is None
-                                else frozenset(
-                                    f"{MCP_TOOL_ID_PREFIX}{name}" for name in native_binding.names
-                                )
-                            ),
+                            expected_tool_ids=_native_tool_ids(native_binding),
                             native_server_url=(
                                 None if native_binding is None else native_binding.url
                             ),

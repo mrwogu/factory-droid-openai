@@ -104,6 +104,16 @@ class Settings:
                 "session_init_timeout_seconds must be at most "
                 f"{MAX_SESSION_INIT_TIMEOUT_SECONDS:g} seconds"
             )
+        # Every warm session pins one catalog for its whole warm life, and every
+        # admitted request publishes one of its own, so the registry has to hold
+        # both at once. Sizing it any smaller makes the registry evict the
+        # catalog of a request that is still running.
+        required_sessions = self.warm_session_count() + self.max_concurrency
+        if self.native_tool_calls and self.max_tracked_sessions < required_sessions:
+            raise ValueError(
+                "max_tracked_sessions must be at least warm sessions plus max_concurrency "
+                f"({required_sessions}) when native_tool_calls is enabled"
+            )
         # The warm pool keys sessions by this value, so it has to match the
         # normalized effort the request path sends to Droid, and a bad value
         # has to fail at construction instead of on every request.

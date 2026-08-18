@@ -5,8 +5,14 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
+from factory_droid_openai.mcp_tools import NativeToolBinding, NativeToolRegistry
 from factory_droid_openai.metrics import BridgeMetrics
-from factory_droid_openai.pool import BackgroundReaper, PoolMetrics, WarmSessionPool
+from factory_droid_openai.pool import (
+    BackgroundReaper,
+    PoolMetrics,
+    WarmSessionPool,
+    _WarmDemand,
+)
 from factory_droid_openai.runner import RunnerError, SessionKey, WarmSession
 
 if TYPE_CHECKING:
@@ -31,14 +37,26 @@ class FakeRunner:
         self.fail = fail
         self.log = log if log is not None else []
         self.warmed = 0
+        self.native_bindings: list[NativeToolBinding | None] = []
 
-    async def warm(self, key: SessionKey, *, timeout_seconds: float) -> WarmSession:
+    async def warm(
+        self,
+        key: SessionKey,
+        *,
+        timeout_seconds: float,
+        native_tools: NativeToolBinding | None = None,
+    ) -> WarmSession:
         del timeout_seconds
         if self.fail:
             raise RuntimeError("warm failed")
         self.warmed += 1
+        self.native_bindings.append(native_tools)
         self.log.append(f"warm:{key.model_id}")
-        return _session(key, created_at=asyncio.get_running_loop().time())
+        return _session(
+            key,
+            created_at=asyncio.get_running_loop().time(),
+            native_binding=native_tools,
+        )
 
     async def discard(self, session: WarmSession) -> None:
         self.log.append(f"discard:{session.key.model_id}")
@@ -49,6 +67,7 @@ def _session(
     *,
     created_at: float = 0.0,
     reaped: bool = False,
+    native_binding: NativeToolBinding | None = None,
 ) -> WarmSession:
     return WarmSession(
         key=key,
@@ -56,6 +75,7 @@ def _session(
         transport=cast("Any", FakeTransport(reaped=reaped)),
         session_id="session-1",
         created_at=created_at,
+        native_binding=native_binding,
     )
 
 
@@ -67,6 +87,7 @@ def _pool(
     max_keys: int = 2,
     retry_seconds: float = 0.0,
     metrics: BridgeMetrics | None = None,
+    native_registry: NativeToolRegistry | None = None,
 ) -> WarmSessionPool:
     return WarmSessionPool(
         runner_factory=cast("RunnerFactory", lambda: runner),
@@ -77,7 +98,12 @@ def _pool(
         max_keys=max_keys,
         retry_seconds=retry_seconds,
         metrics=metrics,
+        native_registry=native_registry,
     )
+
+
+def _native_catalog(registry: NativeToolRegistry, name: str = "weather") -> Any:
+    return registry.catalog_identity(({"name": name, "inputSchema": {"type": "object"}},))
 
 
 @pytest.mark.asyncio
@@ -218,6 +244,181 @@ async def test_pool_discards_sessions_offered_when_full_or_unwanted() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pool_warms_and_reuses_an_exact_native_catalog() -> None:
+    log: list[str] = []
+    reaper = BackgroundReaper()
+    registry = NativeToolRegistry(base_url="http://127.0.0.1:8787")
+    runner = FakeRunner(log=log)
+    pool = WarmSessionPool(
+        runner_factory=cast("RunnerFactory", lambda: runner),
+        reaper=reaper,
+        size=1,
+        warm_timeout_seconds=5.0,
+        native_registry=registry,
+    )
+    catalog = _native_catalog(registry)
+    pool.start()
+    pool.note(KEY, catalog)
+    await asyncio.sleep(0.05)
+
+    session = pool.acquire(KEY, catalog)
+
+    assert session is not None
+    assert session.native_binding is not None
+    assert session.native_binding.catalog == catalog
+    assert runner.native_bindings == [session.native_binding]
+    assert len(registry) == 1
+    await pool.aclose()
+    await reaper.drain()
+    assert len(registry) == 1
+    registry.close(session.native_binding.token)
+    assert len(registry) == 0
+
+
+@pytest.mark.asyncio
+async def test_pool_misses_when_native_catalog_changes() -> None:
+    reaper = BackgroundReaper()
+    registry = NativeToolRegistry(base_url="http://127.0.0.1:8787")
+    pool = WarmSessionPool(
+        runner_factory=cast("RunnerFactory", lambda: FakeRunner()),
+        reaper=reaper,
+        size=1,
+        warm_timeout_seconds=5.0,
+        native_registry=registry,
+    )
+    first_catalog = _native_catalog(registry, "first")
+    second_catalog = _native_catalog(registry, "second")
+    binding = registry.open_catalog(first_catalog)
+    pool.note(KEY, first_catalog)
+    pool.offer(_session(created_at=asyncio.get_running_loop().time(), native_binding=binding))
+
+    assert pool.acquire(KEY, second_catalog) is None
+    await pool.aclose()
+    await reaper.drain()
+
+
+@pytest.mark.asyncio
+async def test_pool_keeps_a_text_session_while_native_catalogs_rotate() -> None:
+    """A rotating catalog must not push a live text key to a target of zero."""
+    log: list[str] = []
+    registry = NativeToolRegistry(base_url="http://127.0.0.1:8787")
+    pool = _pool(FakeRunner(log=log), size=3, max_keys=2, native_registry=registry)
+    warmed = asyncio.get_running_loop().time()
+    pool.note(KEY)
+    pool.offer(_session(KEY, created_at=warmed))
+    pool.note(OTHER_KEY)
+    pool.offer(_session(OTHER_KEY, created_at=warmed))
+    catalogs = [_native_catalog(registry, name) for name in ("first", "second")]
+    for catalog in catalogs:
+        pool.note(KEY, catalog)
+        pool.offer(
+            _session(
+                KEY,
+                created_at=warmed,
+                native_binding=registry.open_catalog(catalog),
+            )
+        )
+
+    # Four demands over a pool of three: the text half still funds both keys,
+    # and only the rotated-away catalog loses its session.
+    pool._rebalance()
+    await asyncio.sleep(0)
+
+    assert pool.acquire(KEY) is not None
+    assert pool.acquire(OTHER_KEY) is not None
+    assert pool.acquire(KEY, catalogs[1]) is not None
+    assert pool.acquire(KEY, catalogs[0]) is None
+    assert log == ["discard:model-a"]
+    await pool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_pool_drops_stale_native_demand() -> None:
+    log: list[str] = []
+    registry = NativeToolRegistry(base_url="http://127.0.0.1:8787")
+    pool = _pool(FakeRunner(log=log), max_keys=1, native_registry=registry)
+    first_catalog = _native_catalog(registry, "first")
+    second_catalog = _native_catalog(registry, "second")
+    first_binding = registry.open_catalog(first_catalog)
+    pool.note(KEY, first_catalog)
+    pool.offer(_session(created_at=asyncio.get_running_loop().time(), native_binding=first_binding))
+
+    pool.note(OTHER_KEY, second_catalog)
+    await asyncio.sleep(0)
+
+    assert log == ["discard:model-a"]
+    assert len(registry) == 0
+    await pool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_pool_reports_missing_native_registry() -> None:
+    registry = NativeToolRegistry(base_url="http://127.0.0.1:8787")
+    pool = _pool(FakeRunner(), native_registry=None)
+    catalog = _native_catalog(registry)
+
+    result = await pool._warm(_WarmDemand(KEY, catalog))
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_pool_closes_a_native_catalog_after_warm_failure() -> None:
+    registry = NativeToolRegistry(base_url="http://127.0.0.1:8787")
+    runner = FakeRunner(fail=True)
+    pool = _pool(runner, native_registry=registry)
+    catalog = _native_catalog(registry)
+
+    pool.start()
+    pool.note(KEY, catalog)
+    await asyncio.sleep(0.05)
+
+    assert len(registry) == 0
+    assert pool.acquire(KEY, catalog) is None
+    await pool.aclose()
+
+
+def test_pool_drop_wrapper_removes_plain_demand() -> None:
+    pool = _pool(FakeRunner())
+
+    pool._drop(KEY)
+
+    assert pool.acquire(KEY) is None
+
+
+@pytest.mark.asyncio
+async def test_pool_closes_a_native_catalog_when_warmup_is_cancelled() -> None:
+    class SlowNativeRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+
+        async def warm(
+            self,
+            key: SessionKey,
+            *,
+            timeout_seconds: float,
+            native_tools: NativeToolBinding | None = None,
+        ) -> WarmSession:
+            del key, timeout_seconds, native_tools
+            self.started.set()
+            await asyncio.sleep(30)
+            raise AssertionError("warmup should have been cancelled")
+
+    registry = NativeToolRegistry(base_url="http://127.0.0.1:8787")
+    runner = SlowNativeRunner()
+    pool = _pool(runner, native_registry=registry)
+    catalog = _native_catalog(registry)
+    pool.start()
+    pool.note(KEY, catalog)
+    await runner.started.wait()
+
+    await pool.aclose()
+
+    assert len(registry) == 0
+
+
+@pytest.mark.asyncio
 async def test_pool_records_warm_failures_and_keeps_running() -> None:
     metrics = BridgeMetrics()
     runner = FakeRunner(fail=True)
@@ -237,8 +438,14 @@ async def test_pool_drops_a_key_after_session_init_timeout() -> None:
             super().__init__()
             self.attempts = 0
 
-        async def warm(self, key: SessionKey, *, timeout_seconds: float) -> WarmSession:
-            del key, timeout_seconds
+        async def warm(
+            self,
+            key: SessionKey,
+            *,
+            timeout_seconds: float,
+            native_tools: NativeToolBinding | None = None,
+        ) -> WarmSession:
+            del key, timeout_seconds, native_tools
             self.attempts += 1
             raise RunnerError(
                 "Factory Droid session initialization timed out after 0.1 seconds.",
@@ -263,9 +470,19 @@ async def test_pool_stops_warming_a_key_droid_rejects() -> None:
             super().__init__(fail=True)
             self.attempts = 0
 
-        async def warm(self, key: SessionKey, *, timeout_seconds: float) -> WarmSession:
+        async def warm(
+            self,
+            key: SessionKey,
+            *,
+            timeout_seconds: float,
+            native_tools: NativeToolBinding | None = None,
+        ) -> WarmSession:
             self.attempts += 1
-            return await super().warm(key, timeout_seconds=timeout_seconds)
+            return await super().warm(
+                key,
+                timeout_seconds=timeout_seconds,
+                native_tools=native_tools,
+            )
 
     runner = CountingRunner()
     pool = _pool(runner, retry_seconds=0.01)
@@ -352,8 +569,14 @@ async def test_pool_close_cancels_an_in_flight_warmup() -> None:
             super().__init__()
             self.started = asyncio.Event()
 
-        async def warm(self, key: SessionKey, *, timeout_seconds: float) -> WarmSession:
-            del key, timeout_seconds
+        async def warm(
+            self,
+            key: SessionKey,
+            *,
+            timeout_seconds: float,
+            native_tools: NativeToolBinding | None = None,
+        ) -> WarmSession:
+            del key, timeout_seconds, native_tools
             self.started.set()
             await asyncio.sleep(30)
             raise AssertionError("warmup should have been cancelled")
@@ -449,12 +672,22 @@ async def test_pool_refills_every_missing_session_in_one_pass() -> None:
             self.concurrent = 0
             self.peak = 0
 
-        async def warm(self, key: SessionKey, *, timeout_seconds: float) -> WarmSession:
+        async def warm(
+            self,
+            key: SessionKey,
+            *,
+            timeout_seconds: float,
+            native_tools: NativeToolBinding | None = None,
+        ) -> WarmSession:
             self.concurrent += 1
             self.peak = max(self.peak, self.concurrent)
             try:
                 await asyncio.sleep(0.02)
-                return await super().warm(key, timeout_seconds=timeout_seconds)
+                return await super().warm(
+                    key,
+                    timeout_seconds=timeout_seconds,
+                    native_tools=native_tools,
+                )
             finally:
                 self.concurrent -= 1
 

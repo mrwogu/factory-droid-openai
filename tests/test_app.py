@@ -93,6 +93,8 @@ class FakeRunner:
 
     async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
         self.requests.append(request)
+        if request.warm_session is not None:
+            request.warm_session.consumed = True
         try:
             if self.error is not None:
                 raise self.error
@@ -4071,7 +4073,13 @@ class WarmingRunner(FakeRunner):
         self.warmed: list[SessionKey] = []
         self.discarded: list[WarmSession] = []
 
-    async def warm(self, key: SessionKey, *, timeout_seconds: float) -> WarmSession:
+    async def warm(
+        self,
+        key: SessionKey,
+        *,
+        timeout_seconds: float,
+        native_tools: Any = None,
+    ) -> WarmSession:
         del timeout_seconds
         self.warmed.append(key)
         return WarmSession(
@@ -4080,6 +4088,7 @@ class WarmingRunner(FakeRunner):
             transport=None,
             session_id="session-1",
             created_at=asyncio.get_running_loop().time(),
+            native_binding=native_tools,
         )
 
     async def discard(self, session: WarmSession) -> None:
@@ -4829,6 +4838,137 @@ async def test_native_tool_calls_publish_the_request_tools_for_the_turn(tmp_path
     # once the turn that published it is over.
     assert "Read the weather." not in runner.requests[0].prompt
     assert runner.requests[0].warm_session is None
+    assert len(app.state.native_tools) == 0
+
+
+@pytest.mark.asyncio
+async def test_native_tool_calls_reuse_a_catalog_matched_warm_session(tmp_path: Path) -> None:
+    marker = (
+        f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Gdansk"}}}}{TOOL_CALL_CLOSE}'
+    )
+    runner = CatalogWatchingRunner([TextDelta(marker), RunComplete(Usage())], registry=None)
+    settings = Settings(
+        droid_path="droid",
+        workdir=tmp_path,
+        timeout_seconds=30.0,
+        native_tool_calls=True,
+        max_concurrency=1,
+        warm_sessions=1,
+        max_tracked_sessions=2,
+        telemetry=False,
+    )
+    app = create_app(
+        settings,
+        runner_factory=cast("RunnerFactory", lambda: runner),
+    )
+    runner.registry = app.state.native_tools
+    catalog = app.state.native_tools.catalog_identity(
+        (
+            {
+                "name": "weather",
+                "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}},
+                "description": "Read the weather.",
+            },
+        )
+    )
+    binding = app.state.native_tools.open_catalog(catalog)
+    app.state.native_tools.pin(binding.token)
+    key = SessionKey(model_id=None, reasoning_effort=None)
+    app.state.pool.note(key, catalog)
+    warm = WarmSession(
+        key=key,
+        client=cast("Any", object()),
+        transport=None,
+        session_id="warm-native",
+        created_at=asyncio.get_running_loop().time(),
+        native_binding=binding,
+    )
+    app.state.pool.offer(warm)
+
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=_weather_payload())
+
+    assert response.status_code == 200
+    assert runner.requests[0].warm_session is warm
+    assert runner.requests[0].native_tools is binding
+    assert runner.catalog_in_flight == catalog.tools
+    assert len(app.state.native_tools) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("consumed", [False, True])
+async def test_native_tool_calls_reject_a_warm_session_without_its_binding(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    consumed: bool,
+) -> None:
+    runner = WarmingRunner()
+    app = create_app(
+        _native_settings(tmp_path),
+        runner_factory=cast("RunnerFactory", lambda: runner),
+    )
+    warm = WarmSession(
+        key=SessionKey(model_id=None, reasoning_effort=None),
+        client=cast("Any", object()),
+        transport=None,
+        session_id="invalid-native-warm",
+        created_at=asyncio.get_running_loop().time(),
+        consumed=consumed,
+    )
+    monkeypatch.setattr(
+        app.state.pool,
+        "acquire",
+        cast("Any", lambda _key, _catalog: warm),
+    )
+
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=_weather_payload())
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["error"]["type"] == "factory_native_tool_unavailable"
+    assert "published no tool catalog" in body["error"]["message"]
+    await app.state.reaper.drain()
+    assert runner.discarded == ([] if consumed else [warm])
+    assert len(app.state.native_tools) == 0
+
+
+@pytest.mark.asyncio
+async def test_native_catalog_setup_releases_a_continuation_lease_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+    settings = Settings(
+        droid_path="droid",
+        workdir=tmp_path,
+        timeout_seconds=30.0,
+        native_tool_calls=True,
+        session_continuity=True,
+        telemetry=False,
+    )
+    app = create_app(
+        settings,
+        runner_factory=cast("RunnerFactory", lambda: runner),
+    )
+    key = SessionKey(model_id=None, reasoning_effort=None)
+    app.state.sessions.remember("session-1", key)
+
+    def fail_open(_catalog: Any) -> Any:
+        raise RuntimeError("catalog capacity")
+
+    monkeypatch.setattr(app.state.native_tools, "open_catalog", fail_open)
+
+    with pytest.raises(RuntimeError, match="catalog capacity"):
+        async with _client(app) as client:
+            await client.post(
+                "/v1/chat/completions",
+                json=_weather_payload(factory_droid_session_id="session-1"),
+            )
+
+    lease = app.state.sessions.acquire("session-1")
+    assert lease is not None
+    lease.release()
     assert len(app.state.native_tools) == 0
 
 

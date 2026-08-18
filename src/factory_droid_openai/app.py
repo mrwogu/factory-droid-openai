@@ -28,6 +28,7 @@ from factory_droid_openai.logs import debug as log_debug
 from factory_droid_openai.logs import info as log_info
 from factory_droid_openai.logs import warning as log_warning
 from factory_droid_openai.mcp_tools import (
+    NativeCatalogUnavailableError,
     NativeToolBinding,
     NativeToolRegistry,
     build_router,
@@ -743,6 +744,10 @@ def create_app(
         max_queue_size=resolved_settings.max_queue_size,
         metrics=metrics,
     )
+    native_tools = NativeToolRegistry(
+        base_url=resolved_settings.native_tool_call_base_url(),
+        max_sessions=resolved_settings.max_tracked_sessions,
+    )
     pool = WarmSessionPool(
         runner_factory=resolved_runner_factory,
         reaper=reaper,
@@ -750,16 +755,13 @@ def create_app(
         warm_timeout_seconds=min(resolved_settings.timeout_seconds, _WARM_TIMEOUT_CEILING),
         ttl_seconds=resolved_settings.warm_session_ttl_seconds,
         metrics=metrics,
+        native_registry=native_tools,
     )
     telemetry = TelemetryReporter(
         metrics=metrics,
         app_version=_BRIDGE_VERSION,
         endpoint=DEFAULT_TELEMETRY_ENDPOINT,
         enabled=resolved_settings.telemetry,
-    )
-    native_tools = NativeToolRegistry(
-        base_url=resolved_settings.native_tool_call_base_url(),
-        max_sessions=resolved_settings.max_tracked_sessions,
     )
 
     @contextlib.asynccontextmanager
@@ -839,8 +841,10 @@ def create_app(
     application.state.native_tools = native_tools
     if resolved_settings.native_tool_calls:
         # The token in each path is the credential, so the endpoint carries no
-        # API-key dependency: only the Droid process this bridge started is
-        # ever told the URL.
+        # API-key dependency: it is told to a Droid process this bridge
+        # started, and holding it only reveals that request's tool schemas. A
+        # warm session keeps its token for its whole warm life, so anything
+        # that can reach the bind address should be treated as trusted.
         application.include_router(build_router(native_tools))
 
     async def require_auth(credentials: BearerCredentials) -> None:
@@ -1387,27 +1391,64 @@ def create_app(
             raise
 
         native_binding: NativeToolBinding | None = None
+        native_catalog = None
         if plan.native_tools:
-            native_binding = native_tools.open(to_mcp_tools(plan.native_tools))
+            native_catalog = native_tools.catalog_identity(to_mcp_tools(plan.native_tools))
             metrics.record_features(("native_tool_calls",))
-            run_request = replace(run_request, native_tools=native_binding)
-            log_debug(
-                "chat.native_tools_published",
-                tools=len(plan.native_tools),
-                open_catalogs=len(native_tools),
-            )
+
+        warm_session: WarmSession | None = None
+        if session_id is None:
+            warm_session = pool.acquire(requested_key, native_catalog)
+            if warm_session is not None:
+                metrics.record_features(("warm_session",))
+                run_request = replace(run_request, warm_session=warm_session)
 
         def release_native_tools() -> None:
             if native_binding is not None:
                 native_tools.close(native_binding.token)
 
-        # Droid attaches MCP servers when a session starts, so a session warmed
-        # without this request's tools cannot serve the turn.
-        if session_id is None and native_binding is None:
-            warm_session = pool.acquire(requested_key)
-            if warm_session is not None:
-                metrics.record_features(("warm_session",))
-                run_request = replace(run_request, warm_session=warm_session)
+        def discard_unused_warm_session() -> None:
+            if warm_session is not None and not warm_session.consumed:
+                reaper.submit(resolved_runner_factory().discard(warm_session))
+
+        if native_catalog is not None:
+            try:
+                if warm_session is not None:
+                    native_binding = warm_session.native_binding
+                    if native_binding is None:
+                        raise NativeCatalogUnavailableError(
+                            "warm Droid session published no tool catalog"
+                        )
+                else:
+                    native_binding = native_tools.open_catalog(native_catalog)
+            except BaseException as exc:
+                discard_unused_warm_session()
+                try:
+                    await lease.release()
+                finally:
+                    try:
+                        if session_use is not None:
+                            session_use.release()
+                    finally:
+                        release_native_tools()
+                if not isinstance(exc, NativeCatalogUnavailableError):
+                    raise
+                # Native tool calls are the only channel this request has, so
+                # an unpublishable catalog fails closed instead of silently
+                # answering with no tools at all.
+                request.state.telemetry_error_type = "factory_native_tool_unavailable"
+                log_warning("chat.rejected", status=503, phase="native_tools")
+                return _error_response(
+                    f"Factory Droid native tool catalog is unavailable: {exc}",
+                    503,
+                    "factory_native_tool_unavailable",
+                )
+            run_request = replace(run_request, native_tools=native_binding)
+            log_debug(
+                "chat.native_tools_published",
+                tools=len(plan.native_tools or ()),
+                open_catalogs=len(native_tools),
+            )
 
         def record_repair(
             event: str,
@@ -1550,10 +1591,13 @@ def create_app(
             return _error_response(str(exc), exc.status_code, exc.error_type)
         finally:
             try:
-                if session_use is not None:
-                    session_use.release()
+                discard_unused_warm_session()
             finally:
-                release_native_tools()
+                try:
+                    if session_use is not None:
+                        session_use.release()
+                finally:
+                    release_native_tools()
 
         log_info(
             "chat.completed",
