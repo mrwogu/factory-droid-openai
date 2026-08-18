@@ -725,6 +725,7 @@ def create_app(
             workdir=resolved_settings.workdir,
             process_grace_seconds=resolved_settings.process_grace_seconds,
             cleanup_timeout_seconds=resolved_settings.cleanup_timeout_seconds,
+            session_init_timeout_seconds=resolved_settings.session_init_timeout_seconds,
             metrics=metrics,
             worktree=resolved_settings.worktree,
             append_system_prompt_file=resolved_settings.append_system_prompt_file,

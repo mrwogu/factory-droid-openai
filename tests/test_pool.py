@@ -7,7 +7,7 @@ import pytest
 
 from factory_droid_openai.metrics import BridgeMetrics
 from factory_droid_openai.pool import BackgroundReaper, PoolMetrics, WarmSessionPool
-from factory_droid_openai.runner import SessionKey, WarmSession
+from factory_droid_openai.runner import RunnerError, SessionKey, WarmSession
 
 if TYPE_CHECKING:
     from factory_droid_openai.pool import RunnerFactory
@@ -227,6 +227,32 @@ async def test_pool_records_warm_failures_and_keeps_running() -> None:
     await asyncio.sleep(0.05)
 
     assert "factory_droid_openai_warm_session_failures_total 1" in metrics.render()
+    await pool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_pool_drops_a_key_after_session_init_timeout() -> None:
+    class InitTimeoutRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
+        async def warm(self, key: SessionKey, *, timeout_seconds: float) -> WarmSession:
+            del key, timeout_seconds
+            self.attempts += 1
+            raise RunnerError(
+                "Factory Droid session initialization timed out after 0.1 seconds.",
+                status_code=504,
+                error_type="factory_droid_timeout",
+            )
+
+    runner = InitTimeoutRunner()
+    pool = _pool(runner, retry_seconds=0.01)
+    pool.start(initial_key=KEY)
+    await asyncio.sleep(0.05)
+
+    assert runner.attempts == 1
+    assert pool.acquire(KEY) is None
     await pool.aclose()
 
 
