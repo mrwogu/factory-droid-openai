@@ -43,6 +43,7 @@ from factory_droid_openai.droid_rpc import (
     ContextBreakdown,
     ContextStats,
     DroidRpcExtension,
+    NativeToolUnavailableError,
 )
 from factory_droid_openai.logs import TRACE as _TRACE_LEVEL
 from factory_droid_openai.logs import current_timeline
@@ -562,10 +563,21 @@ class DroidRunner:
                                 enabled_tool_ids=[],
                             )
                         initialized = True
+                        native_binding = request.native_tools
                         await self._rpc.disable_native_tools(
                             client,
                             keep_tool_prefix=(
-                                None if request.native_tools is None else MCP_TOOL_ID_PREFIX
+                                None if native_binding is None else MCP_TOOL_ID_PREFIX
+                            ),
+                            expected_tool_ids=(
+                                None
+                                if native_binding is None
+                                else frozenset(
+                                    f"{MCP_TOOL_ID_PREFIX}{name}" for name in native_binding.names
+                                )
+                            ),
+                            native_server_url=(
+                                None if native_binding is None else native_binding.url
                             ),
                         )
 
@@ -731,6 +743,12 @@ class DroidRunner:
                 f"Factory Droid session '{request.session_id}' was not found.",
                 status_code=404,
                 error_type="session_not_found",
+            ) from exc
+        except NativeToolUnavailableError as exc:
+            raise RunnerError(
+                str(exc),
+                status_code=503,
+                error_type="factory_native_tool_unavailable",
             ) from exc
         except DroidClientError as exc:
             model_id = _resolve_model_id(request.model, request.model_alias)

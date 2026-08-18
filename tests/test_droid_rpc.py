@@ -6,7 +6,13 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 from droid_sdk.errors import DroidClientError
 
-from factory_droid_openai.droid_rpc import DroidRpcExtension, _ProtocolEngine
+from factory_droid_openai import droid_rpc as rpc_module
+from factory_droid_openai.droid_rpc import (
+    DroidRpcExtension,
+    NativeToolUnavailableError,
+    _ProtocolEngine,
+)
+from factory_droid_openai.mcp_tools import MCP_TOOL_ID_PREFIX
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -425,6 +431,264 @@ async def test_disable_native_tools_spares_the_tools_the_bridge_published() -> N
 
     assert enabled == {"mcp_openai-bridge_get_weather"}
     assert disabled == {"exit-spec-mode", "read-cli", "tool-search-cli"}
+
+
+@pytest.mark.asyncio
+async def test_native_tool_setup_waits_for_only_the_bridge_server() -> None:
+    disabled: set[str] = set()
+    expected = frozenset({f"{MCP_TOOL_ID_PREFIX}get_weather"})
+
+    def handler(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if method == "droid.list_mcp_servers":
+            return {
+                "result": {
+                    "servers": [
+                        {"name": "ambient", "status": "connecting"},
+                        {"name": "openai-bridge", "status": "connected"},
+                    ]
+                }
+            }
+        if method == "droid.list_tools":
+            return {
+                "result": {
+                    "tools": [
+                        {"id": "read-cli", "currentlyAllowed": "read-cli" not in disabled},
+                        {"id": "exit-spec-mode", "currentlyAllowed": True},
+                        {"id": "tool-search-cli", "currentlyAllowed": True},
+                        {
+                            "id": f"{MCP_TOOL_ID_PREFIX}get_weather",
+                            "currentlyAllowed": True,
+                        },
+                    ]
+                }
+            }
+        if method == "droid.update_session_settings":
+            disabled.update(params["disabledToolIds"])
+            return {"result": {}}
+        raise AssertionError(method)
+
+    protocol = FakeProtocol(handler)
+
+    await DroidRpcExtension().disable_native_tools(
+        _client(protocol),
+        keep_tool_prefix="mcp_openai-bridge_",
+        expected_tool_ids=expected,
+        native_server_url="http://127.0.0.1:8787/factory/mcp/token",
+    )
+
+    assert protocol.calls[0][0] == "droid.list_mcp_servers"
+    update = next(params for method, params, _ in protocol.calls if "update" in method)
+    assert update["enabledToolIds"] == [f"{MCP_TOOL_ID_PREFIX}get_weather"]
+    assert update["disabledToolIds"] == ["exit-spec-mode", "read-cli", "tool-search-cli"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tools", "message"),
+    [
+        (
+            [{"id": "read-cli", "currentlyAllowed": True}],
+            "missing mcp_openai-bridge_get_weather",
+        ),
+        (
+            [
+                {"id": "mcp_openai-bridge_get_weather", "currentlyAllowed": True},
+                {"id": "mcp_openai-bridge_other", "currentlyAllowed": True},
+            ],
+            "unexpected mcp_openai-bridge_other",
+        ),
+    ],
+)
+async def test_native_tool_setup_rejects_an_inexact_tool_catalog(
+    tools: list[dict[str, Any]],
+    message: str,
+) -> None:
+    def handler(method: str, _params: dict[str, Any]) -> dict[str, Any]:
+        if method == "droid.list_mcp_servers":
+            return {"result": {"servers": [{"name": "openai-bridge", "status": "connected"}]}}
+        if method == "droid.list_tools":
+            return {"result": {"tools": tools}}
+        if method == "droid.update_session_settings":
+            raise AssertionError("inexact catalogs must fail before settings update")
+        raise AssertionError(method)
+
+    protocol = FakeProtocol(handler)
+
+    with pytest.raises(NativeToolUnavailableError, match=message):
+        await DroidRpcExtension().disable_native_tools(
+            _client(protocol),
+            keep_tool_prefix="mcp_openai-bridge_",
+            expected_tool_ids=frozenset({f"{MCP_TOOL_ID_PREFIX}get_weather"}),
+        )
+
+
+@pytest.mark.asyncio
+async def test_native_tool_setup_reports_mcp_policy_rejection() -> None:
+    def handler(method: str, _params: dict[str, Any]) -> dict[str, Any]:
+        if method == "droid.list_mcp_servers":
+            return {
+                "result": {
+                    "servers": [
+                        {
+                            "name": "openai-bridge",
+                            "status": "failed",
+                            "error": "server denied by organization mcpPolicy allowlist",
+                        }
+                    ]
+                }
+            }
+        raise AssertionError(method)
+
+    with pytest.raises(NativeToolUnavailableError, match=r"mcpPolicy.*127.0.0.1"):
+        await DroidRpcExtension().disable_native_tools(
+            _client(FakeProtocol(handler)),
+            expected_tool_ids=frozenset({f"{MCP_TOOL_ID_PREFIX}get_weather"}),
+            native_server_url="http://127.0.0.1:8787/factory/mcp/token",
+        )
+
+
+@pytest.mark.asyncio
+async def test_native_tool_setup_waits_for_connecting_bridge_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statuses = iter(["connecting", "connected"])
+
+    def handler(method: str, _params: dict[str, Any]) -> dict[str, Any]:
+        if method == "droid.list_mcp_servers":
+            return {"result": {"servers": [{"name": "openai-bridge", "status": next(statuses)}]}}
+        if method == "droid.list_tools":
+            return {
+                "result": {
+                    "tools": [
+                        {
+                            "id": f"{MCP_TOOL_ID_PREFIX}get_weather",
+                            "currentlyAllowed": True,
+                        }
+                    ]
+                }
+            }
+        if method == "droid.update_session_settings":
+            return {"result": {}}
+        raise AssertionError(method)
+
+    monkeypatch.setattr(rpc_module, "_NATIVE_MCP_WAIT_SECONDS", 1.0)
+    protocol = FakeProtocol(handler)
+
+    await DroidRpcExtension().disable_native_tools(
+        _client(protocol),
+        keep_tool_prefix="mcp_openai-bridge_",
+        expected_tool_ids=frozenset({f"{MCP_TOOL_ID_PREFIX}get_weather"}),
+    )
+
+    assert [method for method, _, _ in protocol.calls].count("droid.list_mcp_servers") == 2
+
+
+@pytest.mark.asyncio
+async def test_native_tool_setup_reports_missing_bridge_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(rpc_module, "_NATIVE_MCP_WAIT_SECONDS", 0.0)
+
+    def handler(method: str, _params: dict[str, Any]) -> dict[str, Any]:
+        if method == "droid.list_mcp_servers":
+            return {"result": {"servers": [{"name": "ambient", "status": "failed"}]}}
+        raise AssertionError(method)
+
+    with pytest.raises(NativeToolUnavailableError, match=r"openai-bridge.*127.0.0.1"):
+        await DroidRpcExtension().disable_native_tools(
+            _client(FakeProtocol(handler)),
+            expected_tool_ids=frozenset({f"{MCP_TOOL_ID_PREFIX}get_weather"}),
+            native_server_url="http://127.0.0.1:8787/factory/mcp/token",
+        )
+
+
+@pytest.mark.asyncio
+async def test_native_tool_setup_rejects_duplicate_bridge_servers() -> None:
+    def handler(method: str, _params: dict[str, Any]) -> dict[str, Any]:
+        if method == "droid.list_mcp_servers":
+            return {
+                "result": {
+                    "servers": [
+                        {"name": "openai-bridge", "status": "connected"},
+                        {"name": "openai-bridge", "status": "connected"},
+                    ]
+                }
+            }
+        raise AssertionError(method)
+
+    with pytest.raises(NativeToolUnavailableError, match="multiple"):
+        await DroidRpcExtension().disable_native_tools(
+            _client(FakeProtocol(handler)),
+            expected_tool_ids=frozenset({f"{MCP_TOOL_ID_PREFIX}get_weather"}),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [
+        ("disconnected", "failed at the configured native tool URL"),
+        ("mystery", "unknown status"),
+    ],
+)
+async def test_native_tool_setup_reports_non_connected_status(
+    status: str,
+    message: str,
+) -> None:
+    def handler(method: str, _params: dict[str, Any]) -> dict[str, Any]:
+        if method == "droid.list_mcp_servers":
+            return {
+                "result": {
+                    "servers": [{"name": "openai-bridge", "status": status, "error": "gone"}]
+                }
+            }
+        raise AssertionError(method)
+
+    with pytest.raises(NativeToolUnavailableError, match=message):
+        await DroidRpcExtension().disable_native_tools(
+            _client(FakeProtocol(handler)),
+            expected_tool_ids=frozenset({f"{MCP_TOOL_ID_PREFIX}get_weather"}),
+        )
+
+
+def test_native_tool_error_helpers_render_hostnames() -> None:
+    assert rpc_module._server_hostname(None) == "the configured native tool URL"
+    assert rpc_module._server_hostname("not a URL") == "the configured native tool URL"
+    assert rpc_module._state_value(SimpleNamespace(value="connected")) == "connected"
+    assert rpc_module._state_value("connected") == "connected"
+
+
+@pytest.mark.asyncio
+async def test_native_tool_setup_rejects_a_tool_that_stays_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(rpc_module, "_TOOL_DISABLE_RETRIES", 1)
+
+    def handler(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if method == "droid.list_mcp_servers":
+            return {"result": {"servers": [{"name": "openai-bridge", "status": "connected"}]}}
+        if method == "droid.list_tools":
+            return {
+                "result": {
+                    "tools": [
+                        {
+                            "id": f"{MCP_TOOL_ID_PREFIX}get_weather",
+                            "currentlyAllowed": False,
+                        }
+                    ]
+                }
+            }
+        if method == "droid.update_session_settings":
+            assert params["enabledToolIds"] == [f"{MCP_TOOL_ID_PREFIX}get_weather"]
+            return {"result": {}}
+        raise AssertionError(method)
+
+    with pytest.raises(NativeToolUnavailableError, match="did not keep"):
+        await DroidRpcExtension().disable_native_tools(
+            _client(FakeProtocol(handler)),
+            keep_tool_prefix="mcp_openai-bridge_",
+            expected_tool_ids=frozenset({f"{MCP_TOOL_ID_PREFIX}get_weather"}),
+        )
 
 
 @pytest.mark.asyncio

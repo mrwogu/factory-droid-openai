@@ -337,6 +337,24 @@ request, and it is mounted only while the flag is on. Droid reaches it at
 `http://127.0.0.1:<port>`; set `FACTORY_DROID_OPENAI_NATIVE_TOOL_CALL_URL`
 when the bridge answers on a different address than it binds.
 
+Enterprise-managed `mcpPolicy` settings must allow the MCP server hostname.
+For the default endpoint, the managed settings need an entry equivalent to:
+
+```json
+{
+  "mcpPolicy": {
+    "enabled": true,
+    "allowlist": ["127.0.0.1"]
+  }
+}
+```
+
+If `FACTORY_DROID_OPENAI_NATIVE_TOOL_CALL_URL` is set, allow its hostname
+instead. The bridge checks that `openai-bridge` connects and that its exact
+request tool catalog is available before sending the prompt. A policy
+rejection fails closed as `factory_native_tool_unavailable` with HTTP `503`.
+Confirm the final managed-settings shape with your Factory administrator.
+
 Whether the flag is worth it depends on the model. It pays off for a model that
 misses tool contracts on the text path: one that ignores `tool_choice=required`,
 answers in prose instead of calling a tool, or writes a call the parser has to
@@ -1666,6 +1684,16 @@ factory_native_tool_blocked
 Droid attempted to use one of its own tools instead of returning bridge
 protocol output. Retry with a clearer request or inspect the supplied system
 and user messages for conflicting instructions.
+
+### Native tool server unavailable
+
+```text
+factory_native_tool_unavailable
+```
+
+Native setup could not connect `openai-bridge` or verify the exact request tool
+catalog. For an enterprise `mcpPolicy` rejection, allow the hostname named in
+the error and confirm the managed settings with your Factory administrator.
 
 ### Incomplete response
 
