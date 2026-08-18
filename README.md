@@ -319,8 +319,10 @@ calls them through its own tool slot. The bridge then reports the call as
 
 What changes with the flag on:
 
-- Tool schemas leave the prompt. They are published over MCP instead, so a
-  request carrying a large toolset sends far fewer prompt bytes.
+- Tool schemas leave the prompt. They are published over MCP instead, so the
+  prompt stops growing with the toolset: fifty tools cost about 21 kB of prompt
+  on the default path and about 1 kB here. The transcript itself still travels
+  in the prompt, because each request runs in a fresh Droid session.
 - No dialect has to be recognized, because no tool call is written as text.
   The dialect table above still applies to the default path.
 - A tool-bearing request no longer uses a warm session, because Droid attaches
@@ -335,9 +337,14 @@ request, and it is mounted only while the flag is on. Droid reaches it at
 `http://127.0.0.1:<port>`; set `FACTORY_DROID_OPENAI_NATIVE_TOOL_CALL_URL`
 when the bridge answers on a different address than it binds.
 
-A full e2e matrix run over every model the bridge lists (905 requests per path)
-put the native path ahead of the text path: no bridge defect on either, and
-fifteen tool contracts that the text path lost to unrecognized answers are met.
+Whether the flag is worth it depends on the model. It pays off for a model that
+misses tool contracts on the text path: one that ignores `tool_choice=required`,
+answers in prose instead of calling a tool, or writes a call the parser has to
+guess at. A model that already satisfies those contracts gains nothing and pays
+about two seconds more per tool turn, since a tool-bearing request cannot reuse
+a warm session. `CONTRIBUTING.md` describes how to measure both paths against
+the models you actually use.
+
 Two caveats survive. A model may still call a tool again after the transcript
 already carries the result, because its session-side tool history is empty on
 every request. And a tool-bearing request waits for the machine's own MCP
