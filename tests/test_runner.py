@@ -394,6 +394,38 @@ async def test_runner_maps_sdk_error_event(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_runner_maps_transient_connection_error_event(tmp_path: Path) -> None:
+    client = FakeClient([ErrorEvent("Connection error.", "Error")])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    with pytest.raises(RunnerError, match="Connection error") as error:
+        _ = [event async for event in runner.run(_request())]
+
+    assert error.value.status_code == 503
+    assert error.value.error_type == "factory_droid_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_runner_keeps_detailed_connection_error_as_bridge_error(tmp_path: Path) -> None:
+    client = FakeClient([ErrorEvent("Connection error while parsing response.", "Error")])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    with pytest.raises(RunnerError, match="Connection error while parsing") as error:
+        _ = [event async for event in runner.run(_request())]
+
+    assert error.value.status_code == 502
+    assert error.value.error_type == "factory_droid_error"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "message",
     [
