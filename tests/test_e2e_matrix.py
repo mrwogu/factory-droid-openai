@@ -72,6 +72,27 @@ def test_scenarios_cover_both_transports_and_run_hostile_cases_once(e2e: ModuleT
     assert len(e2e.continuation_switch_scenarios(streaming=False)) == 1
 
 
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("   ", "must not be empty"),
+        ("line\nbreak", "must not contain newlines"),
+        ("line\u2028break", "must not contain newlines"),
+        ("bad\x00label", "must not contain control characters"),
+        ("x" * 129, "at most 128"),
+    ],
+)
+def test_matrix_labels_are_trimmed_and_validated(
+    e2e: ModuleType,
+    value: str,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        e2e.normalize_label(value)
+
+    assert e2e.normalize_label("  native Ż  ") == "native Ż"
+
+
 def test_blank_argument_scenarios_accept_answer_or_tool_retry(e2e: ModuleType) -> None:
     scenarios = [
         scenario for scenario in e2e.scenarios() if scenario.name == "tool_blank_arguments"
@@ -609,10 +630,12 @@ async def test_matrix_runs_every_pair_and_streams_rows_out(e2e: ModuleType) -> N
             plan,
             concurrency=1,
             on_row=written.append,
+            label="native",
         )
 
     assert len(rows) == 3
     assert written == rows
+    assert all(record["label"] == "native" for record in rows)
     assert {row["model"] for row in rows} == {"m1", "m2"}
     assert sum(1 for row in rows if row["scenario"] == "hostile") == 1
 
@@ -660,6 +683,7 @@ async def test_switch_matrix_runs_a_serial_model_ring(e2e: ModuleType) -> None:
             plan,
             settle_seconds=0,
             on_row=written.append,
+            label="native",
         )
 
     assert seen_models == ["m1", "m2", "m2", "m3", "m3", "m1"]
@@ -669,6 +693,7 @@ async def test_switch_matrix_runs_a_serial_model_ring(e2e: ModuleType) -> None:
         ("m3", "m1"),
     ]
     assert all(row["prime_verdict"] == e2e.SUCCESS for row in rows)
+    assert all(record["label"] == "native" for record in rows)
     assert written == rows
 
 
@@ -770,6 +795,7 @@ async def test_continuation_switch_matrix_rejects_a_model_ring(e2e: ModuleType) 
             ["m1", "m2"],
             plan,
             on_row=written.append,
+            label="native",
         )
 
     assert seen == [
@@ -781,6 +807,7 @@ async def test_continuation_switch_matrix_rejects_a_model_ring(e2e: ModuleType) 
         ("m1", "session-m2"),
     ]
     assert all(row["verdict"] == e2e.SUCCESS for row in rows)
+    assert all(record["label"] == "native" for record in rows)
     assert written == rows
 
 
@@ -897,6 +924,14 @@ def test_report_names_the_blocking_cases(e2e: ModuleType) -> None:
     assert "| Model | Pass | Total | Tool calls |" in report
 
 
+def test_report_displays_labels_and_legacy_artifacts(e2e: ModuleType) -> None:
+    labeled = e2e.render_report([e2e.row("m1", _scenario(e2e), _observation(e2e), label="native")])
+    legacy = e2e.render_report(_rows(e2e))
+
+    assert "- Label: native" in labeled
+    assert "- Label: unlabeled legacy artifact" in legacy
+
+
 def test_report_says_so_when_nothing_blocks(e2e: ModuleType) -> None:
     report = e2e.render_report([e2e.row("m1", _scenario(e2e), _observation(e2e))])
 
@@ -943,6 +978,71 @@ def test_comparison_keeps_transition_sources_distinct(e2e: ModuleType) -> None:
     second["source_model"] = "source-b"
 
     assert e2e.compare([first, second], [first, second])["shared"] == 2
+
+
+def test_artifact_labels_reject_mixed_rows_and_round_trip_unicode(
+    e2e: ModuleType,
+    tmp_path: Path,
+) -> None:
+    rows = [e2e.row("m1", _scenario(e2e), _observation(e2e), label=" native Ż ")]
+    path = tmp_path / "unicode.jsonl"
+    path.write_text(
+        "\n".join(json.dumps(record, ensure_ascii=False) for record in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    loaded = e2e.load_rows(path)
+
+    assert loaded[0]["label"] == "native Ż"
+    assert e2e.artifact_label(loaded) == "native Ż"
+    e2e._validate_append_target(path, "native Ż")
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text(" \n\n", encoding="utf-8")
+    e2e._validate_append_target(empty, "native")
+    with pytest.raises(ValueError, match="mixed"):
+        e2e.artifact_label([*loaded, e2e.row("m2", _scenario(e2e), _observation(e2e))])
+
+
+def test_compare_renders_distinct_labels_and_allows_legacy_inputs(e2e: ModuleType) -> None:
+    before = [e2e.row("m1", _scenario(e2e), _observation(e2e), label="text")]
+    after = [e2e.row("m1", _scenario(e2e), _observation(e2e), label="native")]
+
+    result = e2e.compare(before, after)
+    rendered = e2e.render_comparison(result)
+    legacy_rendered = e2e.render_comparison(e2e.compare(_rows(e2e), after))
+
+    assert result["before_label"] == "text"
+    assert result["after_label"] == "native"
+    assert "- Before label: text" in rendered
+    assert "- After label: native" in rendered
+    assert "- Label transition: text -> native" in rendered
+    assert "identity is unavailable" in legacy_rendered
+
+
+def test_compare_rejects_same_label_unless_overridden(e2e: ModuleType) -> None:
+    rows = [e2e.row("m1", _scenario(e2e), _observation(e2e), label="native")]
+
+    with pytest.raises(ValueError, match="cannot compare"):
+        e2e.compare(rows, rows)
+
+    assert e2e.compare(rows, rows, allow_same_label=True)["shared"] == 1
+
+
+def test_compare_command_allows_same_label_with_flag(
+    e2e: ModuleType,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    row = e2e.row("m1", _scenario(e2e), _observation(e2e), label="native")
+    before = tmp_path / "before.jsonl"
+    after = tmp_path / "after.jsonl"
+    for path in (before, after):
+        path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    code = e2e.main(["compare", str(before), str(after), "--allow-same-label"])
+
+    assert code == 0
+    assert "Before label: native" in capsys.readouterr().out
 
 
 def test_report_command_reads_a_jsonl_run(
@@ -1009,6 +1109,7 @@ def test_run_command_writes_rows_and_reports_blocking_findings(
     monkeypatch.delenv("FACTORY_DROID_OPENAI_API_KEY", raising=False)
     out = tmp_path / "nested" / "run.jsonl"
     args = ["run", "--no-stream", "--concurrency", "4", "--out", str(out)]
+    args.extend(["--label", "native"])
     if test_continuity:
         args.append("--test-session-continuity")
 
@@ -1017,5 +1118,30 @@ def test_run_command_writes_rows_and_reports_blocking_findings(
     rows = e2e.load_rows(out)
     assert code == 1
     assert rows
+    assert {row["label"] for row in rows} == {"native"}
     assert all(row["model"] == "m1" for row in rows if row["scenario"] != "hostile_unknown_model")
     assert "Bridge e2e run" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("label_args", [["--label", "native"], []])
+def test_run_rejects_mismatched_append_before_network(
+    e2e: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    label_args: list[str],
+) -> None:
+    out = tmp_path / "run.jsonl"
+    out.write_text(
+        json.dumps(e2e.row("m1", _scenario(e2e), _observation(e2e), label="text")) + "\n",
+        encoding="utf-8",
+    )
+
+    class NoNetworkClient:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+            raise AssertionError("network must not start")
+
+    monkeypatch.setattr(e2e.httpx, "AsyncClient", NoNetworkClient)
+
+    with pytest.raises(ValueError, match="cannot append"):
+        e2e.main(["run", *label_args, "--out", str(out)])
