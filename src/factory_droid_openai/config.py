@@ -21,6 +21,11 @@ DEFAULT_MODEL_ALIAS = "factory-droid"
 # so the bridge stops waiting this long after one arrives. Raise it when a
 # model spreads parallel calls over slower gaps than this.
 DEFAULT_TOOL_CALL_DRAIN_SECONDS = 0.5
+DEFAULT_SESSION_INIT_TIMEOUT_SECONDS = 60.0
+# droid-sdk pins its own SESSION_INIT_TIMEOUT at 60 s, so a larger cap here
+# could never take effect. Revisit both values when the pinned droid-sdk
+# version in pyproject.toml changes.
+MAX_SESSION_INIT_TIMEOUT_SECONDS = 60.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +36,7 @@ class Settings:
     droid_path: str = "droid"
     workdir: Path = field(default_factory=Path.cwd)
     timeout_seconds: float = 600.0
+    session_init_timeout_seconds: float = DEFAULT_SESSION_INIT_TIMEOUT_SECONDS
     body_timeout_seconds: float = 30.0
     max_concurrency: int = 2
     max_queue_size: int = 8
@@ -89,6 +95,15 @@ class Settings:
     def __post_init__(self) -> None:
         if self.max_tool_calls > MAX_PACKED_CALLS:
             raise ValueError(f"max_tool_calls must be at most {MAX_PACKED_CALLS}")
+        if not math.isfinite(self.session_init_timeout_seconds) or (
+            self.session_init_timeout_seconds <= 0
+        ):
+            raise ValueError("session_init_timeout_seconds must be greater than zero and finite")
+        if self.session_init_timeout_seconds > MAX_SESSION_INIT_TIMEOUT_SECONDS:
+            raise ValueError(
+                "session_init_timeout_seconds must be at most "
+                f"{MAX_SESSION_INIT_TIMEOUT_SECONDS:g} seconds"
+            )
         # The warm pool keys sessions by this value, so it has to match the
         # normalized effort the request path sends to Droid, and a bad value
         # has to fail at construction instead of on every request.
@@ -122,6 +137,15 @@ class Settings:
             "FACTORY_DROID_OPENAI_TIMEOUT_SECONDS",
             default=600.0,
         )
+        session_init_timeout_seconds = _positive_float(
+            "FACTORY_DROID_OPENAI_SESSION_INIT_TIMEOUT_SECONDS",
+            default=DEFAULT_SESSION_INIT_TIMEOUT_SECONDS,
+        )
+        if session_init_timeout_seconds > MAX_SESSION_INIT_TIMEOUT_SECONDS:
+            raise ValueError(
+                "FACTORY_DROID_OPENAI_SESSION_INIT_TIMEOUT_SECONDS must be at most "
+                f"{MAX_SESSION_INIT_TIMEOUT_SECONDS:g} seconds for droid-sdk==0.1.2"
+            )
         body_timeout_seconds = _positive_float(
             "FACTORY_DROID_OPENAI_BODY_TIMEOUT_SECONDS",
             default=30.0,
@@ -296,6 +320,7 @@ class Settings:
             droid_path=os.getenv("FACTORY_DROID_PATH", "droid"),
             workdir=workdir.resolve(),
             timeout_seconds=timeout_seconds,
+            session_init_timeout_seconds=session_init_timeout_seconds,
             body_timeout_seconds=body_timeout_seconds,
             max_concurrency=max_concurrency,
             max_queue_size=max_queue_size,

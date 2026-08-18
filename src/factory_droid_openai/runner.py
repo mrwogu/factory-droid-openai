@@ -33,7 +33,10 @@ from droid_sdk.schemas.enums import (
     ReasoningEffort,
 )
 
-from factory_droid_openai.config import DEFAULT_MODEL_ALIAS
+from factory_droid_openai.config import (
+    DEFAULT_MODEL_ALIAS,
+    DEFAULT_SESSION_INIT_TIMEOUT_SECONDS,
+)
 from factory_droid_openai.dialects import TOOL_CALL_CLOSE, TOOL_CALL_OPEN
 from factory_droid_openai.droid_rpc import (
     CompactionResult,
@@ -338,6 +341,7 @@ class DroidRunner:
         client_factory: ClientFactory | None = None,
         process_grace_seconds: float = 2.0,
         cleanup_timeout_seconds: float = 4.0,
+        session_init_timeout_seconds: float = DEFAULT_SESSION_INIT_TIMEOUT_SECONDS,
         metrics: RunnerMetrics | None = None,
         worktree: str | None = None,
         append_system_prompt_file: Path | None = None,
@@ -349,6 +353,7 @@ class DroidRunner:
         self._client_factory = client_factory
         self._process_grace_seconds = process_grace_seconds
         self._cleanup_timeout_seconds = cleanup_timeout_seconds
+        self._session_init_timeout_seconds = session_init_timeout_seconds
         self._metrics = metrics
         self._rpc = rpc_extension or DroidRpcExtension()
         self._reaper = reaper
@@ -366,7 +371,8 @@ class DroidRunner:
         )
         started = time.perf_counter()
         try:
-            async with asyncio.timeout(timeout_seconds):
+
+            async def initialize() -> None:
                 await client.connect()
                 await client.initialize_session(
                     machine_id="factory-droid-openai",
@@ -380,6 +386,11 @@ class DroidRunner:
                     enabled_tool_ids=[],
                 )
                 await self._rpc.disable_native_tools(client)
+
+            await self._run_session_init(
+                asyncio.get_running_loop().time() + timeout_seconds,
+                initialize,
+            )
         except BaseException:
             await self.discard(WarmSession(key, client, transport, None, started))
             raise
@@ -391,6 +402,43 @@ class DroidRunner:
             transport=transport,
             session_id=client.session_id,
             created_at=asyncio.get_running_loop().time(),
+        )
+
+    async def _run_session_init(
+        self,
+        deadline: float,
+        operation: Callable[[], Awaitable[OperationResult]],
+        *,
+        request_timeout: asyncio.Timeout | None = None,
+    ) -> OperationResult:
+        """Run session setup under its own deadline inside the request budget."""
+        started = asyncio.get_running_loop().time()
+        phase_deadline = min(deadline, started + self._session_init_timeout_seconds)
+        try:
+            async with asyncio.timeout_at(phase_deadline):
+                return await operation()
+        except (TimeoutError, DroidTimeoutError) as exc:
+            raise self._session_init_timeout_error(started) from exc
+        except asyncio.CancelledError as exc:
+            # A request deadline that lands on the same instant as the phase
+            # deadline cancels this scope before the phase timer converts it,
+            # and the phase still names where the budget went. A cancel from
+            # anywhere else, such as a client disconnect, has to stay one.
+            if request_timeout is None or not request_timeout.expired():
+                raise
+            raise self._session_init_timeout_error(started) from exc
+
+    def _session_init_timeout_error(self, started: float) -> RunnerError:
+        elapsed = asyncio.get_running_loop().time() - started
+        log_warning(
+            "droid.timeout",
+            phase="session_init",
+            elapsed_s=round(elapsed, 1),
+        )
+        return RunnerError(
+            f"Factory Droid session initialization timed out after {elapsed:.1f} seconds.",
+            status_code=504,
+            error_type="factory_droid_timeout",
         )
 
     async def discard(self, session: WarmSession) -> None:
@@ -471,51 +519,60 @@ class DroidRunner:
         usage = Usage()
 
         try:
-            async with asyncio.timeout_at(deadline):
+            async with asyncio.timeout_at(deadline) as request_timeout:
                 if warm is None:
-                    startup_started = time.perf_counter()
-                    try:
-                        await client.connect()
-                    finally:
-                        startup_seconds = time.perf_counter() - startup_started
-                        if self._metrics is not None:
-                            self._metrics.observe_droid_startup(startup_seconds)
-                        timeline = current_timeline()
-                        startup_ms = (
-                            timeline.observe("droid_startup_ms", startup_seconds)
-                            if timeline is not None
-                            else None
+
+                    async def initialize() -> None:
+                        nonlocal initialized
+                        startup_started = time.perf_counter()
+                        try:
+                            await client.connect()
+                        finally:
+                            startup_seconds = time.perf_counter() - startup_started
+                            if self._metrics is not None:
+                                self._metrics.observe_droid_startup(startup_seconds)
+                            timeline = current_timeline()
+                            startup_ms = (
+                                timeline.observe("droid_startup_ms", startup_seconds)
+                                if timeline is not None
+                                else None
+                            )
+                            log_debug(
+                                "droid.connected",
+                                droid=self._droid_path,
+                                droid_startup_ms=startup_ms,
+                            )
+                        if request.session_id is not None:
+                            # Continuation: reuse the stored Droid session so only
+                            # the new turn is sent instead of the full transcript.
+                            await client.load_session(
+                                session_id=request.session_id,
+                                mcp_servers=mcp_servers,
+                            )
+                        else:
+                            await client.initialize_session(
+                                machine_id="factory-droid-openai",
+                                cwd=str(self._workdir),
+                                mcp_servers=mcp_servers,
+                                model_id=_resolve_model_id(request.model, request.model_alias),
+                                reasoning_effort=reasoning_effort,
+                                interaction_mode=DroidInteractionMode.Auto,
+                                autonomy_level=AutonomyLevel.Off,
+                                skip_permissions_unsafe=False,
+                                enabled_tool_ids=[],
+                            )
+                        initialized = True
+                        await self._rpc.disable_native_tools(
+                            client,
+                            keep_tool_prefix=(
+                                None if request.native_tools is None else MCP_TOOL_ID_PREFIX
+                            ),
                         )
-                        log_debug(
-                            "droid.connected",
-                            droid=self._droid_path,
-                            droid_startup_ms=startup_ms,
-                        )
-                    if request.session_id is not None:
-                        # Continuation: reuse the stored Droid session so only
-                        # the new turn is sent instead of the whole transcript.
-                        await client.load_session(
-                            session_id=request.session_id,
-                            mcp_servers=mcp_servers,
-                        )
-                    else:
-                        await client.initialize_session(
-                            machine_id="factory-droid-openai",
-                            cwd=str(self._workdir),
-                            mcp_servers=mcp_servers,
-                            model_id=_resolve_model_id(request.model, request.model_alias),
-                            reasoning_effort=reasoning_effort,
-                            interaction_mode=DroidInteractionMode.Auto,
-                            autonomy_level=AutonomyLevel.Off,
-                            skip_permissions_unsafe=False,
-                            enabled_tool_ids=[],
-                        )
-                    initialized = True
-                    await self._rpc.disable_native_tools(
-                        client,
-                        keep_tool_prefix=(
-                            None if request.native_tools is None else MCP_TOOL_ID_PREFIX
-                        ),
+
+                    await self._run_session_init(
+                        deadline,
+                        initialize,
+                        request_timeout=request_timeout,
                     )
                 else:
                     await self._retune(warm, request.session_key())
@@ -696,7 +753,9 @@ class DroidRunner:
                     raise
 
     async def list_models(self, *, timeout_seconds: float) -> tuple[DroidModel, ...]:
-        async def operation(client: DroidClient) -> tuple[DroidModel, ...]:
+        models: list[Any] = []
+
+        async def initialize(client: DroidClient) -> None:
             result = await client.initialize_session(
                 machine_id="factory-droid-openai-models",
                 cwd=str(self._workdir),
@@ -706,7 +765,10 @@ class DroidRunner:
                 skip_permissions_unsafe=False,
                 enabled_tool_ids=[],
             )
-            models = result.available_models or []
+
+            models.extend(result.available_models or [])
+
+        async def operation(client: DroidClient) -> tuple[DroidModel, ...]:
             await self._rpc.close_session(client, reason="clear")
             return tuple(
                 DroidModel(
@@ -726,6 +788,7 @@ class DroidRunner:
         return await self._session_operation(
             operation,
             timeout_seconds=timeout_seconds,
+            init_operation=initialize,
         )
 
     async def get_context(
@@ -813,18 +876,18 @@ class DroidRunner:
         timeout_seconds: float,
         disable_tools: bool = True,
     ) -> OperationResult:
-        async def loaded(client: DroidClient) -> OperationResult:
+        async def initialize(client: DroidClient) -> None:
             await client.load_session(session_id=session_id, mcp_servers=[])
             # Metadata-only operations never run a model turn, so they neither
             # need the tool guard nor should they rewrite session settings.
             if disable_tools:
                 await self._rpc.disable_native_tools(client)
-            return await operation(client)
 
         return await self._session_operation(
-            loaded,
+            operation,
             timeout_seconds=timeout_seconds,
             session_id=session_id,
+            init_operation=initialize,
         )
 
     async def _session_operation(
@@ -833,16 +896,29 @@ class DroidRunner:
         *,
         timeout_seconds: float,
         session_id: str | None = None,
+        init_operation: Callable[[DroidClient], Awaitable[None]] | None = None,
     ) -> OperationResult:
         client, transport = self._new_client()
         client.set_permission_handler(lambda _params: "cancel")
         client.set_ask_user_handler(
             lambda _params: {"cancelled": True, "answers": []},
         )
-        started = asyncio.get_running_loop().time()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deadline = started + timeout_seconds
         try:
-            async with asyncio.timeout(timeout_seconds):
-                await client.connect()
+            async with asyncio.timeout_at(deadline) as request_timeout:
+
+                async def initialize() -> None:
+                    await client.connect()
+                    if init_operation is not None:
+                        await init_operation(client)
+
+                await self._run_session_init(
+                    deadline,
+                    initialize,
+                    request_timeout=request_timeout,
+                )
                 return await operation(client)
         except (TimeoutError, DroidTimeoutError) as exc:
             raise RunnerError(

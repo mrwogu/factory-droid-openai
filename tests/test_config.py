@@ -18,6 +18,7 @@ _ENVIRONMENT_KEYS = (
     "FACTORY_DROID_PATH",
     "FACTORY_DROID_OPENAI_WORKDIR",
     "FACTORY_DROID_OPENAI_TIMEOUT_SECONDS",
+    "FACTORY_DROID_OPENAI_SESSION_INIT_TIMEOUT_SECONDS",
     "FACTORY_DROID_OPENAI_BODY_TIMEOUT_SECONDS",
     "FACTORY_DROID_OPENAI_MAX_CONCURRENCY",
     "FACTORY_DROID_OPENAI_MAX_QUEUE_SIZE",
@@ -140,6 +141,23 @@ def test_settings_normalize_reasoning_effort_on_construction() -> None:
         Settings(reasoning_effort="extreme")
 
 
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        (0.0, "greater than zero"),
+        (float("inf"), "greater than zero"),
+        (61.0, "at most 60"),
+    ],
+)
+def test_settings_rejects_invalid_session_init_timeout(
+    tmp_path: Path,
+    value: float,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        Settings(workdir=tmp_path, session_init_timeout_seconds=value)
+
+
 def test_warm_session_count_tracks_max_concurrency_unless_set(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -221,6 +239,7 @@ def test_settings_from_env_reads_all_overrides(
     monkeypatch.setenv("FACTORY_DROID_PATH", "/usr/local/bin/droid")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKDIR", str(workdir))
     monkeypatch.setenv("FACTORY_DROID_OPENAI_TIMEOUT_SECONDS", "45.5")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_SESSION_INIT_TIMEOUT_SECONDS", "12.5")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_BODY_TIMEOUT_SECONDS", "12.5")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_CONCURRENCY", "3")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_QUEUE_SIZE", "12")
@@ -250,6 +269,7 @@ def test_settings_from_env_reads_all_overrides(
         droid_path="/usr/local/bin/droid",
         workdir=workdir,
         timeout_seconds=45.5,
+        session_init_timeout_seconds=12.5,
         body_timeout_seconds=12.5,
         max_concurrency=3,
         max_queue_size=12,
@@ -278,6 +298,26 @@ def test_settings_from_env_reads_all_overrides(
         ("FACTORY_DROID_OPENAI_TIMEOUT_SECONDS", "invalid", "must be a number"),
         ("FACTORY_DROID_OPENAI_TIMEOUT_SECONDS", "0", "must be greater than zero"),
         ("FACTORY_DROID_OPENAI_TIMEOUT_SECONDS", "inf", "must be greater than zero"),
+        (
+            "FACTORY_DROID_OPENAI_SESSION_INIT_TIMEOUT_SECONDS",
+            "invalid",
+            "must be a number",
+        ),
+        (
+            "FACTORY_DROID_OPENAI_SESSION_INIT_TIMEOUT_SECONDS",
+            "0",
+            "must be greater than zero",
+        ),
+        (
+            "FACTORY_DROID_OPENAI_SESSION_INIT_TIMEOUT_SECONDS",
+            "nan",
+            "must be greater than zero",
+        ),
+        (
+            "FACTORY_DROID_OPENAI_SESSION_INIT_TIMEOUT_SECONDS",
+            "61",
+            "must be at most 60",
+        ),
         ("FACTORY_DROID_OPENAI_BODY_TIMEOUT_SECONDS", "nan", "must be greater than zero"),
         ("FACTORY_DROID_OPENAI_MAX_CONCURRENCY", "invalid", "must be an integer"),
         ("FACTORY_DROID_OPENAI_MAX_CONCURRENCY", "0", "must be greater than zero"),

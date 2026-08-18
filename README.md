@@ -1234,6 +1234,7 @@ error types.
 | `FACTORY_DROID_PATH` | `droid` | Droid executable path |
 | `FACTORY_DROID_OPENAI_WORKDIR` | current directory | Droid working directory |
 | `FACTORY_DROID_OPENAI_TIMEOUT_SECONDS` | `600` | Maximum request duration |
+| `FACTORY_DROID_OPENAI_SESSION_INIT_TIMEOUT_SECONDS` | `60` | Session connect, initialize/load, and tool-safety cap; maximum `60` for `droid-sdk==0.1.2` |
 | `FACTORY_DROID_OPENAI_BODY_TIMEOUT_SECONDS` | `30` | Maximum time to receive a request body |
 | `FACTORY_DROID_OPENAI_MAX_CONCURRENCY` | `2` | Concurrent Droid subprocesses |
 | `FACTORY_DROID_OPENAI_WARM_SESSIONS` | `MAX_CONCURRENCY + 1` | Pre-started Droid sessions kept ready (`0` disables) |
