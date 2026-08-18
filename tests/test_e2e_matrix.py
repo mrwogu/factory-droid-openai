@@ -985,7 +985,14 @@ def test_artifact_labels_reject_mixed_rows_and_round_trip_unicode(
     e2e: ModuleType,
     tmp_path: Path,
 ) -> None:
-    rows = [e2e.row("m1", _scenario(e2e), _observation(e2e), label=" native Ż ")]
+    rows = [
+        e2e.row(
+            "m1",
+            _scenario(e2e),
+            _observation(e2e),
+            label=e2e.normalize_label(" native Ż "),
+        )
+    ]
     path = tmp_path / "unicode.jsonl"
     path.write_text(
         "\n".join(json.dumps(record, ensure_ascii=False) for record in rows) + "\n",
@@ -1004,6 +1011,37 @@ def test_artifact_labels_reject_mixed_rows_and_round_trip_unicode(
         e2e.artifact_label([*loaded, e2e.row("m2", _scenario(e2e), _observation(e2e))])
     assert "native Ż" in str(error.value)
     assert "unlabeled legacy artifact" in str(error.value)
+
+
+def test_artifact_labels_reject_a_writer_that_skipped_normalization(
+    e2e: ModuleType,
+    tmp_path: Path,
+) -> None:
+    """Rows are normalized once on write, so the read side has to check."""
+    path = tmp_path / "raw.jsonl"
+    row = e2e.row("m1", _scenario(e2e), _observation(e2e), label="native")
+    row["label"] = " native "
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    with pytest.raises(e2e.MatrixUsageError, match="not normalized"):
+        e2e.artifact_label(e2e.load_rows(path))
+
+    row["label"] = 7
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    with pytest.raises(e2e.MatrixUsageError, match="must be a string"):
+        e2e.artifact_label(e2e.load_rows(path))
+
+
+def test_load_rows_names_the_line_it_cannot_parse(e2e: ModuleType, tmp_path: Path) -> None:
+    path = tmp_path / "broken.jsonl"
+    path.write_text('{"model": "m1"}\nnot json\n', encoding="utf-8")
+
+    with pytest.raises(e2e.MatrixUsageError, match=r"broken\.jsonl:2 is not valid JSON"):
+        e2e.load_rows(path)
+
+    path.write_text("[1, 2]\n", encoding="utf-8")
+    with pytest.raises(e2e.MatrixUsageError, match=r"broken\.jsonl:1 is not a JSON object"):
+        e2e.load_rows(path)
 
 
 def test_artifact_labels_report_distinct_labels(e2e: ModuleType) -> None:

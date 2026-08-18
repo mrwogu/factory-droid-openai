@@ -25,7 +25,7 @@ import sys
 import time
 import unicodedata
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -48,6 +48,18 @@ except ImportError:
 DEFAULT_BASE_URL = "http://127.0.0.1:8787"
 _MAX_LABEL_LENGTH = 128
 RowCallback = Callable[[dict[str, Any]], None] | None
+
+
+class MatrixUsageError(ValueError):
+    """Bad invocation or bad artifact, as opposed to a run finding.
+
+    ``main`` turns this into exit code 2, so a misuse never reads as the
+    blocking failures ``run`` reports or the regressions ``compare`` reports.
+    It stays a ``ValueError`` so callers that only care about the value being
+    wrong keep working.
+    """
+
+
 _WEATHER_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
@@ -365,13 +377,13 @@ def normalize_label(value: str) -> str:
     """Trim and validate a label that identifies one matrix artifact."""
     label = value.strip()
     if not label:
-        raise ValueError("matrix label must not be empty")
+        raise MatrixUsageError("matrix label must not be empty")
     if any(char in "\n\r\u2028\u2029" for char in label):
-        raise ValueError("matrix label must not contain newlines or line separators")
+        raise MatrixUsageError("matrix label must not contain newlines or line separators")
     if any(unicodedata.category(char) == "Cc" for char in label):
-        raise ValueError("matrix label must not contain control characters")
+        raise MatrixUsageError("matrix label must not contain control characters")
     if len(label) > _MAX_LABEL_LENGTH:
-        raise ValueError(f"matrix label must be at most {_MAX_LABEL_LENGTH} characters")
+        raise MatrixUsageError(f"matrix label must be at most {_MAX_LABEL_LENGTH} characters")
     return label
 
 
@@ -767,7 +779,9 @@ def row(
         "detail": detail,
     }
     if label is not None:
-        record["label"] = normalize_label(label)
+        # Normalized once where the label enters the process; every reader
+        # checks it again through artifact_label.
+        record["label"] = label
     return record
 
 
@@ -943,14 +957,14 @@ def artifact_label(rows: list[dict[str, Any]]) -> str | None:
             labels.add(None)
             continue
         if not isinstance(raw, str):
-            raise ValueError(f"matrix row {index} label must be a string")
+            raise MatrixUsageError(f"matrix row {index} label must be a string")
         label = normalize_label(raw)
         if label != raw:
-            raise ValueError(f"matrix row {index} label is not normalized")
+            raise MatrixUsageError(f"matrix row {index} label is not normalized")
         labels.add(label)
     if len(labels) > 1:
         found = sorted(_display_label(label) for label in labels)
-        raise ValueError(f"matrix artifact contains mixed labels: {found}")
+        raise MatrixUsageError(f"matrix artifact contains mixed labels: {found}")
     return next(iter(labels), None)
 
 
@@ -962,7 +976,7 @@ def _validate_append_target(path: Path, label: str | None) -> None:
         return
     existing_label = artifact_label(rows)
     if existing_label != label:
-        raise ValueError(
+        raise MatrixUsageError(
             f"cannot append {_display_label(label)!r} run to "
             f"{_display_label(existing_label)!r} artifact"
         )
@@ -1001,6 +1015,10 @@ def _locked_output(path: Path, label: str | None) -> Iterator[Any]:
         finally:
             lock.seek(0)
             _msvcrt.locking(lock.fileno(), _msvcrt.LK_UNLCK, 1)
+    # A waiting run still holds this file open, and Windows refuses to unlink
+    # it then, so the leftover is swept on the run that finds it free.
+    with suppress(OSError):
+        lock_path.unlink()
 
 
 def render_report(rows: list[dict[str, Any]]) -> str:
@@ -1085,7 +1103,7 @@ def compare(
     before_label = artifact_label(before)
     after_label = artifact_label(after)
     if not allow_same_label and before_label is not None and before_label == after_label:
-        raise ValueError(f"cannot compare two artifacts labeled {before_label!r}")
+        raise MatrixUsageError(f"cannot compare two artifacts labeled {before_label!r}")
     left = {_key(record): record for record in before}
     right = {_key(record): record for record in after}
     regressions = []
@@ -1120,17 +1138,18 @@ def render_comparison(result: dict[str, Any]) -> str:
         f"- Before label: {_display_label(before_label)}",
         f"- After label: {_display_label(after_label)}",
         f"- Label transition: {_display_label(before_label)} -> {_display_label(after_label)}",
-        f"- Shared cases: {result['shared']}",
-        f"- Pass rate: {result['pass_rate_before']:.1%} -> {result['pass_rate_after']:.1%}",
-        f"- Regressions: {len(result['regressions'])}",
-        f"- Fixes: {len(result['fixes'])}",
-        "",
     ]
     if before_label is None or after_label is None:
-        lines.insert(
-            5,
-            "- Label identity is unavailable for at least one legacy artifact.",
-        )
+        lines.append("- Label identity is unavailable for at least one legacy artifact.")
+    lines.extend(
+        [
+            f"- Shared cases: {result['shared']}",
+            f"- Pass rate: {result['pass_rate_before']:.1%} -> {result['pass_rate_after']:.1%}",
+            f"- Regressions: {len(result['regressions'])}",
+            f"- Fixes: {len(result['fixes'])}",
+            "",
+        ]
+    )
     if result["regressions"]:
         lines.extend(["## Regressions", "", "| Case | Now | Detail |", "| --- | --- | --- |"])
         lines.extend(
@@ -1147,12 +1166,15 @@ def render_comparison(result: dict[str, Any]) -> str:
 
 def load_rows(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         if not line.strip():
             continue
-        record = json.loads(line)
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise MatrixUsageError(f"{path}:{number} is not valid JSON: {exc}") from exc
         if not isinstance(record, dict):
-            raise ValueError("matrix artifact rows must be JSON objects")
+            raise MatrixUsageError(f"{path}:{number} is not a JSON object")
         rows.append(record)
     return rows
 
@@ -1170,12 +1192,18 @@ class RunOptions:
     label: str | None = None
 
 
-async def _run(options: RunOptions) -> int:
+def run_locked(options: RunOptions) -> int:
+    """Take the output lock, then run the matrix under it.
+
+    The lock is taken outside the event loop because waiting for it blocks,
+    and it is held for the whole run so a second run cannot interleave rows
+    into the same artifact.
+    """
     out = options.out or Path("traces") / f"e2e-{datetime.now(UTC):%Y%m%dT%H%M%SZ}.jsonl"
     label = None if options.label is None else normalize_label(options.label)
     out.parent.mkdir(parents=True, exist_ok=True)
     with _locked_output(out, label) as handle:
-        return await _run_with_output(options, out, label, handle)
+        return asyncio.run(_run_with_output(options, out, label, handle))
 
 
 async def _run_with_output(
@@ -1282,8 +1310,8 @@ def main(argv: list[str] | None = None) -> int:
             out=args.out,
             label=args.label,
         )
-        return asyncio.run(_run(options))
-    except ValueError as exc:
+        return run_locked(options)
+    except MatrixUsageError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
