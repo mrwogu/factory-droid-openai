@@ -2013,6 +2013,14 @@ class NativeToolClient(FakeClient):
         timeout: float | None = None,
         request_id: str | None = None,
     ) -> dict[str, Any]:
+        if method == "droid.list_mcp_servers":
+            return {
+                "result": {
+                    "servers": [
+                        {"name": "openai-bridge", "status": "connected"},
+                    ]
+                }
+            }
         if method != "droid.list_tools":
             return await super().send_request(method, params, timeout, request_id)
         del request_id
@@ -2028,10 +2036,39 @@ class NativeToolClient(FakeClient):
                     # Droid keeps the deferred-tool loader callable whenever a
                     # session has a tool left to load.
                     {"id": "tool-search-cli", "currentlyAllowed": True},
-                    {"id": f"{MCP_TOOL_ID_PREFIX}get_weather", "currentlyAllowed": True},
+                    *(
+                        {
+                            "id": f"{MCP_TOOL_ID_PREFIX}{name}",
+                            "currentlyAllowed": True,
+                        }
+                        for name in ("get_weather", "write_file", "ping")
+                    ),
                 ]
             }
         }
+
+
+class PolicyBlockedNativeToolClient(FakeClient):
+    async def send_request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        timeout: float | None = None,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        if method == "droid.list_mcp_servers":
+            return {
+                "result": {
+                    "servers": [
+                        {
+                            "name": "openai-bridge",
+                            "status": "failed",
+                            "error": "blocked by organization mcpPolicy allowlist",
+                        }
+                    ]
+                }
+            }
+        return await super().send_request(method, params, timeout, request_id)
 
 
 def _native_binding() -> NativeToolBinding:
@@ -2078,8 +2115,30 @@ async def test_runner_publishes_client_tools_to_droid_over_mcp(tmp_path: Path) -
         {"name": "openai-bridge", "type": "http", "url": binding.url}
     ]
     settings = [params for method, params, _ in client.rpc_requests if "enabledToolIds" in params]
-    assert settings[0]["enabledToolIds"] == [f"{MCP_TOOL_ID_PREFIX}get_weather"]
+    assert settings[0]["enabledToolIds"] == [
+        f"{MCP_TOOL_ID_PREFIX}get_weather",
+        f"{MCP_TOOL_ID_PREFIX}ping",
+        f"{MCP_TOOL_ID_PREFIX}write_file",
+    ]
     assert settings[0]["disabledToolIds"] == ["exit-spec-mode", "read-cli", "tool-search-cli"]
+
+
+@pytest.mark.asyncio
+async def test_runner_maps_native_mcp_policy_rejection_to_503(tmp_path: Path) -> None:
+    client = PolicyBlockedNativeToolClient([])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    with pytest.raises(RunnerError, match=r"mcpPolicy.*127.0.0.1") as error:
+        await _collect(runner, _request(native_tools=_native_binding()))
+
+    assert error.value.status_code == 503
+    assert error.value.error_type == "factory_native_tool_unavailable"
+    assert client.prompt == ""
+    assert client.closed is True
 
 
 @pytest.mark.asyncio
