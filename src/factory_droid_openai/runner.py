@@ -72,6 +72,8 @@ _MODEL_DENIED_PATTERN = re.compile(
     r"|invalid model id)",
     re.IGNORECASE,
 )
+# Droid emits this generic message for a transient upstream connection blip.
+_TRANSIENT_CONNECTION_PATTERN = re.compile(r"connection error\.?", re.IGNORECASE)
 # Droid keeps two of its own meta tools callable whatever a session disables:
 # exit-spec-mode, and the loader that would fetch a deferred tool. Neither
 # touches the machine, and Droid refuses to run them in a session with every
@@ -987,6 +989,12 @@ def _error_event_failure(event: ErrorEvent, *, model: str | None) -> RunnerError
     denied = _model_denied_error(message, model=model)
     if denied is not None:
         return denied
+    if _TRANSIENT_CONNECTION_PATTERN.fullmatch(message.strip()):
+        return RunnerError(
+            message,
+            status_code=503,
+            error_type="factory_droid_unavailable",
+        )
     # The SDK labels error events with its own class names, such as "Error".
     # Forwarding those as OpenAI error types would put undocumented values in
     # the public contract, so the detail stays in the message instead.
