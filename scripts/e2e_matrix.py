@@ -949,7 +949,8 @@ def artifact_label(rows: list[dict[str, Any]]) -> str | None:
             raise ValueError(f"matrix row {index} label is not normalized")
         labels.add(label)
     if len(labels) > 1:
-        raise ValueError("matrix artifact contains mixed labeled and unlabeled rows")
+        found = sorted(_display_label(label) for label in labels)
+        raise ValueError(f"matrix artifact contains mixed labels: {found}")
     return next(iter(labels), None)
 
 
@@ -987,7 +988,12 @@ def _locked_output(path: Path, label: str | None) -> Iterator[Any]:
         lock.write(b"\0")
         lock.flush()
         lock.seek(0)
-        _msvcrt.locking(lock.fileno(), _msvcrt.LK_LOCK, 1)
+        while True:
+            try:
+                _msvcrt.locking(lock.fileno(), _msvcrt.LK_NBLCK, 1)
+                break
+            except OSError:
+                time.sleep(0.1)
         try:
             _validate_append_target(path, label)
             with path.open("a", encoding="utf-8") as handle:
@@ -1253,29 +1259,33 @@ def main(argv: list[str] | None = None) -> int:
     compare_parser.add_argument("--allow-same-label", action="store_true")
 
     args = parser.parse_args(argv)
-    if args.command == "report":
-        print(render_report(load_rows(args.path)), end="")
-        return 0
-    if args.command == "compare":
-        result = compare(
-            load_rows(args.before),
-            load_rows(args.after),
-            allow_same_label=args.allow_same_label,
+    try:
+        if args.command == "report":
+            print(render_report(load_rows(args.path)), end="")
+            return 0
+        if args.command == "compare":
+            result = compare(
+                load_rows(args.before),
+                load_rows(args.after),
+                allow_same_label=args.allow_same_label,
+            )
+            print(render_comparison(result), end="")
+            return 1 if result["regressions"] else 0
+        options = RunOptions(
+            base_url=args.base_url,
+            api_key=os.getenv("FACTORY_DROID_OPENAI_API_KEY"),
+            models=[value for value in args.models.split(",") if value],
+            concurrency=args.concurrency,
+            streaming=not args.no_stream,
+            switch_settle_seconds=args.switch_settle_seconds,
+            test_session_continuity=args.test_session_continuity,
+            out=args.out,
+            label=args.label,
         )
-        print(render_comparison(result), end="")
-        return 1 if result["regressions"] else 0
-    options = RunOptions(
-        base_url=args.base_url,
-        api_key=os.getenv("FACTORY_DROID_OPENAI_API_KEY"),
-        models=[value for value in args.models.split(",") if value],
-        concurrency=args.concurrency,
-        streaming=not args.no_stream,
-        switch_settle_seconds=args.switch_settle_seconds,
-        test_session_continuity=args.test_session_continuity,
-        out=args.out,
-        label=args.label,
-    )
-    return asyncio.run(_run(options))
+        return asyncio.run(_run(options))
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

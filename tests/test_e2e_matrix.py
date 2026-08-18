@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -999,8 +1000,88 @@ def test_artifact_labels_reject_mixed_rows_and_round_trip_unicode(
     empty = tmp_path / "empty.jsonl"
     empty.write_text(" \n\n", encoding="utf-8")
     e2e._validate_append_target(empty, "native")
-    with pytest.raises(ValueError, match="mixed"):
+    with pytest.raises(ValueError, match="mixed labels") as error:
         e2e.artifact_label([*loaded, e2e.row("m2", _scenario(e2e), _observation(e2e))])
+    assert "native Ż" in str(error.value)
+    assert "unlabeled legacy artifact" in str(error.value)
+
+
+def test_artifact_labels_report_distinct_labels(e2e: ModuleType) -> None:
+    rows = [
+        e2e.row("m1", _scenario(e2e), _observation(e2e), label="text"),
+        e2e.row("m2", _scenario(e2e), _observation(e2e), label="native"),
+    ]
+
+    with pytest.raises(ValueError, match="mixed labels") as error:
+        e2e.artifact_label(rows)
+
+    assert "native" in str(error.value)
+    assert "text" in str(error.value)
+
+
+def test_locked_output_waits_for_posix_lock(e2e: ModuleType, tmp_path: Path) -> None:
+    if e2e._fcntl is None:
+        pytest.skip("POSIX locking is unavailable")
+    path = tmp_path / "run.jsonl"
+    started = threading.Event()
+    acquired = threading.Event()
+    errors: list[BaseException] = []
+
+    def contend() -> None:
+        started.set()
+        try:
+            with e2e._locked_output(path, None):
+                acquired.set()
+        except BaseException as exc:
+            errors.append(exc)
+
+    with e2e._locked_output(path, None):
+        thread = threading.Thread(target=contend)
+        thread.start()
+        assert started.wait(1)
+        assert not acquired.wait(0.05)
+    thread.join(1)
+
+    assert not thread.is_alive()
+    assert not errors
+    assert acquired.is_set()
+
+
+def test_locked_output_retries_windows_lock(
+    e2e: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeMsvcrt:
+        LK_NBLCK = 1
+        LK_UNLCK = 2
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, int, int]] = []
+            self.attempts = 0
+
+        def locking(self, fd: int, mode: int, size: int) -> None:
+            self.calls.append((fd, mode, size))
+            if mode == self.LK_NBLCK and self.attempts == 0:
+                self.attempts += 1
+                raise OSError("locked")
+
+    fake_msvcrt = FakeMsvcrt()
+    sleeps: list[float] = []
+    monkeypatch.setattr(e2e, "_fcntl", None)
+    monkeypatch.setattr(e2e, "_msvcrt", fake_msvcrt)
+    monkeypatch.setattr(e2e.time, "sleep", sleeps.append)
+    path = tmp_path / "run.jsonl"
+
+    with e2e._locked_output(path, None):
+        pass
+
+    assert [mode for _, mode, _ in fake_msvcrt.calls] == [
+        fake_msvcrt.LK_NBLCK,
+        fake_msvcrt.LK_NBLCK,
+        fake_msvcrt.LK_UNLCK,
+    ]
+    assert sleeps == [0.1]
 
 
 def test_compare_renders_distinct_labels_and_allows_legacy_inputs(e2e: ModuleType) -> None:
@@ -1128,6 +1209,7 @@ def test_run_rejects_mismatched_append_before_network(
     e2e: ModuleType,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
     label_args: list[str],
 ) -> None:
     out = tmp_path / "run.jsonl"
@@ -1143,5 +1225,7 @@ def test_run_rejects_mismatched_append_before_network(
 
     monkeypatch.setattr(e2e.httpx, "AsyncClient", NoNetworkClient)
 
-    with pytest.raises(ValueError, match="cannot append"):
-        e2e.main(["run", *label_args, "--out", str(out)])
+    code = e2e.main(["run", *label_args, "--out", str(out)])
+
+    assert code == 2
+    assert "error: cannot append" in capsys.readouterr().err
