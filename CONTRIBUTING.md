@@ -98,6 +98,31 @@ uv run python scripts/e2e_matrix.py compare traces/run-a.jsonl traces/run-b.json
 `compare` exits non-zero on any pass to non-pass transition, which makes it the
 A/B tool for prompt and parser changes.
 
+The matrix talks to whatever bridge answers on `--base-url`, so comparing the
+two tool-calling paths means running it twice against two bridges that differ
+only in the flag:
+
+```bash
+export FACTORY_HOME_OVERRIDE="$PWD/traces/profile"
+env -u FACTORY_APPEND_SYSTEM_PROMPT uv run factory-droid-openai --port 8798 &
+FACTORY_DROID_OPENAI_NATIVE_TOOL_CALLS=true \
+  env -u FACTORY_APPEND_SYSTEM_PROMPT uv run factory-droid-openai --port 8799 &
+uv run python scripts/e2e_matrix.py run --base-url http://127.0.0.1:8798 --out traces/text.jsonl
+uv run python scripts/e2e_matrix.py run --base-url http://127.0.0.1:8799 --out traces/native.jsonl
+uv run python scripts/e2e_matrix.py compare traces/text.jsonl traces/native.jsonl
+```
+
+Native runs need the profile override. A tool-bearing request publishes an MCP
+server to Droid, which then waits for every other MCP server the profile
+configures, and one stuck on a login prompt exhausts the session-init timeout.
+Both bridges must run under the same profile, or the comparison measures the
+profile instead of the flag.
+
+Read the transitions, not the pass rates: a model that answers a tool contract
+in one path and not the other is the finding. `model_behavior` on the native
+path still means the model chose that, but a native run that reports a client
+tool as a Factory-native tool is a bridge defect in the prefix handling.
+
 Turn what a live run found into offline regression tests:
 
 ```bash
