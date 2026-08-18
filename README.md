@@ -340,8 +340,10 @@ put the native path ahead of the text path: no bridge defect on either, and
 fifteen tool contracts that the text path lost to unrecognized answers are met.
 Two caveats survive. A model may still call a tool again after the transcript
 already carries the result, because its session-side tool history is empty on
-every request, and a machine whose own MCP servers are slow to start eats into
-the session-init timeout for tool-bearing requests.
+every request. And a tool-bearing request waits for the machine's own MCP
+servers too, so one that is slow or stuck on a login prompt eats into Droid's
+session-init timeout; point `FACTORY_HOME_OVERRIDE` at a Droid profile without
+those servers to keep them out of the session.
 
 ## Requirements
 
