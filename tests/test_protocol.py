@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from factory_droid_openai import logs, protocol
+from factory_droid_openai import logs, protocol, strictjson
 from factory_droid_openai.dialects import (
     MARKER_DIALECTS,
     MAX_PACKED_CALLS,
@@ -31,7 +31,9 @@ from factory_droid_openai.protocol import (
 )
 from factory_droid_openai.strictjson import (
     DuplicateKeyError,
+    JsonNestingError,
     check_no_duplicate_keys,
+    raw_decode_strict,
 )
 
 
@@ -508,6 +510,34 @@ def test_strict_json_contains_excessive_nesting(depth: int) -> None:
 
     with pytest.raises(ValueError, match="nesting exceeds"):
         parse_strict_json(payload)
+
+
+def test_strict_json_wraps_decoder_recursion_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(*_args: object, **_kwargs: object) -> object:
+        raise RecursionError("decoder recursion")
+
+    monkeypatch.setattr(json, "loads", fail)
+
+    with pytest.raises(JsonNestingError, match="nesting exceeds") as error:
+        parse_strict_json("{}")
+
+    assert isinstance(error.value.__cause__, RecursionError)
+
+
+def test_raw_decode_strict_wraps_decoder_recursion_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(_text: str, _index: int = 0) -> tuple[Any, int]:
+        raise RecursionError("decoder recursion")
+
+    monkeypatch.setattr(strictjson._STRICT_DECODER, "raw_decode", fail)
+
+    with pytest.raises(JsonNestingError, match="nesting exceeds") as error:
+        raw_decode_strict("{}", 0)
+
+    assert isinstance(error.value.__cause__, RecursionError)
 
 
 @pytest.mark.parametrize(
