@@ -93,6 +93,8 @@ class FakeRunner:
 
     async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
         self.requests.append(request)
+        if request.warm_session is not None:
+            request.warm_session.consumed = True
         try:
             if self.error is not None:
                 raise self.error
@@ -4071,7 +4073,13 @@ class WarmingRunner(FakeRunner):
         self.warmed: list[SessionKey] = []
         self.discarded: list[WarmSession] = []
 
-    async def warm(self, key: SessionKey, *, timeout_seconds: float) -> WarmSession:
+    async def warm(
+        self,
+        key: SessionKey,
+        *,
+        timeout_seconds: float,
+        native_tools: Any = None,
+    ) -> WarmSession:
         del timeout_seconds
         self.warmed.append(key)
         return WarmSession(
@@ -4080,6 +4088,7 @@ class WarmingRunner(FakeRunner):
             transport=None,
             session_id="session-1",
             created_at=asyncio.get_running_loop().time(),
+            native_binding=native_tools,
         )
 
     async def discard(self, session: WarmSession) -> None:
@@ -4845,7 +4854,7 @@ async def test_native_tool_calls_reuse_a_catalog_matched_warm_session(tmp_path: 
         native_tool_calls=True,
         max_concurrency=1,
         warm_sessions=1,
-        max_tracked_sessions=1,
+        max_tracked_sessions=2,
         telemetry=False,
     )
     app = create_app(
@@ -4887,11 +4896,13 @@ async def test_native_tool_calls_reuse_a_catalog_matched_warm_session(tmp_path: 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("consumed", [False, True])
 async def test_native_tool_calls_reject_a_warm_session_without_its_binding(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    consumed: bool,
 ) -> None:
-    runner = FakeRunner([RunComplete(Usage())])
+    runner = WarmingRunner()
     app = create_app(
         _native_settings(tmp_path),
         runner_factory=cast("RunnerFactory", lambda: runner),
@@ -4902,6 +4913,7 @@ async def test_native_tool_calls_reject_a_warm_session_without_its_binding(
         transport=None,
         session_id="invalid-native-warm",
         created_at=asyncio.get_running_loop().time(),
+        consumed=consumed,
     )
     monkeypatch.setattr(
         app.state.pool,
@@ -4913,6 +4925,8 @@ async def test_native_tool_calls_reject_a_warm_session_without_its_binding(
         async with _client(app) as client:
             await client.post("/v1/chat/completions", json=_weather_payload())
 
+    await app.state.reaper.drain()
+    assert runner.discarded == ([] if consumed else [warm])
     assert len(app.state.native_tools) == 0
 
 

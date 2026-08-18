@@ -1400,6 +1400,14 @@ def create_app(
                 metrics.record_features(("warm_session",))
                 run_request = replace(run_request, warm_session=warm_session)
 
+        def release_native_tools() -> None:
+            if native_binding is not None:
+                native_tools.close(native_binding.token)
+
+        def discard_unused_warm_session() -> None:
+            if warm_session is not None and not warm_session.consumed:
+                reaper.submit(resolved_runner_factory().discard(warm_session))
+
         if native_catalog is not None:
             try:
                 if warm_session is not None:
@@ -1409,11 +1417,15 @@ def create_app(
                 else:
                     native_binding = native_tools.open_catalog(native_catalog)
             except BaseException:
+                discard_unused_warm_session()
                 try:
                     await lease.release()
                 finally:
-                    if session_use is not None:
-                        session_use.release()
+                    try:
+                        if session_use is not None:
+                            session_use.release()
+                    finally:
+                        release_native_tools()
                 raise
             run_request = replace(run_request, native_tools=native_binding)
             log_debug(
@@ -1421,10 +1433,6 @@ def create_app(
                 tools=len(plan.native_tools or ()),
                 open_catalogs=len(native_tools),
             )
-
-        def release_native_tools() -> None:
-            if native_binding is not None:
-                native_tools.close(native_binding.token)
 
         def record_repair(
             event: str,
@@ -1567,10 +1575,13 @@ def create_app(
             return _error_response(str(exc), exc.status_code, exc.error_type)
         finally:
             try:
-                if session_use is not None:
-                    session_use.release()
+                discard_unused_warm_session()
             finally:
-                release_native_tools()
+                try:
+                    if session_use is not None:
+                        session_use.release()
+                finally:
+                    release_native_tools()
 
         log_info(
             "chat.completed",

@@ -55,6 +55,8 @@ _ENVIRONMENT_KEYS = (
     "FACTORY_DROID_OPENAI_WARM_SESSION_TTL_SECONDS",
     "FACTORY_DROID_OPENAI_DETACHED_CLEANUP",
     "FACTORY_DROID_OPENAI_REPAIR_LOST_PREFIX",
+    "FACTORY_DROID_OPENAI_NATIVE_TOOL_CALLS",
+    "FACTORY_DROID_OPENAI_NATIVE_TOOL_CALL_URL",
     "FACTORY_DROID_OPENAI_TELEMETRY",
     "FACTORY_DROID_OPENAI_TRACE_PAYLOADS",
     "FACTORY_DROID_OPENAI_TRACE_FILE",
@@ -180,6 +182,35 @@ def test_warm_session_count_tracks_max_concurrency_unless_set(
 
     monkeypatch.setenv("FACTORY_DROID_OPENAI_WARM_SESSIONS", "5")
     assert Settings.from_env().warm_session_count() == 5
+
+
+def test_settings_reserve_native_catalog_capacity_for_warm_sessions(tmp_path: Path) -> None:
+    with pytest.raises(
+        ValueError,
+        match="max_tracked_sessions must be greater than warm sessions",
+    ):
+        Settings(
+            workdir=tmp_path,
+            native_tool_calls=True,
+            warm_sessions=1,
+            max_tracked_sessions=1,
+        )
+
+    enabled = Settings(
+        workdir=tmp_path,
+        native_tool_calls=True,
+        warm_sessions=1,
+        max_tracked_sessions=2,
+    )
+    assert enabled.native_tool_calls is True
+
+    disabled_pool = Settings(
+        workdir=tmp_path,
+        native_tool_calls=True,
+        warm_sessions=0,
+        max_tracked_sessions=1,
+    )
+    assert disabled_pool.warm_session_count() == 0
 
 
 def test_settings_from_env_reads_pool_overrides(

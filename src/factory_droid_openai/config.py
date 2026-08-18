@@ -104,6 +104,12 @@ class Settings:
                 "session_init_timeout_seconds must be at most "
                 f"{MAX_SESSION_INIT_TIMEOUT_SECONDS:g} seconds"
             )
+        warm_count = self.warm_session_count()
+        if self.native_tool_calls and warm_count > 0 and self.max_tracked_sessions <= warm_count:
+            raise ValueError(
+                "max_tracked_sessions must be greater than warm sessions "
+                "when native_tool_calls is enabled"
+            )
         # The warm pool keys sessions by this value, so it has to match the
         # normalized effort the request path sends to Droid, and a bad value
         # has to fail at construction instead of on every request.

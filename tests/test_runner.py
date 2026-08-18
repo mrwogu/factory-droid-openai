@@ -2383,6 +2383,10 @@ async def test_runner_rejects_a_warm_session_with_a_different_native_catalog(
         async for _ in runner.run(_request(native_tools=second, warm_session=warm)):
             pass
 
+    assert warm.consumed is False
+    assert client.rpc_requests == []
+    assert client.closed is False
+
 
 @pytest.mark.asyncio
 async def test_runner_accepts_a_published_tool_reported_under_its_bare_name(

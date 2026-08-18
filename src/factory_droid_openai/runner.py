@@ -516,19 +516,10 @@ class DroidRunner:
         started = loop.time()
         warm = request.warm_session
         if warm is not None:
-            warm.consumed = True
-            client, transport = warm.client, warm.transport
-        else:
-            client, transport = self._new_client()
-            client.set_permission_handler(lambda _params: "cancel")
-            client.set_ask_user_handler(
-                lambda _params: {"cancelled": True, "answers": []},
+            warm_catalog = None if warm.native_binding is None else warm.native_binding.catalog
+            requested_catalog = (
+                None if request.native_tools is None else request.native_tools.catalog
             )
-        warm_catalog = (
-            None if warm is None or warm.native_binding is None else warm.native_binding.catalog
-        )
-        requested_catalog = None if request.native_tools is None else request.native_tools.catalog
-        if warm is not None:
             warm_has_native = warm.native_binding is not None
             request_has_native = request.native_tools is not None
             if warm_has_native != request_has_native or (
@@ -537,6 +528,14 @@ class DroidRunner:
                 raise RunnerError(
                     "A warm Droid session cannot serve a different native tool catalog.",
                 )
+            warm.consumed = True
+            client, transport = warm.client, warm.transport
+        else:
+            client, transport = self._new_client()
+            client.set_permission_handler(lambda _params: "cancel")
+            client.set_ask_user_handler(
+                lambda _params: {"cancelled": True, "answers": []},
+            )
         mcp_servers = [] if request.native_tools is None else [request.native_tools.server_config()]
         initialized = warm is not None
         completed = False
