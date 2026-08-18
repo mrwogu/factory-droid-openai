@@ -34,6 +34,7 @@ from droid_sdk.schemas.enums import (
 )
 
 from factory_droid_openai import runner as runner_module
+from factory_droid_openai.droid_rpc import NativeToolUnavailableError
 from factory_droid_openai.mcp_tools import (
     MCP_TOOL_ID_PREFIX,
     MCP_TOOL_PREFIX,
@@ -1496,6 +1497,29 @@ async def test_runner_warms_a_session_with_native_tools_enabled(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_runner_verifies_the_catalog_before_a_native_session_goes_warm(
+    tmp_path: Path,
+) -> None:
+    # A session that reaches the pool unverified would serve a native turn with
+    # no tools at all, since the request path trusts a warm session.
+    client = PolicyBlockedNativeToolClient([])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    with pytest.raises(NativeToolUnavailableError, match=r"mcpPolicy.*127.0.0.1"):
+        await runner.warm(
+            SessionKey(model_id=None, reasoning_effort=None),
+            timeout_seconds=1.0,
+            native_tools=_native_binding(),
+        )
+
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
 async def test_runner_warm_closes_the_session_when_startup_fails(tmp_path: Path) -> None:
     class FailingClient(FakeClient):
         async def initialize_session(self, **kwargs: Any) -> None:
@@ -2095,10 +2119,12 @@ class PolicyBlockedNativeToolClient(FakeClient):
 
 
 def _native_binding() -> NativeToolBinding:
-    return NativeToolBinding(
-        token="tok",
-        url="http://127.0.0.1:8787/factory/mcp/tok",
-        names=frozenset({"get_weather", "write_file", "ping"}),
+    return NativeToolRegistry(base_url="http://127.0.0.1:8787").open(
+        (
+            {"name": "get_weather", "inputSchema": {"type": "object"}},
+            {"name": "write_file", "inputSchema": {"type": "object"}},
+            {"name": "ping", "inputSchema": {"type": "object"}},
+        )
     )
 
 
@@ -2331,7 +2357,11 @@ async def test_runner_refuses_a_warm_session_for_a_native_turn(tmp_path: Path) -
 
 @pytest.mark.asyncio
 async def test_runner_accepts_a_warm_session_with_the_same_native_catalog(tmp_path: Path) -> None:
-    binding = _native_binding()
+    # Two real bindings for the same tools: the catalog decides, not the token.
+    registry = NativeToolRegistry(base_url="http://127.0.0.1:8787")
+    tools = ({"name": "get_weather", "inputSchema": {"type": "object"}},)
+    warmed = registry.open(tools)
+    requested = registry.open(tools)
     client = NativeToolClient([TurnComplete()])
     runner = DroidRunner(
         droid_path="droid",
@@ -2344,13 +2374,14 @@ async def test_runner_accepts_a_warm_session_with_the_same_native_catalog(tmp_pa
         transport=None,
         session_id="session-1",
         created_at=0.0,
-        native_binding=binding,
+        native_binding=warmed,
     )
 
     events = [
-        event async for event in runner.run(_request(native_tools=binding, warm_session=warm))
+        event async for event in runner.run(_request(native_tools=requested, warm_session=warm))
     ]
 
+    assert warmed.token != requested.token
     assert events == [
         SessionStarted("session-1"),
         RunComplete(usage=Usage()),

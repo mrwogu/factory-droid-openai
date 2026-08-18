@@ -1,7 +1,7 @@
 import asyncio
 import contextlib
 from collections import defaultdict, deque
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -89,6 +89,14 @@ class _WarmDemand:
     catalog: NativeToolCatalog | None = None
 
 
+def _share(demands: Sequence[_WarmDemand], size: int) -> dict[_WarmDemand, int]:
+    """Hand ``size`` sessions to ``demands``, most recent first."""
+    if not demands:
+        return {}
+    base, extra = divmod(size, len(demands))
+    return {demand: base + (1 if index < extra else 0) for index, demand in enumerate(demands)}
+
+
 class WarmSessionPool:
     """Keeps initialized Droid sessions ready so requests skip session startup.
 
@@ -126,7 +134,6 @@ class WarmSessionPool:
         self._native_sessions: dict[_WarmDemand, deque[WarmSession]] = defaultdict(deque)
         self._wanted: list[SessionKey] = []
         self._native_wanted: list[_WarmDemand] = []
-        self._demand_order: list[_WarmDemand] = []
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
@@ -158,34 +165,25 @@ class WarmSessionPool:
         self._native_sessions.clear()
         self._wanted.clear()
         self._native_wanted.clear()
-        self._demand_order.clear()
         self._publish()
         for session in sessions:
             self._reaper.submit(self._discard_session(session))
 
     def note(self, key: SessionKey, catalog: NativeToolCatalog | None = None) -> None:
         demand = _WarmDemand(key, catalog)
-        if demand in self._demand_order:
-            self._demand_order.remove(demand)
-        self._demand_order.insert(0, demand)
         if catalog is None:
             if key in self._wanted:
                 self._wanted.remove(key)
             self._wanted.insert(0, key)
-            stale_keys = self._wanted[self._max_keys :]
-            for stale_key in stale_keys:
-                stale_demand = _WarmDemand(stale_key)
-                self._drop_demand(stale_demand)
-                self._demand_order.remove(stale_demand)
+            for stale_key in self._wanted[self._max_keys :]:
+                self._drop_demand(_WarmDemand(stale_key))
             del self._wanted[self._max_keys :]
         else:
             if demand in self._native_wanted:
                 self._native_wanted.remove(demand)
             self._native_wanted.insert(0, demand)
-            stale_demands = self._native_wanted[self._max_keys :]
-            for stale_demand in stale_demands:
+            for stale_demand in self._native_wanted[self._max_keys :]:
                 self._drop_demand(stale_demand)
-                self._demand_order.remove(stale_demand)
             del self._native_wanted[self._max_keys :]
         self._wake.set()
 
@@ -335,19 +333,22 @@ class WarmSessionPool:
                 self._wanted.remove(demand.key)
         elif demand in self._native_wanted:
             self._native_wanted.remove(demand)
-        if demand in self._demand_order:
-            self._demand_order.remove(demand)
         self._drop_demand(demand)
 
     def _targets(self) -> dict[_WarmDemand, int]:
-        """Split the pool size across the keys traffic is currently using."""
-        if not self._demand_order:
-            return {}
-        base, extra = divmod(self._size, len(self._demand_order))
-        return {
-            demand: base + (1 if index < extra else 0)
-            for index, demand in enumerate(self._demand_order)
-        }
+        """Split the pool size across the demands traffic is currently using.
+
+        Text and native demands draw on separate halves of the pool. Sharing
+        one budget let a client that rotates tool catalogs multiply the demand
+        count until the plain text keys landed on a target of zero, and the
+        next rebalance then discarded a live session the same traffic needed.
+        """
+        text = [_WarmDemand(key) for key in self._wanted]
+        native = list(self._native_wanted)
+        if not text or not native:
+            return _share(text or native, self._size)
+        native_size = self._size // 2
+        return _share(text, self._size - native_size) | _share(native, native_size)
 
     def _deficits(self) -> list[_WarmDemand]:
         deficits: list[_WarmDemand] = []

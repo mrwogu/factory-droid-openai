@@ -325,17 +325,32 @@ What changes with the flag on:
   in the prompt, because each request runs in a fresh Droid session.
 - No dialect has to be recognized, because no tool call is written as text.
   The dialect table above still applies to the default path.
-- A tool-bearing request no longer uses a warm session, because Droid attaches
-  MCP servers only when a session starts. Requests without tools still do.
+- A tool-bearing request reuses a warm session only when that session was
+  started for the same tool catalog, because Droid attaches MCP servers when a
+  session starts and the published catalog cannot change afterwards. The pool
+  therefore keys native sessions by the catalog itself; the first request for a
+  new catalog pays full session startup, and repeat requests with the same tools
+  hit the pool like any text request. Native and text demands draw on separate
+  halves of the pool, so rotating catalogs cannot starve the text keys.
 - Droid's own tools stay disabled, apart from the deferred-tool loader the
   model needs to reach the published tools at all.
 - The bridge refuses every published call at Droid's permission gate. The
   OpenAI client runs the tool and resubmits the result, as it always has.
 
-The endpoint lives at `/factory/mcp/{token}` with a single-use token per
-request, and it is mounted only while the flag is on. Droid reaches it at
-`http://127.0.0.1:<port>`; set `FACTORY_DROID_OPENAI_NATIVE_TOOL_CALL_URL`
-when the bridge answers on a different address than it binds.
+The endpoint lives at `/factory/mcp/{token}` and is mounted only while the flag
+is on. Droid reaches it at `http://127.0.0.1:<port>`; set
+`FACTORY_DROID_OPENAI_NATIVE_TOOL_CALL_URL` when the bridge answers on a
+different address than it binds.
+
+The token in the path is the endpoint's only credential, because the API-key
+dependency would have to be handed to Droid to be useful. What that buys an
+attacker who already reaches the bind address is the tool schemas of one
+catalog: the endpoint serves `tools/list`, holds no conversation state, refuses
+every `tools/call`, and never receives a tool result, since the OpenAI client
+executes the tools. What it costs is a longer-lived secret than the default
+path has, because a warm session keeps its token for its whole warm life
+instead of one request. Bind the bridge to loopback, or to an address only
+trusted callers reach, whenever the flag is on.
 
 Enterprise-managed `mcpPolicy` settings must allow the MCP server hostname.
 For the default endpoint, the managed settings need an entry equivalent to:
@@ -350,18 +365,26 @@ For the default endpoint, the managed settings need an entry equivalent to:
 ```
 
 If `FACTORY_DROID_OPENAI_NATIVE_TOOL_CALL_URL` is set, allow its hostname
-instead. The bridge checks that `openai-bridge` connects and that its exact
-request tool catalog is available before sending the prompt. A policy
-rejection fails closed as `factory_native_tool_unavailable` with HTTP `503`.
+instead. Before sending a prompt, the bridge checks that `openai-bridge`
+connected and that the session publishes exactly this request's tool catalog;
+a pooled session is checked the same way when it is warmed. A policy rejection
+fails closed as `factory_native_tool_unavailable` with HTTP `503`, and so does
+a catalog the bridge cannot publish at all. A policy change while a session sits
+warm is caught by the next request that has to warm one.
 Confirm the final managed-settings shape with your Factory administrator.
+
+`FACTORY_DROID_OPENAI_MAX_TRACKED_SESSIONS` also bounds how many tool catalogs
+the endpoint holds, so with the flag on it must be at least the warm session
+count plus `FACTORY_DROID_OPENAI_MAX_CONCURRENCY`; the bridge refuses to start
+otherwise.
 
 Whether the flag is worth it depends on the model. It pays off for a model that
 misses tool contracts on the text path: one that ignores `tool_choice=required`,
 answers in prose instead of calling a tool, or writes a call the parser has to
-guess at. A model that already satisfies those contracts gains nothing and pays
-about two seconds more per tool turn, since a tool-bearing request cannot reuse
-a warm session. `CONTRIBUTING.md` describes how to measure both paths against
-the models you actually use.
+guess at. A model that already satisfies those contracts gains nothing, and pays
+full session startup on every request whose toolset the pool has not warmed yet.
+`CONTRIBUTING.md` describes how to measure both paths against the models you
+actually use.
 
 Two caveats survive. A model may still call a tool again after the transcript
 already carries the result, because its session-side tool history is empty on

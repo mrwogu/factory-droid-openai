@@ -11,6 +11,7 @@ from factory_droid_openai.mcp_tools import (
     MCP_PROTOCOL_VERSION,
     MCP_ROUTE_PREFIX,
     MCP_SERVER_NAME,
+    NativeCatalogUnavailableError,
     NativeToolCatalog,
     NativeToolRegistry,
     build_router,
@@ -81,7 +82,6 @@ def test_registry_forgets_a_closed_catalog() -> None:
     binding = registry.open(_catalog())
 
     registry.pin("missing")
-    registry.unpin("missing")
     registry.close(binding.token)
     registry.close(binding.token)
 
@@ -134,10 +134,22 @@ def test_catalog_identity_includes_order_and_every_descriptor_field() -> None:
 
     assert isinstance(first, NativeToolCatalog)
     assert first == same
-    assert first.fingerprint == same.fingerprint
+    assert hash(first) == hash(same)
     assert first != changed
-    assert first.fingerprint != changed.fingerprint
     assert first.names == frozenset({"a", "b"})
+
+
+def test_catalog_serves_the_tools_in_the_order_the_client_sent_them() -> None:
+    """The serialization is what the model reads, so it must not be re-keyed."""
+    registry = _registry()
+    schema = {"type": "object", "properties": {"zone": {"type": "string"}, "city": {}}}
+
+    binding = registry.open(({"inputSchema": schema, "name": "get_weather"},))
+
+    served = registry.catalog(binding.token)
+    assert served is not None
+    assert list(served[0]) == ["inputSchema", "name"]
+    assert list(served[0]["inputSchema"]["properties"]) == ["zone", "city"]
 
 
 def test_catalog_tools_are_fresh_copies() -> None:
@@ -150,9 +162,9 @@ def test_catalog_tools_are_fresh_copies() -> None:
 
 
 def test_catalog_rejects_malformed_serialized_tools() -> None:
-    catalog = NativeToolCatalog(serialized="{}", fingerprint="", names=frozenset())
+    catalog = NativeToolCatalog(serialized="{}", names=frozenset())
 
-    with pytest.raises(RuntimeError, match="serialization is malformed"):
+    with pytest.raises(NativeCatalogUnavailableError, match="serialization is malformed"):
         _ = catalog.tools
 
 
@@ -162,11 +174,11 @@ def test_catalog_identity_rejects_malformed_serialization(
     module = cast("Any", mcp_tools)
     monkeypatch.setattr(module.__dict__["json"], "loads", lambda _serialized: {})
 
-    with pytest.raises(RuntimeError, match="serialization is malformed"):
+    with pytest.raises(NativeCatalogUnavailableError, match="serialization is malformed"):
         _registry().catalog_identity(())
 
 
-def test_pinned_catalogs_survive_eviction_until_unpinned() -> None:
+def test_pinned_catalogs_survive_eviction_until_closed() -> None:
     registry = _registry(max_sessions=2)
     first = registry.open(_catalog())
     second = registry.open(())
@@ -178,7 +190,7 @@ def test_pinned_catalogs_survive_eviction_until_unpinned() -> None:
     assert registry.catalog(second.token) is None
     assert registry.catalog(third.token) is not None
 
-    registry.unpin(first.token)
+    registry.close(first.token)
     fourth = registry.open(({"name": "fourth", "inputSchema": {}},))
     assert registry.catalog(first.token) is None
     assert registry.catalog(fourth.token) is not None
@@ -189,7 +201,7 @@ def test_registry_rejects_opening_when_all_catalogs_are_pinned() -> None:
     first = registry.open(_catalog())
     registry.pin(first.token)
 
-    with pytest.raises(RuntimeError, match="capacity is exhausted"):
+    with pytest.raises(NativeCatalogUnavailableError, match="capacity is exhausted"):
         registry.open(())
 
 

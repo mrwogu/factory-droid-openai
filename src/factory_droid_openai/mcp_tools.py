@@ -7,20 +7,20 @@ Droid as an MCP server, so Droid renders them through the model's own tool slot
 and reports each call as a structured event. Nothing has to be parsed out of
 free text.
 
-The endpoint holds no conversation state. A single-use token in the URL binds
-one MCP server to one chat completion, and the tool catalog is all the endpoint
+The endpoint holds no conversation state. An unguessable token in the URL binds
+one MCP server to one Droid session, and the tool catalog is all the endpoint
 serves: the OpenAI client, never the bridge, executes the tools, so a call is
 answered with a refusal and the bridge reads the call itself off the session's
-events instead.
+events instead. A pooled warm session keeps its token for as long as it is
+warm, so the token outlives the request that created it.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import secrets
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final
 
 from fastapi import APIRouter, Request, Response
@@ -52,20 +52,29 @@ _METHOD_NOT_FOUND: Final = -32601
 _INVALID_REQUEST: Final = -32600
 
 
+class NativeCatalogUnavailableError(RuntimeError):
+    """A request's tool catalog cannot be published to Droid."""
+
+
 @dataclass(frozen=True, slots=True)
 class NativeToolCatalog:
-    """Immutable identity and payload for one ordered MCP catalog."""
+    """Immutable identity and payload for one ordered MCP catalog.
+
+    ``serialized`` keeps the tools exactly as the client sent them, key order
+    included, because it is both what the model is shown and what decides
+    whether a warm session already publishes this catalog. Sorting keys here
+    would reorder the JSON Schema the model reads.
+    """
 
     serialized: str
-    fingerprint: str
-    names: frozenset[str]
+    names: frozenset[str] = field(compare=False)
 
     @property
     def tools(self) -> tuple[dict[str, Any], ...]:
         """Return a fresh catalog copy for an SDK or HTTP response."""
         decoded = json.loads(self.serialized)
         if not isinstance(decoded, list) or not all(isinstance(item, dict) for item in decoded):
-            raise RuntimeError("native tool catalog serialization is malformed")
+            raise NativeCatalogUnavailableError("native tool catalog serialization is malformed")
         return tuple(decoded)
 
 
@@ -76,7 +85,9 @@ class NativeToolBinding:
     token: str
     url: str
     names: frozenset[str]
-    catalog: NativeToolCatalog | None = None
+    # Required, so that "no catalog" can never read as "matches any catalog"
+    # when a warm session is offered to a request.
+    catalog: NativeToolCatalog
 
     def server_config(self) -> dict[str, Any]:
         """Render the MCP server entry Droid's session initializer expects."""
@@ -99,7 +110,13 @@ class NativeToolBinding:
 
 
 class NativeToolRegistry:
-    """Tool catalogs of in-flight requests, keyed by single-use token."""
+    """Tool catalogs Droid may fetch, keyed by an unguessable token.
+
+    A token lives as long as the session that was told about it. For a
+    per-request session that is the request; for a pooled warm session it is
+    the whole warm lifetime, so a token is not single-use. Pinned tokens
+    belong to warm sessions and are never evicted.
+    """
 
     def __init__(self, *, base_url: str, max_sessions: int = 256) -> None:
         self._base_url = base_url.rstrip("/")
@@ -120,7 +137,7 @@ class NativeToolRegistry:
         token = secrets.token_urlsafe(24)
         self._evict_unpinned()
         if len(self._catalogs) >= self._max_sessions:
-            raise RuntimeError("native tool catalog capacity is exhausted")
+            raise NativeCatalogUnavailableError("native tool catalog capacity is exhausted")
         self._catalogs[token] = catalog
         return NativeToolBinding(
             token=token,
@@ -137,9 +154,6 @@ class NativeToolRegistry:
         if token in self._catalogs:
             self._pinned.add(token)
 
-    def unpin(self, token: str) -> None:
-        self._pinned.discard(token)
-
     def catalog(self, token: str) -> tuple[dict[str, Any], ...] | None:
         catalog = self._catalogs.get(token)
         return None if catalog is None else catalog.tools
@@ -148,6 +162,13 @@ class NativeToolRegistry:
         return len(self._catalogs)
 
     def _evict_unpinned(self) -> None:
+        """Reclaim the oldest unpinned tokens to make room for a new one.
+
+        An unpinned token belongs to a request that is still running, so this
+        is a leak guard, not a capacity plan: ``validate_config`` sizes the
+        registry to hold every warm session plus every admitted request at
+        once, which leaves nothing to reclaim unless a token was orphaned.
+        """
         while len(self._catalogs) >= self._max_sessions:
             token = next((token for token in self._catalogs if token not in self._pinned), None)
             if token is None:
@@ -160,18 +181,13 @@ def _catalog(tools: Sequence[Mapping[str, Any]]) -> NativeToolCatalog:
         [dict(tool) for tool in tools],
         ensure_ascii=False,
         allow_nan=False,
-        sort_keys=True,
         separators=(",", ":"),
     )
     decoded = json.loads(serialized)
     if not isinstance(decoded, list) or not all(isinstance(item, dict) for item in decoded):
-        raise RuntimeError("native tool catalog serialization is malformed")
+        raise NativeCatalogUnavailableError("native tool catalog serialization is malformed")
     names = frozenset(str(tool["name"]) for tool in decoded)
-    return NativeToolCatalog(
-        serialized=serialized,
-        fingerprint=hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
-        names=names,
-    )
+    return NativeToolCatalog(serialized=serialized, names=names)
 
 
 def to_mcp_tools(tools: Iterable[Any]) -> tuple[dict[str, Any], ...]:

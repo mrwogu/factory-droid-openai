@@ -298,6 +298,41 @@ async def test_pool_misses_when_native_catalog_changes() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pool_keeps_a_text_session_while_native_catalogs_rotate() -> None:
+    """A rotating catalog must not push a live text key to a target of zero."""
+    log: list[str] = []
+    registry = NativeToolRegistry(base_url="http://127.0.0.1:8787")
+    pool = _pool(FakeRunner(log=log), size=3, max_keys=2, native_registry=registry)
+    warmed = asyncio.get_running_loop().time()
+    pool.note(KEY)
+    pool.offer(_session(KEY, created_at=warmed))
+    pool.note(OTHER_KEY)
+    pool.offer(_session(OTHER_KEY, created_at=warmed))
+    catalogs = [_native_catalog(registry, name) for name in ("first", "second")]
+    for catalog in catalogs:
+        pool.note(KEY, catalog)
+        pool.offer(
+            _session(
+                KEY,
+                created_at=warmed,
+                native_binding=registry.open_catalog(catalog),
+            )
+        )
+
+    # Four demands over a pool of three: the text half still funds both keys,
+    # and only the rotated-away catalog loses its session.
+    pool._rebalance()
+    await asyncio.sleep(0)
+
+    assert pool.acquire(KEY) is not None
+    assert pool.acquire(OTHER_KEY) is not None
+    assert pool.acquire(KEY, catalogs[1]) is not None
+    assert pool.acquire(KEY, catalogs[0]) is None
+    assert log == ["discard:model-a"]
+    await pool.aclose()
+
+
+@pytest.mark.asyncio
 async def test_pool_drops_stale_native_demand() -> None:
     log: list[str] = []
     registry = NativeToolRegistry(base_url="http://127.0.0.1:8787")
@@ -403,8 +438,14 @@ async def test_pool_drops_a_key_after_session_init_timeout() -> None:
             super().__init__()
             self.attempts = 0
 
-        async def warm(self, key: SessionKey, *, timeout_seconds: float) -> WarmSession:
-            del key, timeout_seconds
+        async def warm(
+            self,
+            key: SessionKey,
+            *,
+            timeout_seconds: float,
+            native_tools: NativeToolBinding | None = None,
+        ) -> WarmSession:
+            del key, timeout_seconds, native_tools
             self.attempts += 1
             raise RunnerError(
                 "Factory Droid session initialization timed out after 0.1 seconds.",

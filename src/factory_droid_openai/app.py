@@ -28,6 +28,7 @@ from factory_droid_openai.logs import debug as log_debug
 from factory_droid_openai.logs import info as log_info
 from factory_droid_openai.logs import warning as log_warning
 from factory_droid_openai.mcp_tools import (
+    NativeCatalogUnavailableError,
     NativeToolBinding,
     NativeToolRegistry,
     build_router,
@@ -840,8 +841,10 @@ def create_app(
     application.state.native_tools = native_tools
     if resolved_settings.native_tool_calls:
         # The token in each path is the credential, so the endpoint carries no
-        # API-key dependency: only the Droid process this bridge started is
-        # ever told the URL.
+        # API-key dependency: it is told to a Droid process this bridge
+        # started, and holding it only reveals that request's tool schemas. A
+        # warm session keeps its token for its whole warm life, so anything
+        # that can reach the bind address should be treated as trusted.
         application.include_router(build_router(native_tools))
 
     async def require_auth(credentials: BearerCredentials) -> None:
@@ -1413,10 +1416,12 @@ def create_app(
                 if warm_session is not None:
                     native_binding = warm_session.native_binding
                     if native_binding is None:
-                        raise RuntimeError("native warm session has no catalog binding")
+                        raise NativeCatalogUnavailableError(
+                            "warm Droid session published no tool catalog"
+                        )
                 else:
                     native_binding = native_tools.open_catalog(native_catalog)
-            except BaseException:
+            except BaseException as exc:
                 discard_unused_warm_session()
                 try:
                     await lease.release()
@@ -1426,7 +1431,18 @@ def create_app(
                             session_use.release()
                     finally:
                         release_native_tools()
-                raise
+                if not isinstance(exc, NativeCatalogUnavailableError):
+                    raise
+                # Native tool calls are the only channel this request has, so
+                # an unpublishable catalog fails closed instead of silently
+                # answering with no tools at all.
+                request.state.telemetry_error_type = "factory_native_tool_unavailable"
+                log_warning("chat.rejected", status=503, phase="native_tools")
+                return _error_response(
+                    f"Factory Droid native tool catalog is unavailable: {exc}",
+                    503,
+                    "factory_native_tool_unavailable",
+                )
             run_request = replace(run_request, native_tools=native_binding)
             log_debug(
                 "chat.native_tools_published",

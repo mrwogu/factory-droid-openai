@@ -4921,10 +4921,13 @@ async def test_native_tool_calls_reject_a_warm_session_without_its_binding(
         cast("Any", lambda _key, _catalog: warm),
     )
 
-    with pytest.raises(RuntimeError, match="no catalog binding"):
-        async with _client(app) as client:
-            await client.post("/v1/chat/completions", json=_weather_payload())
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=_weather_payload())
 
+    assert response.status_code == 503
+    body = response.json()
+    assert body["error"]["type"] == "factory_native_tool_unavailable"
+    assert "published no tool catalog" in body["error"]["message"]
     await app.state.reaper.drain()
     assert runner.discarded == ([] if consumed else [warm])
     assert len(app.state.native_tools) == 0

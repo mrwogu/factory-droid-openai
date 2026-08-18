@@ -100,6 +100,18 @@ def _is_ignorable_native_tool(tool_name: str) -> bool:
     return tool_name.replace("-", "").replace("_", "").casefold() in _IGNORED_NATIVE_TOOLS
 
 
+def _native_tool_ids(binding: NativeToolBinding | None) -> frozenset[str] | None:
+    """Tool ids Droid has to report for ``binding``, or ``None`` for text tools.
+
+    Both a warm session and a per-request session verify against this, so a
+    session that never published the request's catalog is never used to serve
+    a native turn.
+    """
+    if binding is None:
+        return None
+    return frozenset(f"{MCP_TOOL_ID_PREFIX}{name}" for name in binding.names)
+
+
 def _native_tool_marker(name: str, arguments: Any) -> str:
     """Render a structured tool call in the bridge's own marker form."""
     payload = json.dumps(
@@ -396,6 +408,8 @@ class DroidRunner:
                 await self._rpc.disable_native_tools(
                     client,
                     keep_tool_prefix=(None if native_tools is None else MCP_TOOL_ID_PREFIX),
+                    expected_tool_ids=_native_tool_ids(native_tools),
+                    native_server_url=(None if native_tools is None else native_tools.url),
                 )
 
             await self._run_session_init(
@@ -516,15 +530,14 @@ class DroidRunner:
         started = loop.time()
         warm = request.warm_session
         if warm is not None:
+            # A binding always carries its catalog, so ``None`` here means the
+            # side publishes no tools at all, and one comparison covers both a
+            # catalog mismatch and a native session offered to a text turn.
             warm_catalog = None if warm.native_binding is None else warm.native_binding.catalog
             requested_catalog = (
                 None if request.native_tools is None else request.native_tools.catalog
             )
-            warm_has_native = warm.native_binding is not None
-            request_has_native = request.native_tools is not None
-            if warm_has_native != request_has_native or (
-                warm_has_native and warm_catalog != requested_catalog
-            ):
+            if warm_catalog != requested_catalog:
                 raise RunnerError(
                     "A warm Droid session cannot serve a different native tool catalog.",
                 )
@@ -595,13 +608,7 @@ class DroidRunner:
                             keep_tool_prefix=(
                                 None if native_binding is None else MCP_TOOL_ID_PREFIX
                             ),
-                            expected_tool_ids=(
-                                None
-                                if native_binding is None
-                                else frozenset(
-                                    f"{MCP_TOOL_ID_PREFIX}{name}" for name in native_binding.names
-                                )
-                            ),
+                            expected_tool_ids=_native_tool_ids(native_binding),
                             native_server_url=(
                                 None if native_binding is None else native_binding.url
                             ),
