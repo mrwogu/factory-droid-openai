@@ -32,6 +32,10 @@ _UNAVOIDABLE_TOOL_IDS = frozenset({"exit-spec-mode"})
 # fetches a schema Droid already holds, and the model needs it to reach those
 # tools at all.
 _DEFERRED_TOOL_LOADER_IDS = frozenset({"tool-search-cli"})
+_CONNECTED_MCP_STATUS = "connected"
+_FAILED_MCP_STATUSES = frozenset({"failed", "disconnected", "disabled"})
+_MCP_URL_FIELDS = ("url", "uri")
+_DEFAULT_PORTS = {"http": 80, "https": 443}
 _MCP_POLICY_PATTERN = re.compile(
     r"(?:mcp\s*policy|allowlist|allow\s+list|organization\s+policy)",
     re.IGNORECASE,
@@ -207,6 +211,7 @@ class DroidRpcExtension:
     ) -> None:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _NATIVE_MCP_WAIT_SECONDS
+        last_status: str | None = None
         while True:
             timeout = min(_RPC_TIMEOUT_SECONDS, max(0.1, deadline - loop.time()))
             result = await self._request(
@@ -219,24 +224,25 @@ class DroidRpcExtension:
             target = [server for server in servers if _native_server_matches(server, server_url)]
             if len(target) > 1:
                 raise NativeToolUnavailableError(
-                    f"Droid reported multiple MCP servers named '{MCP_SERVER_NAME}'"
+                    f"Droid reported multiple MCP servers named '{MCP_SERVER_NAME}': "
+                    + ", ".join(sorted(_reported_endpoint(server) for server in target))
                 )
             if target:
                 server = target[0]
-                status = _state_value(server.get("status"))
-                if status == "connected":
+                last_status = _state_value(server.get("status"))
+                if last_status == _CONNECTED_MCP_STATUS:
                     return
-                if status in {"failed", "disconnected", "disabled"}:
+                if last_status in _FAILED_MCP_STATUSES:
                     raise _native_server_error(server, server_url)
-                if status != "connecting":
-                    raise NativeToolUnavailableError(
-                        f"Droid MCP server '{MCP_SERVER_NAME}' has unknown status {status!r}"
-                    )
+                # Every other status, including one a newer Droid introduces,
+                # is a reason to keep polling: only the deadline decides, so a
+                # renamed "connecting" cannot fail an otherwise healthy turn.
             if loop.time() >= deadline:
                 hostname = _server_hostname(server_url)
+                seen = "" if last_status is None else f", last status {last_status!r}"
                 raise NativeToolUnavailableError(
                     f"Droid MCP server '{MCP_SERVER_NAME}' did not connect at {hostname} "
-                    f"within {_NATIVE_MCP_WAIT_SECONDS:.1f} seconds"
+                    f"within {_NATIVE_MCP_WAIT_SECONDS:.1f} seconds{seen}"
                 )
             await asyncio.sleep(_MCP_POLL_SECONDS)
 
@@ -367,7 +373,44 @@ def _matching(tool_ids: set[str], prefix: str | None) -> set[str]:
 def _native_server_matches(server: dict[str, Any], server_url: str | None) -> bool:
     if server.get("name") != MCP_SERVER_NAME:
         return False
-    return all(server[field] == server_url for field in ("url", "uri") if field in server)
+    reported = [server[field] for field in _MCP_URL_FIELDS if field in server]
+    if not reported:
+        # Droid may list a server without echoing its URL, and the name is then
+        # all there is to match on.
+        return True
+    return all(_same_endpoint(value, server_url) for value in reported)
+
+
+def _reported_endpoint(server: dict[str, Any]) -> str:
+    for field in _MCP_URL_FIELDS:
+        value = server.get(field)
+        if isinstance(value, str) and value:
+            return value
+    return "no URL reported"
+
+
+def _same_endpoint(reported: object, configured: str | None) -> bool:
+    """Compare two URLs by endpoint identity rather than by spelling."""
+    if configured is None or not isinstance(reported, str):
+        return False
+    left = _endpoint_identity(reported)
+    right = _endpoint_identity(configured)
+    return left is not None and left == right
+
+
+def _endpoint_identity(url: str) -> tuple[str, str, int | None, str] | None:
+    parts = urlsplit(url)
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower()
+    return (
+        scheme,
+        (parts.hostname or "").lower(),
+        port if port is not None else _DEFAULT_PORTS.get(scheme),
+        parts.path.rstrip("/"),
+    )
 
 
 def _native_server_error(

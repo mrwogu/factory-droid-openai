@@ -672,19 +672,50 @@ async def test_native_tool_setup_reports_missing_bridge_server(
 
 @pytest.mark.asyncio
 async def test_native_tool_setup_rejects_duplicate_bridge_servers() -> None:
+    url = "http://127.0.0.1:8787/factory/mcp/token"
+
     def handler(method: str, _params: dict[str, Any]) -> dict[str, Any]:
         if method == "droid.list_mcp_servers":
             return {
                 "result": {
                     "servers": [
-                        {"name": "openai-bridge", "status": "connected"},
+                        {"name": "openai-bridge", "status": "connected", "url": url},
                         {"name": "openai-bridge", "status": "connected"},
                     ]
                 }
             }
         raise AssertionError(method)
 
-    with pytest.raises(NativeToolUnavailableError, match="multiple"):
+    with pytest.raises(NativeToolUnavailableError, match="multiple") as error:
+        await DroidRpcExtension().disable_native_tools(
+            _client(FakeProtocol(handler)),
+            expected_tool_ids=frozenset({f"{MCP_TOOL_ID_PREFIX}get_weather"}),
+            native_server_url=url,
+        )
+
+    # Naming what was reported is what tells an operator whether the extra
+    # entry is a stale bridge or a foreign server borrowing the name.
+    assert url in str(error.value)
+    assert "no URL reported" in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_native_tool_setup_reports_a_failed_status() -> None:
+    def handler(method: str, _params: dict[str, Any]) -> dict[str, Any]:
+        if method == "droid.list_mcp_servers":
+            return {
+                "result": {
+                    "servers": [
+                        {"name": "openai-bridge", "status": "disconnected", "error": "gone"}
+                    ]
+                }
+            }
+        raise AssertionError(method)
+
+    with pytest.raises(
+        NativeToolUnavailableError,
+        match="failed at the configured native tool URL",
+    ):
         await DroidRpcExtension().disable_native_tools(
             _client(FakeProtocol(handler)),
             expected_tool_ids=frozenset({f"{MCP_TOOL_ID_PREFIX}get_weather"}),
@@ -692,31 +723,75 @@ async def test_native_tool_setup_rejects_duplicate_bridge_servers() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("status", "message"),
-    [
-        ("disconnected", "failed at the configured native tool URL"),
-        ("mystery", "unknown status"),
-    ],
-)
-async def test_native_tool_setup_reports_non_connected_status(
-    status: str,
-    message: str,
+async def test_native_tool_setup_waits_out_an_unrecognized_status(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A status name this bridge does not know is a wait, not a verdict."""
+    monkeypatch.setattr(rpc_module, "_NATIVE_MCP_WAIT_SECONDS", 0.0)
+
     def handler(method: str, _params: dict[str, Any]) -> dict[str, Any]:
         if method == "droid.list_mcp_servers":
-            return {
-                "result": {
-                    "servers": [{"name": "openai-bridge", "status": status, "error": "gone"}]
-                }
-            }
+            return {"result": {"servers": [{"name": "openai-bridge", "status": "mystery"}]}}
         raise AssertionError(method)
 
-    with pytest.raises(NativeToolUnavailableError, match=message):
+    with pytest.raises(
+        NativeToolUnavailableError,
+        match=r"did not connect.*last status 'mystery'",
+    ):
         await DroidRpcExtension().disable_native_tools(
             _client(FakeProtocol(handler)),
             expected_tool_ids=frozenset({f"{MCP_TOOL_ID_PREFIX}get_weather"}),
         )
+
+
+@pytest.mark.asyncio
+async def test_native_tool_setup_accepts_a_server_that_leaves_an_unknown_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statuses = iter(["initializing", "connected"])
+
+    def handler(method: str, _params: dict[str, Any]) -> dict[str, Any]:
+        if method == "droid.list_mcp_servers":
+            return {"result": {"servers": [{"name": "openai-bridge", "status": next(statuses)}]}}
+        if method == "droid.list_tools":
+            return {
+                "result": {
+                    "tools": [
+                        {
+                            "id": f"{MCP_TOOL_ID_PREFIX}get_weather",
+                            "currentlyAllowed": True,
+                        }
+                    ]
+                }
+            }
+        if method == "droid.update_session_settings":
+            return {"result": {}}
+        raise AssertionError(method)
+
+    monkeypatch.setattr(rpc_module, "_NATIVE_MCP_WAIT_SECONDS", 1.0)
+
+    await DroidRpcExtension().disable_native_tools(
+        _client(FakeProtocol(handler)),
+        keep_tool_prefix="mcp_openai-bridge_",
+        expected_tool_ids=frozenset({f"{MCP_TOOL_ID_PREFIX}get_weather"}),
+    )
+
+
+def test_native_server_matching_compares_endpoint_identity() -> None:
+    matches = rpc_module._native_server_matches
+    url = "http://127.0.0.1:8787/factory/mcp/tok"
+
+    # Spelling Droid may normalize on its way back: trailing slash, case, and
+    # an explicit default port all name the same endpoint.
+    assert matches({"name": "openai-bridge", "url": f"{url}/"}, url)
+    assert matches({"name": "openai-bridge", "url": url.replace("http", "HTTP")}, url)
+    assert matches({"name": "openai-bridge", "url": "http://host/mcp"}, "http://host:80/mcp")
+    assert matches({"name": "openai-bridge"}, url)
+    assert not matches({"name": "openai-bridge", "url": "http://127.0.0.1:9999/x"}, url)
+    assert not matches({"name": "openai-bridge", "url": "http://127.0.0.1:port/x"}, url)
+    assert not matches({"name": "openai-bridge", "url": 7}, url)
+    assert not matches({"name": "openai-bridge", "url": url}, None)
+    assert rpc_module._reported_endpoint({"name": "openai-bridge"}) == "no URL reported"
 
 
 def test_native_tool_error_helpers_render_hostnames() -> None:
