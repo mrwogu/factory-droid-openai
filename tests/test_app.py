@@ -996,7 +996,10 @@ async def test_tool_call_drain_keeps_delayed_parallel_calls(
                 self.closed = True
 
     runner = DelayedParallelRunner([])
-    app = _feature_app(tmp_path, runner, tool_call_drain_seconds=0.05)
+    # The window has to outlast the gap the runner leaves between the two
+    # calls by a wide margin: a loaded CI machine stretches a 10 ms sleep far
+    # past its nominal length, and a window that close drops the second call.
+    app = _feature_app(tmp_path, runner, tool_call_drain_seconds=0.5)
     payload = _payload(
         stream=stream,
         tools=[
