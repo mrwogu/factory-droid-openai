@@ -9,7 +9,7 @@ import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, TypeVar
+from typing import Any, NoReturn, Protocol, TypeVar
 
 from droid_sdk import (
     AssistantTextDelta,
@@ -417,10 +417,6 @@ class DroidRunner:
                 return await operation()
         except (TimeoutError, DroidTimeoutError) as exc:
             raise self._session_init_timeout_error(started) from exc
-        except asyncio.CancelledError as exc:
-            if asyncio.get_running_loop().time() < phase_deadline:
-                raise
-            raise self._session_init_timeout_error(started) from exc
 
     def _session_init_timeout_error(self, started: float) -> RunnerError:
         elapsed = asyncio.get_running_loop().time() - started
@@ -434,6 +430,16 @@ class DroidRunner:
             status_code=504,
             error_type="factory_droid_timeout",
         )
+
+    def _handle_session_init_cancellation(
+        self,
+        started: float,
+        request_timeout: asyncio.Timeout,
+        exc: asyncio.CancelledError,
+    ) -> NoReturn:
+        if not request_timeout.expired():
+            raise exc
+        raise self._session_init_timeout_error(started) from exc
 
     async def discard(self, session: WarmSession) -> None:
         """Tear down a warm session that will not serve a turn."""
@@ -513,7 +519,7 @@ class DroidRunner:
         usage = Usage()
 
         try:
-            async with asyncio.timeout_at(deadline):
+            async with asyncio.timeout_at(deadline) as request_timeout:
                 if warm is None:
 
                     async def initialize() -> None:
@@ -563,7 +569,10 @@ class DroidRunner:
                             ),
                         )
 
-                    await self._run_session_init(deadline, initialize)
+                    try:
+                        await self._run_session_init(deadline, initialize)
+                    except asyncio.CancelledError as exc:
+                        self._handle_session_init_cancellation(started, request_timeout, exc)
                 else:
                     await self._retune(warm, request.session_key())
                 session_timeline = current_timeline()
@@ -893,19 +902,21 @@ class DroidRunner:
         client.set_ask_user_handler(
             lambda _params: {"cancelled": True, "answers": []},
         )
-        started = asyncio.get_running_loop().time()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deadline = started + timeout_seconds
         try:
-            async with asyncio.timeout(timeout_seconds):
+            async with asyncio.timeout_at(deadline) as request_timeout:
 
                 async def initialize() -> None:
                     await client.connect()
                     if init_operation is not None:
                         await init_operation(client)
 
-                await self._run_session_init(
-                    asyncio.get_running_loop().time() + timeout_seconds,
-                    initialize,
-                )
+                try:
+                    await self._run_session_init(deadline, initialize)
+                except asyncio.CancelledError as exc:
+                    self._handle_session_init_cancellation(started, request_timeout, exc)
                 return await operation(client)
         except (TimeoutError, DroidTimeoutError) as exc:
             raise RunnerError(

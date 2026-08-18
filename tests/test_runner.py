@@ -529,6 +529,36 @@ async def test_runner_caps_session_initialization_and_closes_a_hanging_client(
 
 
 @pytest.mark.asyncio
+async def test_runner_preserves_external_cancellation_during_session_init(
+    tmp_path: Path,
+) -> None:
+    class CancelledInitClient(FakeClient):
+        async def initialize_session(self, **kwargs: Any) -> None:
+            del kwargs
+            loop = asyncio.get_running_loop()
+            end = loop.time() + 0.03
+            while loop.time() < end:
+                pass
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+            await asyncio.sleep(0)
+
+    client = CancelledInitClient([])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+        session_init_timeout_seconds=0.01,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await _collect(runner, _request(timeout_seconds=1.0))
+
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
 async def test_runner_caps_continuation_load_session(tmp_path: Path) -> None:
     class HangingLoadClient(FakeClient):
         async def load_session(
@@ -1386,9 +1416,10 @@ async def test_session_operations_time_out_on_a_slow_droid(tmp_path: Path) -> No
         client_factory=cast("Any", lambda _path, _cwd: client),
     )
 
-    with pytest.raises(RunnerError, match="timed out"):
+    with pytest.raises(RunnerError, match="session initialization timed out") as error:
         await runner.close_session("session", timeout_seconds=0.01)
 
+    assert error.value.error_type == "factory_droid_timeout"
     assert client.closed is True
 
 
