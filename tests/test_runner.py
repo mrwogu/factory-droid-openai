@@ -38,6 +38,7 @@ from factory_droid_openai.mcp_tools import (
     MCP_TOOL_ID_PREFIX,
     MCP_TOOL_PREFIX,
     NativeToolBinding,
+    NativeToolRegistry,
 )
 from factory_droid_openai.metrics import BridgeMetrics
 from factory_droid_openai.pool import BackgroundReaper
@@ -1473,6 +1474,28 @@ async def test_runner_warms_a_session_with_the_requested_settings(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_runner_warms_a_session_with_native_tools_enabled(tmp_path: Path) -> None:
+    client = NativeToolClient([])
+    binding = _native_binding()
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    session = await runner.warm(
+        SessionKey(model_id="claude-sonnet-4", reasoning_effort="low"),
+        timeout_seconds=1.0,
+        native_tools=binding,
+    )
+
+    assert session.native_binding is binding
+    assert client.init_kwargs["mcp_servers"] == [binding.server_config()]
+    assert client.disabled_tool_ids == {"read-cli", "exit-spec-mode", "tool-search-cli"}
+    await runner.discard(session)
+
+
+@pytest.mark.asyncio
 async def test_runner_warm_closes_the_session_when_startup_fails(tmp_path: Path) -> None:
     class FailingClient(FakeClient):
         async def initialize_session(self, **kwargs: Any) -> None:
@@ -2303,6 +2326,61 @@ async def test_runner_refuses_a_warm_session_for_a_native_turn(tmp_path: Path) -
 
     with pytest.raises(RunnerError, match="warm Droid session cannot serve"):
         async for _ in runner.run(_request(native_tools=_native_binding(), warm_session=warm)):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_runner_accepts_a_warm_session_with_the_same_native_catalog(tmp_path: Path) -> None:
+    binding = _native_binding()
+    client = NativeToolClient([TurnComplete()])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+    warm = WarmSession(
+        key=SessionKey(model_id=None, reasoning_effort="high"),
+        client=cast("Any", client),
+        transport=None,
+        session_id="session-1",
+        created_at=0.0,
+        native_binding=binding,
+    )
+
+    events = [
+        event async for event in runner.run(_request(native_tools=binding, warm_session=warm))
+    ]
+
+    assert events == [
+        SessionStarted("session-1"),
+        RunComplete(usage=Usage()),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runner_rejects_a_warm_session_with_a_different_native_catalog(
+    tmp_path: Path,
+) -> None:
+    registry = NativeToolRegistry(base_url="http://127.0.0.1:8787")
+    first = registry.open(({"name": "first", "inputSchema": {}},))
+    second = registry.open(({"name": "second", "inputSchema": {}},))
+    client = NativeToolClient([TurnComplete()])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+    warm = WarmSession(
+        key=SessionKey(model_id=None, reasoning_effort="high"),
+        client=cast("Any", client),
+        transport=None,
+        session_id="session-1",
+        created_at=0.0,
+        native_binding=first,
+    )
+
+    with pytest.raises(RunnerError, match="different native tool catalog"):
+        async for _ in runner.run(_request(native_tools=second, warm_session=warm)):
             pass
 
 

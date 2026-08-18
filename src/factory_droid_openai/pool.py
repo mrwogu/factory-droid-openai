@@ -2,10 +2,16 @@ import asyncio
 import contextlib
 from collections import defaultdict, deque
 from collections.abc import Callable, Coroutine
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from factory_droid_openai.logs import debug as log_debug
 from factory_droid_openai.logs import warning as log_warning
+from factory_droid_openai.mcp_tools import (
+    NativeToolBinding,
+    NativeToolCatalog,
+    NativeToolRegistry,
+)
 from factory_droid_openai.metrics import WARM_RETUNE_EFFORT
 from factory_droid_openai.runner import DroidRunner, SessionKey, WarmSession
 
@@ -77,6 +83,12 @@ class BackgroundReaper:
             self._metrics.set_pending_reaps(len(self._tasks))
 
 
+@dataclass(frozen=True, slots=True)
+class _WarmDemand:
+    key: SessionKey
+    catalog: NativeToolCatalog | None = None
+
+
 class WarmSessionPool:
     """Keeps initialized Droid sessions ready so requests skip session startup.
 
@@ -99,6 +111,7 @@ class WarmSessionPool:
         max_keys: int = 2,
         retry_seconds: float = 5.0,
         metrics: PoolMetrics | None = None,
+        native_registry: NativeToolRegistry | None = None,
     ) -> None:
         self._runner_factory = runner_factory
         self._reaper = reaper
@@ -108,8 +121,12 @@ class WarmSessionPool:
         self._max_keys = max(1, max_keys)
         self._retry_seconds = retry_seconds
         self._metrics = metrics
-        self._sessions: dict[SessionKey, deque[WarmSession]] = defaultdict(deque)
+        self._native_registry = native_registry
+        self._sessions: dict[_WarmDemand, deque[WarmSession]] = defaultdict(deque)
+        self._native_sessions: dict[_WarmDemand, deque[WarmSession]] = defaultdict(deque)
         self._wanted: list[SessionKey] = []
+        self._native_wanted: list[_WarmDemand] = []
+        self._demand_order: list[_WarmDemand] = []
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
@@ -131,43 +148,79 @@ class WarmSessionPool:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
-        sessions = [session for queue in self._sessions.values() for session in queue]
+        sessions = [
+            session
+            for queues in (self._sessions, self._native_sessions)
+            for queue in queues.values()
+            for session in queue
+        ]
         self._sessions.clear()
+        self._native_sessions.clear()
+        self._wanted.clear()
+        self._native_wanted.clear()
+        self._demand_order.clear()
         self._publish()
         for session in sessions:
-            self._reaper.submit(self._runner_factory().discard(session))
+            self._reaper.submit(self._discard_session(session))
 
-    def note(self, key: SessionKey) -> None:
-        if key in self._wanted:
-            self._wanted.remove(key)
-        self._wanted.insert(0, key)
-        for stale in self._wanted[self._max_keys :]:
-            self._drop(stale)
-        del self._wanted[self._max_keys :]
+    def note(self, key: SessionKey, catalog: NativeToolCatalog | None = None) -> None:
+        demand = _WarmDemand(key, catalog)
+        if demand in self._demand_order:
+            self._demand_order.remove(demand)
+        self._demand_order.insert(0, demand)
+        if catalog is None:
+            if key in self._wanted:
+                self._wanted.remove(key)
+            self._wanted.insert(0, key)
+            stale_keys = self._wanted[self._max_keys :]
+            for stale_key in stale_keys:
+                stale_demand = _WarmDemand(stale_key)
+                self._drop_demand(stale_demand)
+                self._demand_order.remove(stale_demand)
+            del self._wanted[self._max_keys :]
+        else:
+            if demand in self._native_wanted:
+                self._native_wanted.remove(demand)
+            self._native_wanted.insert(0, demand)
+            stale_demands = self._native_wanted[self._max_keys :]
+            for stale_demand in stale_demands:
+                self._drop_demand(stale_demand)
+                self._demand_order.remove(stale_demand)
+            del self._native_wanted[self._max_keys :]
         self._wake.set()
 
     def offer(self, session: WarmSession) -> None:
         """Register an already warmed session, or discard it when unwanted."""
-        if len(self._sessions.get(session.key, ())) >= self._targets().get(session.key, 0):
+        demand = _WarmDemand(
+            session.key,
+            session.native_binding.catalog if session.native_binding is not None else None,
+        )
+        queues = self._native_sessions if demand.catalog is not None else self._sessions
+        if len(queues.get(demand, ())) >= self._targets().get(demand, 0):
             self._discard(session)
             return
-        self._sessions[session.key].append(session)
+        queues[demand].append(session)
         self._publish()
         log_debug("pool.warmed", model=session.key.model_id, warm_sessions=self._total())
 
-    def acquire(self, key: SessionKey) -> WarmSession | None:
+    def acquire(
+        self,
+        key: SessionKey,
+        catalog: NativeToolCatalog | None = None,
+    ) -> WarmSession | None:
         """Take a ready session for ``key``, or ``None`` when none is warm yet."""
         if not self.enabled:
             return None
-        self.note(key)
-        session = self._take(key)
+        demand = _WarmDemand(key, catalog)
+        self.note(key, catalog)
+        session = self._take_demand(demand)
         if session is not None:
             self._publish()
             if self._metrics is not None:
                 self._metrics.increment_warm_hits()
             log_debug("pool.hit", model=key.model_id, warm_sessions=self._total())
             return session
-        session = self._take_retunable(key)
+        session = self._take_retunable(demand)
         if session is not None:
             self._publish()
             if self._metrics is not None:
@@ -187,8 +240,9 @@ class WarmSessionPool:
         log_debug("pool.miss", model=key.model_id, warm_sessions=self._total())
         return None
 
-    def _take(self, key: SessionKey) -> WarmSession | None:
-        queue = self._sessions.get(key)
+    def _take_demand(self, demand: _WarmDemand) -> WarmSession | None:
+        queues = self._native_sessions if demand.catalog is not None else self._sessions
+        queue = queues.get(demand)
         while queue:
             session = queue.popleft()
             if self._usable(session):
@@ -196,10 +250,15 @@ class WarmSessionPool:
             self._discard(session)
         return None
 
-    def _take_retunable(self, key: SessionKey) -> WarmSession | None:
+    def _take_retunable(self, demand: _WarmDemand) -> WarmSession | None:
         """Borrow a session the runner can safely repoint."""
-        for warmed_key, queue in self._sessions.items():
-            if warmed_key == key or not key.can_retune_from(warmed_key):
+        queues = self._native_sessions if demand.catalog is not None else self._sessions
+        for warmed_demand, queue in queues.items():
+            if (
+                warmed_demand.catalog != demand.catalog
+                or warmed_demand.key == demand.key
+                or not demand.key.can_retune_from(warmed_demand.key)
+            ):
                 continue
             while queue:
                 session = queue.popleft()
@@ -228,7 +287,7 @@ class WarmSessionPool:
                 return
             # Droid startup is seconds of mostly idle waiting, so a burst that
             # drained the pool refills in one startup instead of N.
-            warmed = await asyncio.gather(*(self._warm(key) for key in deficits))
+            warmed = await asyncio.gather(*(self._warm(demand) for demand in deficits))
             for session in warmed:
                 if session is not None:
                     self.offer(session)
@@ -236,46 +295,75 @@ class WarmSessionPool:
                 await asyncio.sleep(self._retry_seconds)
                 return
 
-    async def _warm(self, key: SessionKey) -> WarmSession | None:
+    async def _warm(self, demand: _WarmDemand) -> WarmSession | None:
         runner = self._runner_factory()
+        binding: NativeToolBinding | None = None
         try:
-            return await runner.warm(key, timeout_seconds=self._warm_timeout_seconds)
+            if demand.catalog is not None:
+                if self._native_registry is None:
+                    raise RuntimeError("native warm pool has no catalog registry")
+                binding = self._native_registry.open_catalog(demand.catalog)
+                self._native_registry.pin(binding.token)
+                return await runner.warm(
+                    demand.key,
+                    timeout_seconds=self._warm_timeout_seconds,
+                    native_tools=binding,
+                )
+            return await runner.warm(demand.key, timeout_seconds=self._warm_timeout_seconds)
         except asyncio.CancelledError:
+            if binding is not None and self._native_registry is not None:
+                self._native_registry.close(binding.token)
             raise
         except Exception as exc:
+            if binding is not None and self._native_registry is not None:
+                self._native_registry.close(binding.token)
             if self._metrics is not None:
                 self._metrics.increment_warm_failures()
-            log_warning("pool.warm_failed", model=key.model_id, error=type(exc).__name__)
+            log_warning("pool.warm_failed", model=demand.key.model_id, error=type(exc).__name__)
             # Settings Droid rejects, such as a model an organization policy
             # blocks, would otherwise be retried for as long as they stay in
             # the wanted list. Traffic that still works re-adds the key.
-            self._forget(key)
+            self._forget_demand(demand)
             return None
 
     def _forget(self, key: SessionKey) -> None:
-        if key in self._wanted:
-            self._wanted.remove(key)
-        self._drop(key)
+        self._forget_demand(_WarmDemand(key))
 
-    def _targets(self) -> dict[SessionKey, int]:
+    def _forget_demand(self, demand: _WarmDemand) -> None:
+        if demand.catalog is None:
+            if demand.key in self._wanted:
+                self._wanted.remove(demand.key)
+        elif demand in self._native_wanted:
+            self._native_wanted.remove(demand)
+        if demand in self._demand_order:
+            self._demand_order.remove(demand)
+        self._drop_demand(demand)
+
+    def _targets(self) -> dict[_WarmDemand, int]:
         """Split the pool size across the keys traffic is currently using."""
-        if not self._wanted:
+        if not self._demand_order:
             return {}
-        base, extra = divmod(self._size, len(self._wanted))
-        return {key: base + (1 if index < extra else 0) for index, key in enumerate(self._wanted)}
+        base, extra = divmod(self._size, len(self._demand_order))
+        return {
+            demand: base + (1 if index < extra else 0)
+            for index, demand in enumerate(self._demand_order)
+        }
 
-    def _deficits(self) -> list[SessionKey]:
-        deficits: list[SessionKey] = []
-        for key, target in self._targets().items():
-            missing = target - len(self._sessions.get(key, ()))
-            deficits.extend([key] * max(0, missing))
+    def _deficits(self) -> list[_WarmDemand]:
+        deficits: list[_WarmDemand] = []
+        targets = self._targets()
+        for demand, target in targets.items():
+            queues = self._native_sessions if demand.catalog is not None else self._sessions
+            missing = target - len(queues.get(demand, ()))
+            deficits.extend([demand] * max(0, missing))
         return deficits
 
     def _rebalance(self) -> None:
         """Free capacity held for keys that traffic has moved away from."""
         targets = self._targets()
-        for key, target in reversed(list(targets.items())):
-            queue = self._sessions.get(key)
+        for demand, target in reversed(list(targets.items())):
+            queues = self._native_sessions if demand.catalog is not None else self._sessions
+            queue = queues.get(demand)
             while queue is not None and len(queue) > target:
                 self._discard(queue.pop())
         self._publish()
@@ -287,23 +375,39 @@ class WarmSessionPool:
         return age < self._ttl_seconds
 
     def _drop_stale(self) -> None:
-        for queue in self._sessions.values():
-            for session in tuple(queue):
-                if not self._usable(session):
-                    queue.remove(session)
-                    self._discard(session)
+        for queues in (self._sessions, self._native_sessions):
+            for queue in queues.values():
+                for session in tuple(queue):
+                    if not self._usable(session):
+                        queue.remove(session)
+                        self._discard(session)
         self._publish()
 
-    def _drop(self, key: SessionKey) -> None:
-        for session in self._sessions.pop(key, ()):
+    def _drop_demand(self, demand: _WarmDemand) -> None:
+        queues = self._native_sessions if demand.catalog is not None else self._sessions
+        for session in queues.pop(demand, ()):
             self._discard(session)
         self._publish()
 
+    def _drop(self, key: SessionKey) -> None:
+        self._drop_demand(_WarmDemand(key))
+
     def _discard(self, session: WarmSession) -> None:
-        self._reaper.submit(self._runner_factory().discard(session))
+        self._reaper.submit(self._discard_session(session))
+
+    async def _discard_session(self, session: WarmSession) -> None:
+        try:
+            await self._runner_factory().discard(session)
+        finally:
+            if session.native_binding is not None and self._native_registry is not None:
+                self._native_registry.close(session.native_binding.token)
 
     def _total(self) -> int:
-        return sum(len(queue) for queue in self._sessions.values())
+        return sum(
+            len(queue)
+            for queues in (self._sessions, self._native_sessions)
+            for queue in queues.values()
+        )
 
     def _publish(self) -> None:
         if self._metrics is not None:

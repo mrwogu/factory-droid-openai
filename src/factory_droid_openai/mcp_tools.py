@@ -16,7 +16,10 @@ events instead.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import secrets
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
@@ -50,12 +53,30 @@ _INVALID_REQUEST: Final = -32600
 
 
 @dataclass(frozen=True, slots=True)
+class NativeToolCatalog:
+    """Immutable identity and payload for one ordered MCP catalog."""
+
+    serialized: str
+    fingerprint: str
+    names: frozenset[str]
+
+    @property
+    def tools(self) -> tuple[dict[str, Any], ...]:
+        """Return a fresh catalog copy for an SDK or HTTP response."""
+        decoded = json.loads(self.serialized)
+        if not isinstance(decoded, list) or not all(isinstance(item, dict) for item in decoded):
+            raise RuntimeError("native tool catalog serialization is malformed")
+        return tuple(decoded)
+
+
+@dataclass(frozen=True, slots=True)
 class NativeToolBinding:
     """What one request needs to reach its own MCP endpoint."""
 
     token: str
     url: str
     names: frozenset[str]
+    catalog: NativeToolCatalog | None = None
 
     def server_config(self) -> dict[str, Any]:
         """Render the MCP server entry Droid's session initializer expects."""
@@ -83,32 +104,74 @@ class NativeToolRegistry:
     def __init__(self, *, base_url: str, max_sessions: int = 256) -> None:
         self._base_url = base_url.rstrip("/")
         self._max_sessions = max_sessions
-        self._catalogs: dict[str, tuple[dict[str, Any], ...]] = {}
+        self._catalogs: OrderedDict[str, NativeToolCatalog] = OrderedDict()
+        self._pinned: set[str] = set()
 
     def open(self, tools: Sequence[Mapping[str, Any]]) -> NativeToolBinding:
         """Publish ``tools`` under a fresh token and return how to reach them."""
+        return self.open_catalog(self.catalog_identity(tools))
+
+    def catalog_identity(self, tools: Sequence[Mapping[str, Any]]) -> NativeToolCatalog:
+        """Canonicalize a request catalog without allocating a credential."""
+        return _catalog(tools)
+
+    def open_catalog(self, catalog: NativeToolCatalog) -> NativeToolBinding:
+        """Publish an existing catalog under a fresh token."""
         token = secrets.token_urlsafe(24)
-        while len(self._catalogs) >= self._max_sessions:
-            # A request that never closed its catalog must not pin memory for
-            # the life of the process. The oldest entry belongs to the oldest
-            # request, whose turn is over by the time the cap is reached.
-            self._catalogs.pop(next(iter(self._catalogs)))
-        catalog = tuple(dict(tool) for tool in tools)
+        self._evict_unpinned()
+        if len(self._catalogs) >= self._max_sessions:
+            raise RuntimeError("native tool catalog capacity is exhausted")
         self._catalogs[token] = catalog
         return NativeToolBinding(
             token=token,
             url=f"{self._base_url}{MCP_ROUTE_PREFIX}/{token}",
-            names=frozenset(str(tool["name"]) for tool in catalog),
+            names=catalog.names,
+            catalog=catalog,
         )
 
     def close(self, token: str) -> None:
         self._catalogs.pop(token, None)
+        self._pinned.discard(token)
+
+    def pin(self, token: str) -> None:
+        if token in self._catalogs:
+            self._pinned.add(token)
+
+    def unpin(self, token: str) -> None:
+        self._pinned.discard(token)
 
     def catalog(self, token: str) -> tuple[dict[str, Any], ...] | None:
-        return self._catalogs.get(token)
+        catalog = self._catalogs.get(token)
+        return None if catalog is None else catalog.tools
 
     def __len__(self) -> int:
         return len(self._catalogs)
+
+    def _evict_unpinned(self) -> None:
+        while len(self._catalogs) >= self._max_sessions:
+            token = next((token for token in self._catalogs if token not in self._pinned), None)
+            if token is None:
+                return
+            self._catalogs.pop(token)
+
+
+def _catalog(tools: Sequence[Mapping[str, Any]]) -> NativeToolCatalog:
+    serialized = json.dumps(
+        [dict(tool) for tool in tools],
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    decoded = json.loads(serialized)
+    if not isinstance(decoded, list) or not all(isinstance(item, dict) for item in decoded):
+        raise RuntimeError("native tool catalog serialization is malformed")
+    names = frozenset(str(tool["name"]) for tool in decoded)
+    return NativeToolCatalog(
+        serialized=serialized,
+        fingerprint=hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+        names=names,
+    )
 
 
 def to_mcp_tools(tools: Iterable[Any]) -> tuple[dict[str, Any], ...]:

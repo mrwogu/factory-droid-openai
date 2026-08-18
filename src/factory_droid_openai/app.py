@@ -743,6 +743,10 @@ def create_app(
         max_queue_size=resolved_settings.max_queue_size,
         metrics=metrics,
     )
+    native_tools = NativeToolRegistry(
+        base_url=resolved_settings.native_tool_call_base_url(),
+        max_sessions=resolved_settings.max_tracked_sessions,
+    )
     pool = WarmSessionPool(
         runner_factory=resolved_runner_factory,
         reaper=reaper,
@@ -750,16 +754,13 @@ def create_app(
         warm_timeout_seconds=min(resolved_settings.timeout_seconds, _WARM_TIMEOUT_CEILING),
         ttl_seconds=resolved_settings.warm_session_ttl_seconds,
         metrics=metrics,
+        native_registry=native_tools,
     )
     telemetry = TelemetryReporter(
         metrics=metrics,
         app_version=_BRIDGE_VERSION,
         endpoint=DEFAULT_TELEMETRY_ENDPOINT,
         enabled=resolved_settings.telemetry,
-    )
-    native_tools = NativeToolRegistry(
-        base_url=resolved_settings.native_tool_call_base_url(),
-        max_sessions=resolved_settings.max_tracked_sessions,
     )
 
     @contextlib.asynccontextmanager
@@ -1387,27 +1388,43 @@ def create_app(
             raise
 
         native_binding: NativeToolBinding | None = None
+        native_catalog = None
         if plan.native_tools:
-            native_binding = native_tools.open(to_mcp_tools(plan.native_tools))
+            native_catalog = native_tools.catalog_identity(to_mcp_tools(plan.native_tools))
             metrics.record_features(("native_tool_calls",))
+
+        warm_session: WarmSession | None = None
+        if session_id is None:
+            warm_session = pool.acquire(requested_key, native_catalog)
+            if warm_session is not None:
+                metrics.record_features(("warm_session",))
+                run_request = replace(run_request, warm_session=warm_session)
+
+        if native_catalog is not None:
+            try:
+                if warm_session is not None:
+                    native_binding = warm_session.native_binding
+                    if native_binding is None:
+                        raise RuntimeError("native warm session has no catalog binding")
+                else:
+                    native_binding = native_tools.open_catalog(native_catalog)
+            except BaseException:
+                try:
+                    await lease.release()
+                finally:
+                    if session_use is not None:
+                        session_use.release()
+                raise
             run_request = replace(run_request, native_tools=native_binding)
             log_debug(
                 "chat.native_tools_published",
-                tools=len(plan.native_tools),
+                tools=len(plan.native_tools or ()),
                 open_catalogs=len(native_tools),
             )
 
         def release_native_tools() -> None:
             if native_binding is not None:
                 native_tools.close(native_binding.token)
-
-        # Droid attaches MCP servers when a session starts, so a session warmed
-        # without this request's tools cannot serve the turn.
-        if session_id is None and native_binding is None:
-            warm_session = pool.acquire(requested_key)
-            if warm_session is not None:
-                metrics.record_features(("warm_session",))
-                run_request = replace(run_request, warm_session=warm_session)
 
         def record_repair(
             event: str,

@@ -6,10 +6,12 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+import factory_droid_openai.mcp_tools as mcp_tools
 from factory_droid_openai.mcp_tools import (
     MCP_PROTOCOL_VERSION,
     MCP_ROUTE_PREFIX,
     MCP_SERVER_NAME,
+    NativeToolCatalog,
     NativeToolRegistry,
     build_router,
     handle_rpc,
@@ -78,6 +80,8 @@ def test_registry_forgets_a_closed_catalog() -> None:
     registry = _registry()
     binding = registry.open(_catalog())
 
+    registry.pin("missing")
+    registry.unpin("missing")
     registry.close(binding.token)
     registry.close(binding.token)
 
@@ -105,6 +109,88 @@ def test_registry_copies_the_published_tools() -> None:
     catalog = registry.catalog(binding.token)
     assert catalog is not None
     assert catalog[0]["name"] == "get_weather"
+
+
+def test_catalog_identity_includes_order_and_every_descriptor_field() -> None:
+    registry = _registry()
+    first = registry.catalog_identity(
+        (
+            {"name": "a", "description": "one", "inputSchema": {"type": "object"}},
+            {"name": "b", "inputSchema": {"type": "string"}},
+        )
+    )
+    same = registry.catalog_identity(
+        (
+            {"name": "a", "description": "one", "inputSchema": {"type": "object"}},
+            {"name": "b", "inputSchema": {"type": "string"}},
+        )
+    )
+    changed = registry.catalog_identity(
+        (
+            {"name": "b", "inputSchema": {"type": "string"}},
+            {"name": "a", "description": "two", "inputSchema": {"type": "object"}},
+        )
+    )
+
+    assert isinstance(first, NativeToolCatalog)
+    assert first == same
+    assert first.fingerprint == same.fingerprint
+    assert first != changed
+    assert first.fingerprint != changed.fingerprint
+    assert first.names == frozenset({"a", "b"})
+
+
+def test_catalog_tools_are_fresh_copies() -> None:
+    catalog = _registry().catalog_identity(_catalog())
+
+    first = catalog.tools
+    first[0]["name"] = "mutated"
+
+    assert catalog.tools[0]["name"] == "get_weather"
+
+
+def test_catalog_rejects_malformed_serialized_tools() -> None:
+    catalog = NativeToolCatalog(serialized="{}", fingerprint="", names=frozenset())
+
+    with pytest.raises(RuntimeError, match="serialization is malformed"):
+        _ = catalog.tools
+
+
+def test_catalog_identity_rejects_malformed_serialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = cast("Any", mcp_tools)
+    monkeypatch.setattr(module.__dict__["json"], "loads", lambda _serialized: {})
+
+    with pytest.raises(RuntimeError, match="serialization is malformed"):
+        _registry().catalog_identity(())
+
+
+def test_pinned_catalogs_survive_eviction_until_unpinned() -> None:
+    registry = _registry(max_sessions=2)
+    first = registry.open(_catalog())
+    second = registry.open(())
+    registry.pin(first.token)
+
+    third = registry.open(({"name": "third", "inputSchema": {}},))
+
+    assert registry.catalog(first.token) == _catalog()
+    assert registry.catalog(second.token) is None
+    assert registry.catalog(third.token) is not None
+
+    registry.unpin(first.token)
+    fourth = registry.open(({"name": "fourth", "inputSchema": {}},))
+    assert registry.catalog(first.token) is None
+    assert registry.catalog(fourth.token) is not None
+
+
+def test_registry_rejects_opening_when_all_catalogs_are_pinned() -> None:
+    registry = _registry(max_sessions=1)
+    first = registry.open(_catalog())
+    registry.pin(first.token)
+
+    with pytest.raises(RuntimeError, match="capacity is exhausted"):
+        registry.open(())
 
 
 def test_openai_tools_become_mcp_descriptors() -> None:
