@@ -22,6 +22,9 @@ DEFAULT_MODEL_ALIAS = "factory-droid"
 # model spreads parallel calls over slower gaps than this.
 DEFAULT_TOOL_CALL_DRAIN_SECONDS = 0.5
 DEFAULT_SESSION_INIT_TIMEOUT_SECONDS = 60.0
+# droid-sdk pins its own SESSION_INIT_TIMEOUT at 60 s, so a larger cap here
+# could never take effect. Revisit both values when the pinned droid-sdk
+# version in pyproject.toml changes.
 MAX_SESSION_INIT_TIMEOUT_SECONDS = 60.0
 
 

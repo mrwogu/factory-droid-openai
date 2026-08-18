@@ -9,7 +9,7 @@ import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NoReturn, Protocol, TypeVar
+from typing import Any, Protocol, TypeVar
 
 from droid_sdk import (
     AssistantTextDelta,
@@ -408,6 +408,8 @@ class DroidRunner:
         self,
         deadline: float,
         operation: Callable[[], Awaitable[OperationResult]],
+        *,
+        request_timeout: asyncio.Timeout | None = None,
     ) -> OperationResult:
         """Run session setup under its own deadline inside the request budget."""
         started = asyncio.get_running_loop().time()
@@ -416,6 +418,14 @@ class DroidRunner:
             async with asyncio.timeout_at(phase_deadline):
                 return await operation()
         except (TimeoutError, DroidTimeoutError) as exc:
+            raise self._session_init_timeout_error(started) from exc
+        except asyncio.CancelledError as exc:
+            # A request deadline that lands on the same instant as the phase
+            # deadline cancels this scope before the phase timer converts it,
+            # and the phase still names where the budget went. A cancel from
+            # anywhere else, such as a client disconnect, has to stay one.
+            if request_timeout is None or not request_timeout.expired():
+                raise
             raise self._session_init_timeout_error(started) from exc
 
     def _session_init_timeout_error(self, started: float) -> RunnerError:
@@ -430,16 +440,6 @@ class DroidRunner:
             status_code=504,
             error_type="factory_droid_timeout",
         )
-
-    def _handle_session_init_cancellation(
-        self,
-        started: float,
-        request_timeout: asyncio.Timeout,
-        exc: asyncio.CancelledError,
-    ) -> NoReturn:
-        if not request_timeout.expired():
-            raise exc
-        raise self._session_init_timeout_error(started) from exc
 
     async def discard(self, session: WarmSession) -> None:
         """Tear down a warm session that will not serve a turn."""
@@ -569,10 +569,11 @@ class DroidRunner:
                             ),
                         )
 
-                    try:
-                        await self._run_session_init(deadline, initialize)
-                    except asyncio.CancelledError as exc:
-                        self._handle_session_init_cancellation(started, request_timeout, exc)
+                    await self._run_session_init(
+                        deadline,
+                        initialize,
+                        request_timeout=request_timeout,
+                    )
                 else:
                     await self._retune(warm, request.session_key())
                 session_timeline = current_timeline()
@@ -913,10 +914,11 @@ class DroidRunner:
                     if init_operation is not None:
                         await init_operation(client)
 
-                try:
-                    await self._run_session_init(deadline, initialize)
-                except asyncio.CancelledError as exc:
-                    self._handle_session_init_cancellation(started, request_timeout, exc)
+                await self._run_session_init(
+                    deadline,
+                    initialize,
+                    request_timeout=request_timeout,
+                )
                 return await operation(client)
         except (TimeoutError, DroidTimeoutError) as exc:
             raise RunnerError(
