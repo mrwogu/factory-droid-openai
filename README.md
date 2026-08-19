@@ -484,9 +484,14 @@ each release:
 docker pull ghcr.io/mrwogu/factory-droid-openai:latest
 ```
 
-The image bundles a pinned Droid CLI with auto-updates disabled, so the
-bridge and CLI versions are reproducible. Droid runs as a non-root user
-(`uid 1000`) and the bridge listens on `0.0.0.0:8787` inside the container.
+The image installs a SHA256-verified Droid CLI release. Auto-updates are
+enabled by default, so new Droid processes can use newer CLI versions without
+rebuilding the bridge image. Runtime updates are performed by the Droid CLI
+itself and are not covered by the build-time checksum verification, so a
+long-running container can drift from the CLI version in the published image.
+Build or run with updates disabled when the running CLI must match the image
+digest. Droid runs as a non-root user (`uid 1000`) and the bridge listens on
+`0.0.0.0:8787` inside the container.
 
 Run it with a Factory service-account key and a bridge bearer token. Bind
 the port to loopback on the host so the bridge is not exposed to the
@@ -511,6 +516,21 @@ export FACTORY_DROID_OPENAI_API_KEY="$(python -c 'import secrets; print(secrets.
 docker compose up -d
 ```
 
+The update setting is inherited by every Droid subprocess. Droid checks for
+updates when a new process starts. Existing processes keep their current
+version; restarting the container is not required for future requests. Restart
+the container only when all warm sessions must switch immediately. Updates
+modify the current container filesystem, not the published image, so a
+recreated container starts from the image version and checks again.
+
+Runtime updates need a writable `/home/droid/.local/bin` and outbound HTTPS to
+`downloads.factory.ai`. Set `FACTORY_DROID_AUTO_UPDATE_ENABLED=false` when the
+container runs with `--read-only`, runs as a UID other than `1000`, or has no
+such egress; otherwise every new Droid process retries the update. Warm
+sessions start several Droid processes, so the same executable can be replaced
+while other processes are being spawned. Disable updates when the CLI version
+has to stay identical across a burst of requests.
+
 Podman works as a drop-in replacement. Use `podman-compose` or replace
 `docker` with `podman` in the commands above. The compose file uses
 `${VAR:?error}` syntax to require environment variables; set both keys in
@@ -525,9 +545,23 @@ in `docker-compose.yml` when using Compose, to run without a workdir.
 To build the image locally instead of pulling it:
 
 ```bash
+# Runtime auto-updates are enabled by default.
 docker build -t factory-droid-openai .
-# or, pinning the Droid CLI version:
-docker build --build-arg DROID_VERSION=0.174.0 -t factory-droid-openai .
+# Pin the initial CLI release and disable runtime updates:
+docker build \
+  --build-arg DROID_VERSION=0.174.0 \
+  --build-arg DROID_AUTO_UPDATE=false \
+  -t factory-droid-openai .
+```
+
+Override the image default in a running container with
+`FACTORY_DROID_AUTO_UPDATE_ENABLED=false`. The compose file forwards that
+variable from the host only when it is set, so an image built with
+`DROID_AUTO_UPDATE=false` stays pinned without any runtime override:
+
+```bash
+export FACTORY_DROID_AUTO_UPDATE_ENABLED=false
+docker compose up -d
 ```
 
 Authentication inside a container uses `FACTORY_API_KEY` only. Interactive
@@ -1282,6 +1316,7 @@ error types.
 | `FACTORY_DROID_OPENAI_PORT` | `8787` | Listen port |
 | `FACTORY_DROID_OPENAI_API_KEY` | unset | Optional bearer token |
 | `FACTORY_DROID_PATH` | `droid` | Droid executable path |
+| `FACTORY_DROID_AUTO_UPDATE_ENABLED` | unset | Read by the Droid CLI, not the bridge; `false` disables CLI self-updates. The container image sets it from the `DROID_AUTO_UPDATE` build arg |
 | `FACTORY_DROID_OPENAI_WORKDIR` | current directory | Droid working directory |
 | `FACTORY_DROID_OPENAI_TIMEOUT_SECONDS` | `600` | Maximum request duration |
 | `FACTORY_DROID_OPENAI_SESSION_INIT_TIMEOUT_SECONDS` | `60` | Session connect, initialize/load, and tool-safety cap; maximum `60` for `droid-sdk==0.1.2` |

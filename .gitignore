@@ -14,3 +14,4 @@ dist/
 .wrangler/
 traces/
 .playwright-mcp/
+.worktrees/

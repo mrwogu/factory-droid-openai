@@ -9,6 +9,8 @@
 #   The bridge disables all Factory-native tools, so the mount can be
 #   read-only. Remove the volumes block below if you do not need a workdir.
 #   Set FACTORY_DROID_SETTINGS_FILE to mount one Droid settings.json read-only.
+#   Set FACTORY_DROID_AUTO_UPDATE_ENABLED=false to keep the CLI version that
+#   ships in the image instead of updating at runtime.
 #
 # Usage:
 #   export FACTORY_API_KEY=fk-...
@@ -22,18 +24,24 @@ services:
     # Always pull the newest image on `docker compose up`.
     pull_policy: always
     # Build locally instead of pulling the published image:
-    # build: .
+    # build:
+    #   context: .
+    #   args:
+    #     DROID_AUTO_UPDATE: ${DROID_AUTO_UPDATE:-true}
     ports:
       - "127.0.0.1:8787:8787"
     environment:
-      FACTORY_API_KEY: ${FACTORY_API_KEY:?FACTORY_API_KEY must be set}
-      FACTORY_DROID_OPENAI_API_KEY: ${FACTORY_DROID_OPENAI_API_KEY:?FACTORY_DROID_OPENAI_API_KEY must be set}
+      - FACTORY_API_KEY=${FACTORY_API_KEY:?FACTORY_API_KEY must be set}
+      - FACTORY_DROID_OPENAI_API_KEY=${FACTORY_DROID_OPENAI_API_KEY:?FACTORY_DROID_OPENAI_API_KEY must be set}
+      # Forwarded only when set on the host, so an image built with
+      # DROID_AUTO_UPDATE=false stays pinned by default.
+      - FACTORY_DROID_AUTO_UPDATE_ENABLED
       # Optional overrides:
-      # FACTORY_DROID_OPENAI_MAX_CONCURRENCY: "2"
-      # FACTORY_DROID_OPENAI_WARM_SESSIONS: "2"
-      # FACTORY_DROID_OPENAI_TIMEOUT_SECONDS: "600"
-      # FACTORY_DROID_OPENAI_MODEL_CACHE_SECONDS: "300"
-      # FACTORY_DROID_OPENAI_TELEMETRY: "false"
+      # - FACTORY_DROID_OPENAI_MAX_CONCURRENCY=2
+      # - FACTORY_DROID_OPENAI_WARM_SESSIONS=2
+      # - FACTORY_DROID_OPENAI_TIMEOUT_SECONDS=600
+      # - FACTORY_DROID_OPENAI_MODEL_CACHE_SECONDS=300
+      # - FACTORY_DROID_OPENAI_TELEMETRY=false
     # Optional read-only mounts. Uncomment `volumes` and either entry needed.
     # volumes:
     #   - ./:/work:ro
