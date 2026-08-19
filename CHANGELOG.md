@@ -1,5 +1,28 @@
 # Changelog
 
+## [1.7.0](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.12...v1.7.0) (2026-08-19)
+
+
+### Features
+
+* **config:** default max tool calls to the packing cap ([3fcbe19](https://github.com/mrwogu/factory-droid-openai/commit/3fcbe19ba520237f8e8d051aaaa692b323f704d3))
+* **docker:** enable Droid auto-updates ([#100](https://github.com/mrwogu/factory-droid-openai/issues/100)) ([cbdebc3](https://github.com/mrwogu/factory-droid-openai/commit/cbdebc318acaec427e8b5dfd40b405683510a78d)), closes [#99](https://github.com/mrwogu/factory-droid-openai/issues/99)
+* **matrix:** label e2e artifacts ([#97](https://github.com/mrwogu/factory-droid-openai/issues/97)) ([6cea623](https://github.com/mrwogu/factory-droid-openai/commit/6cea623df77694bed3130737a93c1dec4e6d338a))
+* **native:** fail closed on MCP policy blocks ([#98](https://github.com/mrwogu/factory-droid-openai/issues/98)) ([b417ef5](https://github.com/mrwogu/factory-droid-openai/commit/b417ef5f80f0f4bb2008db6130a4321cc9597ee0))
+* **pool:** reuse warm sessions for native tools ([#94](https://github.com/mrwogu/factory-droid-openai/issues/94)) ([cde04e7](https://github.com/mrwogu/factory-droid-openai/commit/cde04e79fa01e80f24511dc773cc3b9e17c0f6a4))
+* **protocol:** recover arg_key calls that lost every opener ([0ef0d5a](https://github.com/mrwogu/factory-droid-openai/commit/0ef0d5af5d5e89dd7a8d7237a5a7f8cb5bbda38c))
+* **protocol:** recover GLM fused name-key tool calls ([09ff4e7](https://github.com/mrwogu/factory-droid-openai/commit/09ff4e7d84c56147595186515ed7c6ac8291bee5))
+* **protocol:** repair fused GLM values with lost escaping ([1b9144a](https://github.com/mrwogu/factory-droid-openai/commit/1b9144ae3f08c99729da31e2c8abdd4a00db843b))
+* **timeout:** bound session initialization ([#96](https://github.com/mrwogu/factory-droid-openai/issues/96)) ([dc1d26a](https://github.com/mrwogu/factory-droid-openai/commit/dc1d26a6ce58102dd36496ad346e80313f47316f))
+* **tools:** call client tools natively over MCP ([4d90aa1](https://github.com/mrwogu/factory-droid-openai/commit/4d90aa127c5a4816fd64ae3102a66c3008679b84))
+
+
+### Bug Fixes
+
+* **protocol:** reject ambiguous fused name splits ([941c9f3](https://github.com/mrwogu/factory-droid-openai/commit/941c9f3e05bfbf5f6847b2f7bc4814b20a7d407a))
+* **runner:** classify transient connection errors ([#82](https://github.com/mrwogu/factory-droid-openai/issues/82)) ([1a3da46](https://github.com/mrwogu/factory-droid-openai/commit/1a3da46d3792f187c84865bbe8bdeee80a76b4b5))
+* **tools:** honour a published tool reported under its bare name ([aa2004a](https://github.com/mrwogu/factory-droid-openai/commit/aa2004a0514d7e759aebb4439ca68b50e108bd05))
+
 ## [1.6.12](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.11...v1.6.12) (2026-08-14)
 
 
