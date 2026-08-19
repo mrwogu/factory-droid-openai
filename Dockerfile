@@ -2,28 +2,35 @@
 #
 # Container image for the Factory Droid OpenAI Bridge.
 #
-# Builds a self-contained image that runs the bridge and a pinned Droid CLI.
+# Builds a self-contained image that runs the bridge and the Droid CLI.
 # The bridge listens on 0.0.0.0:8787 inside the container; bind it to
 # 127.0.0.1 on the host and front it with the bridge bearer token when
 # exposing it beyond loopback.
 #
 # Build args:
-#   PYTHON_VERSION   Python base image tag (default 3.13-slim).
-#   DROID_VERSION    Factory Droid CLI version (default: latest from npm registry).
-#   BRIDGE_VERSION   factory-droid-openai PyPI version (default: install from source).
+#   PYTHON_VERSION     Python base image tag (default 3.13-slim).
+#   DROID_VERSION      Factory Droid CLI version (default: latest from npm registry).
+#   DROID_AUTO_UPDATE  Enable runtime CLI updates (default: true).
+#   BRIDGE_VERSION     factory-droid-openai PyPI version (default: install from source).
 #
-# Droid auto-update is disabled so the resolved CLI version is locked in for the
-# lifetime of the image. Omit DROID_VERSION to auto-resolve latest at build time;
-# set it to pin a specific release.
+# Runtime auto-updates are enabled by default. They are performed by the CLI
+# itself and are not covered by the build-time checksum verification, so set
+# DROID_AUTO_UPDATE=false when the running CLI must match the image digest, or
+# when the container has no writable home directory or no egress to
+# downloads.factory.ai. Omit DROID_VERSION to resolve the latest release at
+# build time; set it to pin the initial release.
 
 ARG PYTHON_VERSION=3.13-slim
 ARG DROID_VERSION
+ARG DROID_AUTO_UPDATE=true
 
 FROM python:${PYTHON_VERSION} AS base
 
 ARG DROID_VERSION
 ARG BRIDGE_VERSION
 
+# FACTORY_DROID_AUTO_UPDATE_ENABLED is false here so no build step can swap the
+# verified binary. The requested runtime value is applied in the last layer.
 ENV FACTORY_DROID_OPENAI_HOST=0.0.0.0 \
     FACTORY_DROID_OPENAI_PORT=8787 \
     FACTORY_DROID_OPENAI_WORKDIR=/work \
@@ -83,10 +90,29 @@ RUN if [ -n "${BRIDGE_VERSION}" ]; then \
 # working directory (Factory-native tools are disabled), so a read-only host
 # mount at /work is safe. Sessions live in the per-user Factory config dir.
 RUN useradd --create-home --uid 1000 droid \
- && mkdir -p /home/droid/.factory \
- && chown -R droid:droid /work /home/droid/.factory
+ && mkdir -p /home/droid/.factory /home/droid/.local/bin \
+ && mv /usr/local/bin/droid /home/droid/.local/bin/droid \
+ && chown -R droid:droid /work /home/droid/.factory /home/droid/.local
+
+# The updater replaces the executable in place, so it has to live in a
+# directory the non-root runtime user owns.
+ENV PATH="/home/droid/.local/bin:${PATH}"
 USER droid
 WORKDIR /work
+
+# Prove the relocated binary resolves through PATH and is executable by the
+# runtime user. Updates are still disabled at this point, so the check cannot
+# replace the verified binary.
+RUN droid --version
+
+# Declared and consumed last, so toggling DROID_AUTO_UPDATE does not
+# invalidate the cached apt and install layers.
+ARG DROID_AUTO_UPDATE
+RUN case "${DROID_AUTO_UPDATE}" in \
+      true|false) ;; \
+      *) echo "DROID_AUTO_UPDATE must be true or false" >&2; exit 1 ;; \
+    esac
+ENV FACTORY_DROID_AUTO_UPDATE_ENABLED=${DROID_AUTO_UPDATE}
 
 EXPOSE 8787
 
