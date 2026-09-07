@@ -540,14 +540,17 @@ async def test_pool_refills_after_a_session_is_taken() -> None:
 async def test_pool_sweeps_expired_sessions_in_the_background() -> None:
     log: list[str] = []
     runner = FakeRunner(log=log)
-    pool = _pool(runner, size=1, ttl_seconds=1.0)
+    pool = _pool(runner, size=2, ttl_seconds=1.0)
     pool.note(KEY)
     pool.offer(_session(created_at=asyncio.get_running_loop().time() - 10.0))
+    pool.offer(_session(created_at=asyncio.get_running_loop().time()))
 
     pool.start()
     await asyncio.sleep(0.05)
 
     assert sorted(log) == ["discard:model-a", "warm:model-a"]
+    assert pool.acquire(KEY) is not None
+    assert pool.acquire(KEY) is not None
     await pool.aclose()
 
 
@@ -558,7 +561,7 @@ async def test_pool_tolerates_warm_failures_without_metrics() -> None:
     pool.start(initial_key=KEY)
     await asyncio.sleep(0.05)
 
-    assert pool.acquire(KEY) is None
+    assert pool.acquire(OTHER_KEY) is None
     await pool.aclose()
 
 
@@ -607,6 +610,54 @@ async def test_pool_moves_capacity_to_the_key_traffic_switched_to() -> None:
     assert sorted(log) == ["discard:model-a", "warm:model-a", "warm:model-b"]
     session = pool.acquire(OTHER_KEY)
     assert session is not None
+    await pool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_first_observed_key_replaces_the_startup_key() -> None:
+    log: list[str] = []
+    runner = FakeRunner(log=log)
+    pool = _pool(runner, size=2)
+
+    pool.start(initial_key=KEY)
+    await asyncio.sleep(0.05)
+    assert log == ["warm:model-a", "warm:model-a"]
+
+    assert pool.acquire(OTHER_KEY) is None
+    await asyncio.sleep(0.05)
+
+    assert log == [
+        "warm:model-a",
+        "warm:model-a",
+        "discard:model-a",
+        "discard:model-a",
+        "warm:model-b",
+        "warm:model-b",
+    ]
+    assert pool.acquire(OTHER_KEY) is not None
+    assert pool.acquire(OTHER_KEY) is not None
+    await pool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_first_observed_effort_reuses_one_startup_session() -> None:
+    log: list[str] = []
+    metrics = BridgeMetrics()
+    runner = FakeRunner(log=log)
+    pool = _pool(runner, size=2, metrics=metrics)
+
+    pool.start(initial_key=KEY)
+    await asyncio.sleep(0.05)
+
+    session = pool.acquire(RETUNE_KEY)
+    await asyncio.sleep(0)
+
+    assert session is not None
+    assert session.key == KEY
+    assert log == ["warm:model-a", "warm:model-a", "discard:model-a"]
+    rendered = metrics.render()
+    assert "factory_droid_openai_warm_session_hits_total 1" in rendered
+    assert 'factory_droid_openai_warm_session_retunes_total{reason="effort"} 1' in rendered
     await pool.aclose()
 
 
