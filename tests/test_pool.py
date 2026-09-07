@@ -22,6 +22,9 @@ KEY = SessionKey(model_id="model-a", reasoning_effort="high")
 OTHER_KEY = SessionKey(model_id="model-b", reasoning_effort=None)
 RETUNE_KEY = SessionKey(model_id="model-a", reasoning_effort="low")
 CROSS_MODEL_KEY = SessionKey(model_id="model-b", reasoning_effort="high")
+# Shape the bridge actually seeds the pool with: the model Droid defaults to.
+SEED_KEY = SessionKey(model_id=None, reasoning_effort=None)
+SEED_EFFORT_KEY = SessionKey(model_id=None, reasoning_effort="high")
 
 
 class FakeTransport:
@@ -658,6 +661,36 @@ async def test_first_observed_effort_reuses_one_startup_session() -> None:
     rendered = metrics.render()
     assert "factory_droid_openai_warm_session_hits_total 1" in rendered
     assert 'factory_droid_openai_warm_session_retunes_total{reason="effort"} 1' in rendered
+    await pool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_model_less_startup_seed_retires_instead_of_retuning() -> None:
+    """An effort change on the startup seed cannot borrow one of its sessions.
+
+    The bridge seeds the pool with the model Droid defaults to, and a session
+    without an explicit model id cannot be repointed, so the whole seed has to
+    retire. Handing one over anyway would fail the turn in the runner.
+    """
+    log: list[str] = []
+    metrics = BridgeMetrics()
+    runner = FakeRunner(log=log)
+    pool = _pool(runner, size=2, metrics=metrics)
+
+    pool.start(initial_key=SEED_KEY)
+    await asyncio.sleep(0.05)
+    assert runner.warmed == 2
+
+    assert pool.acquire(SEED_EFFORT_KEY) is None
+    await asyncio.sleep(0.05)
+
+    assert log.count("discard:None") == 2
+    assert runner.warmed == 4
+    rendered = metrics.render()
+    assert "factory_droid_openai_warm_session_misses_total 1" in rendered
+    assert 'factory_droid_openai_warm_session_retunes_total{reason="effort"} 0' in rendered
+    assert pool.acquire(SEED_EFFORT_KEY) is not None
+    assert pool.acquire(SEED_EFFORT_KEY) is not None
     await pool.aclose()
 
 
