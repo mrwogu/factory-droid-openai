@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.7.1](https://github.com/mrwogu/factory-droid-openai/compare/v1.7.0...v1.7.1) (2026-09-08)
+
+
+### Bug Fixes
+
+* **pool:** retire unused startup demand ([#102](https://github.com/mrwogu/factory-droid-openai/issues/102)) ([a90b241](https://github.com/mrwogu/factory-droid-openai/commit/a90b2418220d907be019f580744fb1a50fa8e9c2))
+
 ## [1.7.0](https://github.com/mrwogu/factory-droid-openai/compare/v1.6.12...v1.7.0) (2026-08-19)
 
 
