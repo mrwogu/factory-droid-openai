@@ -1510,6 +1510,9 @@ Requests that ask for a different model, for the model alias, or for the
 model's default reasoning effort on a session that carries an explicit one,
 log `pool.miss` and wait for a fresh session. The pool tracks the settings
 recent traffic used, so repeat traffic converges on exact matches.
+The initial default-model demand is only a startup seed. When the first
+request asks for another model or reasoning effort, the pool retires that
+unused seed and moves all capacity to the observed demand.
 
 Teardown runs after the response is finished, so session close and the second
 `droid exec` needs to exit no longer delay the last token. Set
@@ -1554,6 +1557,10 @@ DEBUG    2026-07-27T14:10:12+0200 event=droid.cleanup request_id=chatcmpl-8f2a c
 `pool.retune` and `droid.session_retuned` only when a session warmed for the
 same model is reused at another reasoning effort, and cleanup is logged after
 the response because it is detached.
+
+`elapsed_ms` on an intermediate event is the request age when that event was
+logged. A `pool.miss` happens after admission, so its `elapsed_ms` includes
+`queue_ms`; it is not the duration of the pool lookup or session startup.
 
 Phase fields, in the order they occur:
 

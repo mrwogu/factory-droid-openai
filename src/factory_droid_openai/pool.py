@@ -134,6 +134,8 @@ class WarmSessionPool:
         self._native_sessions: dict[_WarmDemand, deque[WarmSession]] = defaultdict(deque)
         self._wanted: list[SessionKey] = []
         self._native_wanted: list[_WarmDemand] = []
+        # Startup cannot know which explicit model the first request will use.
+        self._initial_key: SessionKey | None = None
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
@@ -145,6 +147,7 @@ class WarmSessionPool:
         if not self.enabled or self._task is not None:
             return
         if initial_key is not None:
+            self._initial_key = initial_key
             self.note(initial_key)
         self._task = asyncio.create_task(self._loop())
 
@@ -165,6 +168,7 @@ class WarmSessionPool:
         self._native_sessions.clear()
         self._wanted.clear()
         self._native_wanted.clear()
+        self._initial_key = None
         self._publish()
         for session in sessions:
             self._reaper.submit(self._discard_session(session))
@@ -210,29 +214,39 @@ class WarmSessionPool:
         if not self.enabled:
             return None
         demand = _WarmDemand(key, catalog)
+        initial_demand: _WarmDemand | None = None
+        if self._initial_key is not None:
+            initial_demand = _WarmDemand(self._initial_key)
+            self._initial_key = None
+            if demand == initial_demand:
+                initial_demand = None
+            elif initial_demand.key in self._wanted:
+                self._wanted.remove(initial_demand.key)
         self.note(key, catalog)
         session = self._take_demand(demand)
-        if session is not None:
-            self._publish()
-            if self._metrics is not None:
-                self._metrics.increment_warm_hits()
-            log_debug("pool.hit", model=key.model_id, warm_sessions=self._total())
-            return session
-        session = self._take_retunable(demand)
-        if session is not None:
-            self._publish()
-            if self._metrics is not None:
-                self._metrics.increment_warm_hits()
-                self._metrics.increment_warm_retunes(WARM_RETUNE_EFFORT)
-            log_debug(
-                "pool.retune",
-                model=key.model_id,
-                reason=WARM_RETUNE_EFFORT,
-                warmed_for_effort=session.key.reasoning_effort,
-                warm_sessions=self._total(),
-            )
-            return session
+        retuned = False
+        if session is None:
+            session = self._take_retunable(demand)
+            retuned = session is not None
+        if initial_demand is not None:
+            self._drop_demand(initial_demand)
         self._publish()
+        if session is not None:
+            if self._metrics is not None:
+                self._metrics.increment_warm_hits()
+                if retuned:
+                    self._metrics.increment_warm_retunes(WARM_RETUNE_EFFORT)
+            if retuned:
+                log_debug(
+                    "pool.retune",
+                    model=key.model_id,
+                    reason=WARM_RETUNE_EFFORT,
+                    warmed_for_effort=session.key.reasoning_effort,
+                    warm_sessions=self._total(),
+                )
+            else:
+                log_debug("pool.hit", model=key.model_id, warm_sessions=self._total())
+            return session
         if self._metrics is not None:
             self._metrics.increment_warm_misses()
         log_debug("pool.miss", model=key.model_id, warm_sessions=self._total())

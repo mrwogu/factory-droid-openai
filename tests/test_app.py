@@ -4123,6 +4123,40 @@ async def test_chat_completion_uses_a_warm_session(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_text_tool_catalogs_share_warm_session_demand(tmp_path: Path) -> None:
+    runner = FakeRunner([TextDelta("hi"), RunComplete(Usage())])
+    app = _app(tmp_path, runner)
+    key = SessionKey(model_id="gpt-5.6-luna", reasoning_effort="none")
+    app.state.pool.note(key)
+    app.state.pool.offer(_warm_session(key))
+    app.state.pool.offer(_warm_session(key))
+
+    async with _client(app) as client:
+        for name in ("search_observations", "recall"):
+            response = await client.post(
+                "/v1/chat/completions",
+                json=_payload(
+                    model="gpt-5.6-luna",
+                    reasoning_effort="none",
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                ),
+            )
+            assert response.status_code == 200
+
+    assert len(runner.requests) == 2
+    assert all(request.warm_session is not None for request in runner.requests)
+    assert "factory_droid_openai_warm_session_hits_total 2" in app.state.metrics.render()
+
+
+@pytest.mark.asyncio
 async def test_warm_session_key_follows_the_configured_reasoning_effort(tmp_path: Path) -> None:
     runner = FakeRunner([TextDelta("hi"), RunComplete(Usage())])
     settings = Settings(
