@@ -258,6 +258,7 @@ class WarmSessionPool:
         while queue:
             session = queue.popleft()
             if self._usable(session):
+                self._touch(queue)
                 return session
             self._discard(session)
         return None
@@ -275,6 +276,7 @@ class WarmSessionPool:
             while queue:
                 session = queue.popleft()
                 if self._usable(session):
+                    self._touch(queue)
                     return session
                 self._discard(session)
         return None
@@ -388,6 +390,18 @@ class WarmSessionPool:
             return False
         age = asyncio.get_running_loop().time() - session.created_at
         return age < self._ttl_seconds
+
+    def _touch(self, queue: deque[WarmSession]) -> None:
+        """Refresh-on-use: keep the sessions a hit leaves behind alive.
+
+        Without the refresh the TTL retires a queue steady traffic keeps
+        serving from, and every rotation turns the next request into a cold
+        start. A demand without traffic never touches its queue, so idle
+        sessions still expire.
+        """
+        now = asyncio.get_running_loop().time()
+        for session in queue:
+            session.created_at = now
 
     def _drop_stale(self) -> None:
         for queues in (self._sessions, self._native_sessions):

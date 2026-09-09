@@ -1323,7 +1323,7 @@ error types.
 | `FACTORY_DROID_OPENAI_BODY_TIMEOUT_SECONDS` | `30` | Maximum time to receive a request body |
 | `FACTORY_DROID_OPENAI_MAX_CONCURRENCY` | `2` | Concurrent Droid subprocesses |
 | `FACTORY_DROID_OPENAI_WARM_SESSIONS` | `MAX_CONCURRENCY + 1` | Pre-started Droid sessions kept ready (`0` disables) |
-| `FACTORY_DROID_OPENAI_WARM_SESSION_TTL_SECONDS` | `600` | Age at which an unused warm session is replaced |
+| `FACTORY_DROID_OPENAI_WARM_SESSION_TTL_SECONDS` | `600` | Idle age at which a warm session is replaced; every pool hit refreshes it |
 | `FACTORY_DROID_OPENAI_DETACHED_CLEANUP` | `true` | Tear down Droid processes after the response is sent |
 | `FACTORY_DROID_OPENAI_MAX_QUEUE_SIZE` | `8` | Requests waiting for a Droid slot |
 | `FACTORY_DROID_OPENAI_RETRY_AFTER_SECONDS` | `1` | `Retry-After` value sent with `429` |
@@ -1509,7 +1509,11 @@ calls in `<|tool_calls_section_begin|>` where K3 uses `<|open|>tools<|sep|>`.
 Requests that ask for a different model, for the model alias, or for the
 model's default reasoning effort on a session that carries an explicit one,
 log `pool.miss` and wait for a fresh session. The pool tracks the settings
-recent traffic used, so repeat traffic converges on exact matches.
+recent traffic used, so repeat traffic converges on exact matches. Every
+hit also refreshes the `FACTORY_DROID_OPENAI_WARM_SESSION_TTL_SECONDS`
+clock of the sessions it leaves behind, so the TTL retires only demands
+whose traffic actually stopped instead of rotating a busy working set on a
+fixed schedule.
 The initial default-model demand is only a startup seed. When the first
 request asks for another model or reasoning effort, the pool retires that
 unused seed and moves all capacity to the observed demand.

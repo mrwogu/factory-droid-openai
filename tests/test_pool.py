@@ -219,6 +219,44 @@ async def test_pool_discards_dead_and_expired_sessions() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pool_refreshes_the_ttl_of_sessions_a_hit_leaves_behind() -> None:
+    # A steady stream must not lose its working set to the fixed TTL. The
+    # second session is just inside the TTL at hit time, the hit refreshes it,
+    # so it is still usable 50 ms later where its original creation time
+    # would have expired.
+    pool = _pool(FakeRunner(), size=2, ttl_seconds=1.0)
+    pool.note(KEY)
+    now = asyncio.get_running_loop().time()
+    pool.offer(_session(created_at=now))
+    pool.offer(_session(created_at=now - 0.999))
+
+    first = pool.acquire(KEY)
+    await asyncio.sleep(0.05)
+
+    assert first is not None
+    assert pool.acquire(KEY) is not None
+    await pool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_pool_refreshes_the_ttl_of_sessions_a_retune_borrows() -> None:
+    # A retune is a hit too: the borrow refreshes the sessions the retuned
+    # queue still holds, so traffic moving between efforts keeps them warm.
+    pool = _pool(FakeRunner(), size=2, ttl_seconds=1.0)
+    pool.note(KEY)
+    now = asyncio.get_running_loop().time()
+    pool.offer(_session(KEY, created_at=now))
+    pool.offer(_session(KEY, created_at=now - 0.999))
+
+    borrowed = pool.acquire(RETUNE_KEY)
+    await asyncio.sleep(0.05)
+
+    assert borrowed is not None
+    assert pool.acquire(KEY) is not None
+    await pool.aclose()
+
+
+@pytest.mark.asyncio
 async def test_pool_drops_sessions_for_keys_that_fell_out_of_use() -> None:
     log: list[str] = []
     pool = _pool(FakeRunner(log=log), size=4, max_keys=1)
