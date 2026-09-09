@@ -1357,6 +1357,71 @@ def _decode_lost_prefix(
     return None
 
 
+# One dropped member per repair, so a payload that keeps failing is a shape
+# this decoder does not exist for and the budget stops the surgery.
+_MAX_DANGLING_MEMBER_REPAIRS = 8
+_MEMBER_SEPARATOR_AT_END = re.compile(r",[ \t\r\n]*\Z")
+
+
+def _drop_dangling_member(value: str, pos: int) -> str | None:
+    """Deletes the member fragment json reports a missing colon behind.
+
+    ``pos`` is where json expected the ``:`` after a key string, so the last
+    quote before it closed that key. When the key content starts with a
+    structural close, that quote is really the orphaned opening quote of a
+    member whose key never arrived, and the separator in front of it belongs
+    to the same dead member. Deleting both lets the container close where
+    the model closed it.
+    """
+    close = value.rfind('"', 0, pos)
+    start = value.rfind('"', 0, close)
+    key = value[start + 1 : close]
+    if not key.startswith(("}", "]")):
+        return None
+    separator = _MEMBER_SEPARATOR_AT_END.search(value, 0, start)
+    if separator is None:
+        return None
+    return value[: separator.start()] + value[start + 1 :]
+
+
+def _decode_dangling_member(
+    body: str,
+    allowed_tool_names: frozenset[str],
+) -> list[dict[str, Any]] | None:
+    """Rebuilds a JSON call whose members lost their keys entirely.
+
+    Observed on gpt-5.6-luna ``done`` calls with long arguments: where an
+    object should carry its next member, the model emits only the separator
+    and an opening quote, so a payload like ``..."],"},{"heading":...`` hands
+    json a stray string it reads as the key ``},{`` and rejects for a missing
+    colon. Deleting the fragment drops only the member whose key never
+    arrived and leaves the rest strict JSON validates; any other break shape
+    stays rejected. Only one call per marker pair is rebuilt: a packed
+    payload fails the strict re-parse instead of being guessed apart.
+    """
+    value = body
+    for _ in range(_MAX_DANGLING_MEMBER_REPAIRS):
+        try:
+            parsed = parse_strict_json(value)
+        except json.JSONDecodeError as exc:
+            if exc.msg != "Expecting ':' delimiter":
+                return None
+            repaired = _drop_dangling_member(value, exc.pos)
+            if repaired is None:
+                return None
+            value = repaired
+        except ValueError:
+            return None
+        else:
+            if not isinstance(parsed, dict):
+                return None
+            name = parsed.get("name")
+            if not isinstance(name, str) or name not in allowed_tool_names:
+                return None
+            return [cast("dict[str, Any]", parsed)]
+    return None
+
+
 PAYLOAD_DECODERS: tuple[PayloadDecoder, ...] = (
     PayloadDecoder("pipe_tag_tokens", _decode_pipe_tag_tokens),
     PayloadDecoder("kimi_sections", _decode_kimi_sections),
@@ -1370,6 +1435,7 @@ PAYLOAD_DECODERS: tuple[PayloadDecoder, ...] = (
     PayloadDecoder("arg_key_lost_open", _decode_arg_key_lost_open),
     PayloadDecoder("lost_prefix_fused", _decode_lost_prefix_fused),
     PayloadDecoder("lost_prefix_fused_repair", _decode_lost_prefix_fused_repair),
+    PayloadDecoder("dangling_member", _decode_dangling_member),
     PayloadDecoder("bare_name", _decode_bare_name),
     PayloadDecoder("bare_call", _decode_bare_call),
 )

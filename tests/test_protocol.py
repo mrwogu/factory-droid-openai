@@ -1936,6 +1936,92 @@ def test_stream_parser_repairs_fenced_payload() -> None:
     assert json.loads(emissions[0].arguments) == {"city": "Sopot"}
 
 
+def test_stream_parser_repairs_dropped_member_keys_in_native_calls() -> None:
+    # gpt-5.6-luna emitted the done call with one member's key missing
+    # entirely, leaving a dangling `,"` fragment before the object close.
+    parser = ToolCallStreamParser(frozenset({"done"}))
+    body = (
+        '{"name":"done","arguments":{"memory_ids":["f34658e4"],"facts":['
+        '{"level":"info","heading":"head","content":["x"]},'
+        '{"heading":"head","content":["makes zero runtime IAM network calls."],"},'
+        '{"heading":"Why the approach changed","level":"info","content":["y"]}'
+        "]}}"
+    )
+
+    emissions = parser.feed(f"{TOOL_CALL_OPEN}{body}{TOOL_CALL_CLOSE}")
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert emissions[0].name == "done"
+    # The repair drops only the member whose key never arrived; the object
+    # that lost it keeps the members that did arrive.
+    assert json.loads(emissions[0].arguments) == {
+        "memory_ids": ["f34658e4"],
+        "facts": [
+            {"level": "info", "heading": "head", "content": ["x"]},
+            {"heading": "head", "content": ["makes zero runtime IAM network calls."]},
+            {"heading": "Why the approach changed", "level": "info", "content": ["y"]},
+        ],
+    }
+
+
+def test_stream_parser_repairs_several_dropped_member_keys() -> None:
+    parser = ToolCallStreamParser(frozenset({"done"}))
+    body = '{"name":"done","arguments":{"facts":[{"a":1,"},{"b":2,"},{"c":3}]}}'
+
+    emissions = parser.feed(f"{TOOL_CALL_OPEN}{body}{TOOL_CALL_CLOSE}")
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == {"facts": [{"a": 1}, {"b": 2}, {"c": 3}]}
+
+
+def test_stream_parser_repairs_dropped_member_keys_with_pretty_whitespace() -> None:
+    parser = ToolCallStreamParser(frozenset({"done"}))
+    body = '{"name":"done","arguments":{"facts":[{"content":["x"],  "},{"heading":"y"}]}}'
+
+    emissions = parser.feed(f"{TOOL_CALL_OPEN}{body}{TOOL_CALL_CLOSE}")
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == {"facts": [{"content": ["x"]}, {"heading": "y"}]}
+
+
+def test_stream_parser_stops_repairing_after_the_dangling_member_budget() -> None:
+    parser = ToolCallStreamParser(frozenset({"done"}))
+    facts = "".join(f'{{"a":{index},"}},' for index in range(9)) + '{"end":1}'
+    body = f'{{"name":"done","arguments":{{"facts":[{facts}]}}}}'
+
+    with pytest.raises(MalformedToolCallError, match="invalid tool-call JSON"):
+        parser.feed(f"{TOOL_CALL_OPEN}{body}{TOOL_CALL_CLOSE}")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # A syntax error other than the dropped-member colon shape.
+        '{"name":"done","arguments":{"a":',
+        # Duplicate keys keep their strict rejection instead of a repair.
+        '{"name":"done","name":"done","arguments":{}}',
+        # A missing colon behind a plain key is not a dropped member.
+        '{"a" "b"}',
+        # A structural-looking key without a separator is not a fragment.
+        '{"}x"}',
+        # A repaired payload that is not one call object stays rejected.
+        '[{"a":1,"},{"b":2}]',
+        # The repaired call must still name an allowed tool.
+        '{"name":"delete_file","arguments":{"facts":[{"a":1,"},{"b":2}]}}',
+        # A non-string name keeps its strict rejection.
+        '{"name":123,"arguments":{"facts":[{"a":1,"},{"b":2}]}}',
+    ],
+)
+def test_stream_parser_keeps_dropped_member_repairs_fail_closed(body: str) -> None:
+    parser = ToolCallStreamParser(frozenset({"done"}))
+
+    with pytest.raises(MalformedToolCallError, match="invalid tool-call JSON"):
+        parser.feed(f"{TOOL_CALL_OPEN}{body}{TOOL_CALL_CLOSE}")
+
+
 def test_stream_parser_repairs_unterminated_fence() -> None:
     parser = ToolCallStreamParser(frozenset({"weather"}))
 

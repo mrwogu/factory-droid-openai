@@ -181,6 +181,11 @@ _DECODER_FIXTURES = (
         'weathercity":"Gda"nsk"}',
         {"city": 'Gda"nsk'},
     ),
+    RecoveryFixture(
+        "dangling_member",
+        '{"name":"weather","arguments":{"city":"Gdansk","notes":[{"sky":"clear","},{"sky":"cloudy"}]}}',
+        {"city": "Gdansk", "notes": [{"sky": "clear"}, {"sky": "cloudy"}]},
+    ),
     RecoveryFixture("bare_name", 'weather\n{"city":"Gdansk"}', {"city": "Gdansk"}),
     RecoveryFixture("bare_call", 'weather{"city":"Gdansk"}', {"city": "Gdansk"}),
 )
@@ -290,6 +295,7 @@ _SINGLE_CALL_DECODERS = frozenset(
         "harmony_commentary",
         "arg_key_value",
         "bare_name",
+        "dangling_member",
     }
 )
 
