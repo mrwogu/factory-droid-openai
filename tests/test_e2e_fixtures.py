@@ -79,6 +79,10 @@ def test_events_are_grouped_per_request_in_arrival_order(fixtures_script: Module
         json.loads(_trace_line("req-5", {"kind": "text_delta"}, attempt="bad")),
         json.loads(_trace_line("req-6", {"kind": "text_delta"}, choice=-1)),
         json.loads(_trace_line("req-7", {"kind": "text_delta"}, choice="bad")),
+        json.loads(_trace_line("req-8", {"kind": "text_delta"}, attempt=True)),
+        json.loads(_trace_line("req-9", {"kind": "text_delta"}, attempt=False)),
+        json.loads(_trace_line("req-10", {"kind": "text_delta"}, choice=True)),
+        json.loads(_trace_line("req-11", {"kind": "text_delta"}, choice=False)),
     ]
 
     grouped = fixtures_script.group_events(trace)

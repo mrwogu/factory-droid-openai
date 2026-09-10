@@ -137,26 +137,36 @@ async def test_reaper_waits_only_for_matching_session_cleanup() -> None:
     sibling_release = asyncio.Event()
     second_started = asyncio.Event()
     second_release = asyncio.Event()
+    first_completed = asyncio.Event()
+    sibling_completed = asyncio.Event()
+    second_completed = asyncio.Event()
 
-    async def teardown(started: asyncio.Event, release: asyncio.Event) -> None:
+    async def teardown(
+        started: asyncio.Event,
+        release: asyncio.Event,
+        completed: asyncio.Event,
+    ) -> None:
         started.set()
         await release.wait()
+        completed.set()
 
-    reaper.submit(teardown(first_started, first_release), key="session-1")
-    reaper.submit(teardown(sibling_started, sibling_release), key="session-1")
-    reaper.submit(teardown(second_started, second_release), key="session-2")
+    reaper.submit(teardown(first_started, first_release, first_completed), key="session-1")
+    reaper.submit(teardown(sibling_started, sibling_release, sibling_completed), key="session-1")
+    reaper.submit(teardown(second_started, second_release, second_completed), key="session-2")
     await first_started.wait()
     await sibling_started.wait()
     await second_started.wait()
     wait = asyncio.create_task(reaper.wait_for("session-1"))
     first_release.set()
-    await asyncio.sleep(0)
+    await first_completed.wait()
     assert not wait.done()
     sibling_release.set()
+    await sibling_completed.wait()
     await wait
 
     assert not second_release.is_set()
     second_release.set()
+    await second_completed.wait()
     await reaper.drain()
 
 

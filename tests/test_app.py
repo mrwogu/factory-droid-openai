@@ -40,6 +40,7 @@ from factory_droid_openai.app import (
     _telemetry_error_category,
     _validation_message,
     _wait_for_disconnect,
+    _wait_for_retry_cleanup,
     create_app,
 )
 from factory_droid_openai.config import Settings
@@ -207,7 +208,7 @@ class FakeRunner:
 
 
 class RetryRunner(FakeRunner):
-    def __init__(self, attempts: list[list[RunEvent]]) -> None:
+    def __init__(self, attempts: list[str]) -> None:
         super().__init__([])
         self.attempts = attempts
 
@@ -216,7 +217,7 @@ class RetryRunner(FakeRunner):
         if request.warm_session is not None:
             request.warm_session.consumed = True
         try:
-            for event in self.attempts[len(self.requests) - 1]:
+            for event in _recorded_events(self.attempts[len(self.requests) - 1]):
                 yield event
         finally:
             self.closed = True
@@ -2388,19 +2389,8 @@ async def test_non_streaming_malformed_tool_call_retries_same_session(tmp_path: 
     trace_path = tmp_path / "trace.jsonl"
     runner = RetryRunner(
         [
-            [
-                SessionStarted("session-109"),
-                TextDelta(f"{TOOL_CALL_OPEN}not json{TOOL_CALL_CLOSE}"),
-                RunComplete(Usage(input_tokens=10, output_tokens=4)),
-            ],
-            [
-                SessionStarted("session-109"),
-                TextDelta(
-                    f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":'
-                    f'{{"city":"Gdansk"}}}}{TOOL_CALL_CLOSE}'
-                ),
-                RunComplete(Usage(input_tokens=16, output_tokens=8)),
-            ],
+            "retry/malformed-tool.jsonl",
+            "retry/valid-tool.jsonl",
         ]
     )
     payload = _payload(
@@ -2434,7 +2424,7 @@ async def test_non_streaming_malformed_tool_call_retries_same_session(tmp_path: 
         "prompt_tokens_details": {"cached_tokens": 0},
     }
     assert len(runner.requests) == 2
-    assert runner.requests[1].session_id == "session-109"
+    assert runner.requests[1].session_id == "replay-session"
     assert runner.requests[1].warm_session is None
     assert runner.requests[1].images == ()
     assert runner.requests[1].documents == ()
@@ -2463,16 +2453,8 @@ async def test_non_streaming_malformed_tool_call_retries_same_session(tmp_path: 
 async def test_non_streaming_truncated_tool_call_retries_same_session(tmp_path: Path) -> None:
     runner = RetryRunner(
         [
-            [
-                SessionStarted("session-112"),
-                TextDelta(f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":'),
-                RunComplete(Usage()),
-            ],
-            [
-                SessionStarted("session-112"),
-                TextDelta("No tool needed"),
-                RunComplete(Usage()),
-            ],
+            "retry/truncated-tool.jsonl",
+            "retry/plain-answer.jsonl",
         ]
     )
     payload = _payload(
@@ -2487,9 +2469,9 @@ async def test_non_streaming_truncated_tool_call_retries_same_session(tmp_path: 
         response = await client.post("/v1/chat/completions", json=payload)
 
     assert response.status_code == 200
-    assert response.json()["choices"][0]["message"]["content"] == "No tool needed"
+    assert response.json()["choices"][0]["message"]["content"] == "Direct answer"
     assert len(runner.requests) == 2
-    assert runner.requests[1].session_id == "session-112"
+    assert runner.requests[1].session_id == "replay-session"
     assert "incomplete" in runner.requests[1].prompt
 
 
@@ -2499,16 +2481,8 @@ async def test_non_streaming_truncated_phantom_tool_retries_without_tools(
 ) -> None:
     runner = RetryRunner(
         [
-            [
-                SessionStarted("session-112"),
-                TextDelta(f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":'),
-                RunComplete(Usage()),
-            ],
-            [
-                SessionStarted("session-112"),
-                TextDelta("Direct answer"),
-                RunComplete(Usage()),
-            ],
+            "retry/truncated-tool.jsonl",
+            "retry/plain-answer.jsonl",
         ]
     )
     async with _client(_app(tmp_path, runner)) as client:
@@ -2526,16 +2500,8 @@ async def test_truncated_phantom_tool_keeps_no_tool_retry_for_structured_output(
 ) -> None:
     runner = RetryRunner(
         [
-            [
-                SessionStarted("session-112"),
-                TextDelta(f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":'),
-                RunComplete(Usage()),
-            ],
-            [
-                SessionStarted("session-112"),
-                TextDelta('{"answer":7}'),
-                RunComplete(Usage()),
-            ],
+            "retry/truncated-tool.jsonl",
+            "retry/valid-structured-output.jsonl",
         ]
     )
     async with _client(_app(tmp_path, runner)) as client:
@@ -2552,19 +2518,10 @@ async def test_truncated_phantom_tool_keeps_no_tool_retry_for_structured_output(
 
 @pytest.mark.asyncio
 async def test_non_streaming_tool_without_catalog_retries_same_session(tmp_path: Path) -> None:
-    marker = f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{}}}}{TOOL_CALL_CLOSE}'
     runner = RetryRunner(
         [
-            [
-                SessionStarted("session-112"),
-                TextDelta(marker),
-                RunComplete(Usage()),
-            ],
-            [
-                SessionStarted("session-112"),
-                TextDelta("Direct answer"),
-                RunComplete(Usage()),
-            ],
+            "retry/valid-tool.jsonl",
+            "retry/plain-answer.jsonl",
         ]
     )
     async with _client(_app(tmp_path, runner)) as client:
@@ -2573,7 +2530,7 @@ async def test_non_streaming_tool_without_catalog_retries_same_session(tmp_path:
     assert response.status_code == 200
     assert response.json()["choices"][0]["message"]["content"] == "Direct answer"
     assert len(runner.requests) == 2
-    assert runner.requests[1].session_id == "session-112"
+    assert runner.requests[1].session_id == "replay-session"
     assert "no tools are available" in runner.requests[1].prompt
 
 
@@ -2581,12 +2538,12 @@ async def test_non_streaming_tool_without_catalog_retries_same_session(tmp_path:
 async def test_non_streaming_retry_stays_bounded_when_tool_call_is_still_malformed(
     tmp_path: Path,
 ) -> None:
-    malformed: list[RunEvent] = [
-        SessionStarted("session-109"),
-        TextDelta(f"{TOOL_CALL_OPEN}not json{TOOL_CALL_CLOSE}"),
-        RunComplete(Usage()),
-    ]
-    runner = RetryRunner([malformed, malformed])
+    runner = RetryRunner(
+        [
+            "retry/malformed-tool.jsonl",
+            "retry/malformed-tool.jsonl",
+        ]
+    )
     payload = _payload(
         tools=[
             {
@@ -2606,19 +2563,8 @@ async def test_non_streaming_retry_stays_bounded_when_tool_call_is_still_malform
 
 
 @pytest.mark.asyncio
-async def test_non_streaming_retry_cleanup_wait_respects_request_deadline(
-    tmp_path: Path,
-) -> None:
-    runner = RetryRunner(
-        [
-            [
-                SessionStarted("xxxxxxxx"),
-                TextDelta(f"{TOOL_CALL_OPEN}not json{TOOL_CALL_CLOSE}"),
-                RunComplete(Usage()),
-            ]
-        ]
-    )
-    app = _app(tmp_path, runner)
+async def test_retry_cleanup_wait_respects_expired_deadline() -> None:
+    reaper = BackgroundReaper()
     cleanup_started = asyncio.Event()
     cleanup_release = asyncio.Event()
 
@@ -2626,27 +2572,22 @@ async def test_non_streaming_retry_cleanup_wait_respects_request_deadline(
         cleanup_started.set()
         await cleanup_release.wait()
 
-    app.state.reaper.submit(cleanup(), key="xxxxxxxx")
+    reaper.submit(cleanup(), key="replay-session")
     await cleanup_started.wait()
-    async with _client(app) as client:
-        response = await client.post(
-            "/v1/chat/completions",
-            json=_payload(
-                timeout=0.01,
-                tools=[
-                    {
-                        "type": "function",
-                        "function": {"name": "weather", "parameters": {}},
-                    }
-                ],
-            ),
-        )
-    cleanup_release.set()
-    await app.state.reaper.drain()
+    try:
+        with pytest.raises(RunnerError) as exc_info:
+            await _wait_for_retry_cleanup(
+                reaper,
+                session_id="replay-session",
+                deadline=asyncio.get_running_loop().time() - 1.0,
+                timeout_seconds=10.0,
+            )
+    finally:
+        cleanup_release.set()
+        await reaper.drain()
 
-    assert response.status_code == 504
-    assert response.json()["error"]["type"] == "factory_droid_timeout"
-    assert len(runner.requests) == 1
+    assert exc_info.value.status_code == 504
+    assert exc_info.value.error_type == "factory_droid_timeout"
 
 
 @pytest.mark.asyncio
@@ -4251,16 +4192,8 @@ async def test_invalid_structured_output_fails_closed(
 async def test_invalid_structured_output_retries_same_session(tmp_path: Path) -> None:
     runner = RetryRunner(
         [
-            [
-                SessionStarted("session-112"),
-                TextDelta('{"answer":"wrong"}'),
-                RunComplete(Usage()),
-            ],
-            [
-                SessionStarted("session-112"),
-                TextDelta('{"answer":7}'),
-                RunComplete(Usage()),
-            ],
+            "retry/invalid-structured-output.jsonl",
+            "retry/valid-structured-output.jsonl",
         ]
     )
     schema = {
@@ -4283,7 +4216,7 @@ async def test_invalid_structured_output_retries_same_session(tmp_path: Path) ->
     assert response.status_code == 200
     assert response.json()["choices"][0]["message"]["content"] == '{"answer":7}'
     assert len(runner.requests) == 2
-    assert runner.requests[1].session_id == "session-112"
+    assert runner.requests[1].session_id == "replay-session"
     assert runner.requests[1].output_format == {
         "type": "json_schema",
         "schema": schema,
@@ -4565,16 +4498,7 @@ async def test_structured_output_over_the_depth_limit_fails_closed(
 async def test_structured_output_over_the_parser_depth_limit_is_not_retried(
     tmp_path: Path,
 ) -> None:
-    nested = "[" * 600 + "0" + "]" * 600
-    runner = RetryRunner(
-        [
-            [
-                SessionStarted("session-deep"),
-                TextDelta(nested),
-                RunComplete(Usage()),
-            ]
-        ]
-    )
+    runner = RetryRunner(["retry/depth-limit-structured-output.jsonl"])
     async with _client(_app(tmp_path, runner)) as client:
         response = await client.post(
             "/v1/chat/completions",

@@ -1,0 +1,4 @@
+{"kind": "meta", "scenario": "retry_plain_answer", "stream": false, "recorded_model": "seed", "expect_verdict": "pass"}
+{"kind": "session_started"}
+{"kind": "text_delta", "text": "Direct answer"}
+{"kind": "run_complete", "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "prompt_tokens_details": {"cached_tokens": 0}}}

@@ -59,10 +59,10 @@ def group_events(trace: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]
             # Head mode truncates payloads, so only full traces can be replayed.
             continue
         attempt = record.get("attempt", 0)
-        if not isinstance(attempt, int) or attempt < 0:
+        if type(attempt) is not int or attempt < 0:
             continue
         choice = record.get("choice", 0)
-        if not isinstance(choice, int) or choice < 0:
+        if type(choice) is not int or choice < 0:
             continue
         key = (request_id, choice)
         previous_attempt = latest_attempt.get(key)
