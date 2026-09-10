@@ -298,8 +298,9 @@ the partial output cannot consume the retry's context. Explicit continuations
 and other invalid outputs retry inside the same Droid session because their
 earlier history is not available in the current request. Same-session retries
 do not resend the prompt or attachments. Every retry keeps the original request
-deadline. A repeated failure still returns the notice. Streaming requests are
-not retried because response bytes may already have reached the client.
+deadline. A repeated malformed call still returns the notice, while a repeated
+truncated call returns `finish_reason="length"` without it. Streaming requests
+are not retried because response bytes may already have reached the client.
 Intermediate truncations log as `chat.attempt_truncated`; `chat.truncated` is
 reserved for the final request outcome.
 When an earlier call in the same turn did complete, the turn keeps
