@@ -291,11 +291,17 @@ and a plain-text bridge notice. The malformed JSON and the call are dropped,
 never executed or returned to the client. The notice names no tool-call
 format, because anything it named would itself be tool-call-shaped text in
 assistant content. Before returning that notice, a non-streaming request retries
-one malformed or incomplete call inside the same Droid session when no valid
-call was already produced. The retry uses a fixed correction prompt, keeps the
-original request deadline, and does not resend the original prompt or
-attachments. A repeated failure still returns the notice. Streaming requests
-are not retried because response bytes may already have reached the client.
+one malformed or incomplete call when no valid call was already produced. For
+an isolated request, a truncated tool call starts a fresh Droid session with
+the full original prompt, attachments, and a fixed correction instruction, so
+the partial output cannot consume the retry's context. Explicit continuations
+and other invalid outputs retry inside the same Droid session because their
+earlier history is not available in the current request. Same-session retries
+do not resend the prompt or attachments. Every retry keeps the original request
+deadline. A repeated failure still returns the notice. Streaming requests are
+not retried because response bytes may already have reached the client.
+Intermediate truncations log as `chat.attempt_truncated`; `chat.truncated` is
+reserved for the final request outcome.
 When an earlier call in the same turn did complete, the turn keeps
 `finish_reason="tool_calls"` so the client runs the call it already received.
 Close markers inside JSON strings are argument data, not framing. Ambiguous

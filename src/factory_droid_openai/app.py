@@ -140,7 +140,7 @@ _MODEL_OUTPUT_RETRY_PROMPTS: dict[ModelOutputRetryReason, str] = {
         "the original request directly without any tool call or explanation about this correction."
     ),
     "truncated_tool_call": (
-        "Your previous tool call was incomplete. Return the required tool call again as one "
+        "A previous tool call attempt was incomplete. Return the required tool call as one "
         "complete valid tool call. Output no explanation."
     ),
 }
@@ -1730,12 +1730,16 @@ def create_app(
                             reason=retry_reason,
                         )
                         metrics.record_features((f"model_output_retry:{retry_reason}",))
-                        await _wait_for_retry_cleanup(
-                            reaper,
-                            session_id=attempt_session_id,
-                            deadline=deadline,
-                            timeout_seconds=timeout_seconds,
-                        )
+                        if (
+                            retry_reason != "truncated_tool_call"
+                            or choice_request.session_id is not None
+                        ):
+                            await _wait_for_retry_cleanup(
+                                reaper,
+                                session_id=attempt_session_id,
+                                deadline=deadline,
+                                timeout_seconds=timeout_seconds,
+                            )
                         attempt_request = _model_output_retry_request(
                             choice_request,
                             session_id=attempt_session_id,
@@ -1744,8 +1748,18 @@ def create_app(
                         attempt = 1
 
                     completed_result = cast("CollectedCompletion", result)
-                    if completed_result.truncated:
+                    if completed_result.truncation is not None:
                         request.state.stream_outcome = "truncated"
+                        _log_truncated_tool_call(
+                            "chat.truncated",
+                            completed_result.truncation,
+                            stream=False,
+                            run_request=attempt_request,
+                            usage=completed_result.usage,
+                            attempt=attempt,
+                            choice=index,
+                            warm_age_ms=completed_result.warm_age_ms,
+                        )
                     elif completed_result.malformed_note is not None:
                         request.state.stream_outcome = "malformed"
                     if completed_result.session_id is not None:
@@ -1823,6 +1837,17 @@ class BridgeHTTPError(Exception):
         self.headers = headers
 
 
+@dataclass(frozen=True, slots=True)
+class _TruncatedToolCall:
+    reason: str
+    tool_name: str | None
+    payload_bytes: int
+
+    @classmethod
+    def from_error(cls, exc: IncompleteToolCallError) -> _TruncatedToolCall:
+        return cls(str(exc), exc.tool_name, exc.payload_bytes)
+
+
 class CollectedCompletion:
     def __init__(self) -> None:
         self.text_parts: list[str] = []
@@ -1832,7 +1857,8 @@ class CollectedCompletion:
         self.completed = False
         self.session_id: str | None = None
         self.stopped = False
-        self.truncated = False
+        self.truncation: _TruncatedToolCall | None = None
+        self.warm_age_ms: float | None = None
         self.malformed_note: str | None = None
 
     @property
@@ -1842,6 +1868,10 @@ class CollectedCompletion:
     @property
     def reasoning(self) -> str:
         return "".join(self.reasoning_parts)
+
+    @property
+    def truncated(self) -> bool:
+        return self.truncation is not None
 
 
 def _completion_retry_reason(
@@ -1876,6 +1906,13 @@ def _model_output_retry_request(
     session_id: str,
     reason: ModelOutputRetryReason,
 ) -> RunRequest:
+    if reason == "truncated_tool_call" and request.session_id is None:
+        return replace(
+            request,
+            prompt=f"{request.prompt}\n\n{_MODEL_OUTPUT_RETRY_PROMPTS[reason]}",
+            session_id=None,
+            warm_session=None,
+        )
     return replace(
         request,
         prompt=_MODEL_OUTPUT_RETRY_PROMPTS[reason],
@@ -1883,6 +1920,40 @@ def _model_output_retry_request(
         documents=(),
         session_id=session_id,
         warm_session=None,
+    )
+
+
+def _warm_session_age_ms(request: RunRequest) -> float | None:
+    warm_session = request.warm_session
+    if warm_session is None:
+        return None
+    age = asyncio.get_running_loop().time() - warm_session.created_at
+    return round(max(0.0, age) * 1000, 1)
+
+
+def _log_truncated_tool_call(
+    event: str,
+    truncation: _TruncatedToolCall,
+    *,
+    stream: bool,
+    run_request: RunRequest,
+    usage: Usage,
+    attempt: int,
+    choice: int,
+    warm_age_ms: float | None,
+) -> None:
+    log_warning(
+        event,
+        stream=stream,
+        error_type="factory_protocol_error",
+        reason=truncation.reason,
+        tool_name=truncation.tool_name,
+        payload_bytes=truncation.payload_bytes,
+        attempt=attempt,
+        choice=choice,
+        warm=run_request.warm_session is not None,
+        warm_age_ms=warm_age_ms,
+        output_tokens=usage.output_tokens,
     )
 
 
@@ -1989,6 +2060,7 @@ async def _collect_completion(
     trace_choice: int = 0,
 ) -> CollectedCompletion:
     result = CollectedCompletion()
+    result.warm_age_ms = _warm_session_age_ms(run_request)
     stop_buffer = StopSequenceBuffer(stop_sequences)
     observed_ttft = not observe_ttft
 
@@ -2077,14 +2149,16 @@ async def _collect_completion(
                 # a tool-call payload returns completed output with
                 # finish_reason="length" instead of a 502. The partial call is
                 # dropped, never executed.
-                result.truncated = True
-                log_warning(
-                    "chat.truncated",
+                result.truncation = _TruncatedToolCall.from_error(exc)
+                _log_truncated_tool_call(
+                    "chat.attempt_truncated",
+                    result.truncation,
                     stream=False,
-                    error_type="factory_protocol_error",
-                    reason=str(exc),
-                    tool_name=exc.tool_name,
-                    payload_bytes=exc.payload_bytes,
+                    run_request=run_request,
+                    usage=result.usage,
+                    attempt=trace_attempt,
+                    choice=trace_choice,
+                    warm_age_ms=result.warm_age_ms,
                 )
         held = stop_buffer.flush()
         if held:
@@ -2171,6 +2245,7 @@ async def _stream_completion(
     trace_event: Callable[..., None] | None = None,
 ) -> AsyncIterator[str]:
     usage = Usage()
+    warm_age_ms = _warm_session_age_ms(run_request)
     completed = False
     saw_tool_call = False
     saw_text = False
@@ -2365,13 +2440,15 @@ async def _stream_completion(
             # blind-retrying an unrecoverable request. The partial call is
             # dropped, never executed.
             outcome = "truncated"
-            log_warning(
+            _log_truncated_tool_call(
                 "chat.truncated",
+                _TruncatedToolCall.from_error(exc),
                 stream=True,
-                error_type="factory_protocol_error",
-                reason=str(exc),
-                tool_name=exc.tool_name,
-                payload_bytes=exc.payload_bytes,
+                run_request=run_request,
+                usage=usage,
+                attempt=0,
+                choice=0,
+                warm_age_ms=warm_age_ms,
             )
             held = stop_buffer.flush()
             if held:
