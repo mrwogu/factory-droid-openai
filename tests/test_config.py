@@ -54,6 +54,7 @@ _ENVIRONMENT_KEYS = (
     "FACTORY_DROID_OPENAI_LOG_FORMAT",
     "FACTORY_DROID_OPENAI_WARM_SESSIONS",
     "FACTORY_DROID_OPENAI_WARM_SESSION_TTL_SECONDS",
+    "FACTORY_DROID_OPENAI_WARM_SESSION_IDLE_DRAIN_SECONDS",
     "FACTORY_DROID_OPENAI_DETACHED_CLEANUP",
     "FACTORY_DROID_OPENAI_REPAIR_LOST_PREFIX",
     "FACTORY_DROID_OPENAI_NATIVE_TOOL_CALLS",
@@ -161,6 +162,15 @@ def test_settings_rejects_invalid_session_init_timeout(
         Settings(workdir=tmp_path, session_init_timeout_seconds=value)
 
 
+@pytest.mark.parametrize("value", [0.0, -1.0, float("inf")])
+def test_settings_rejects_invalid_warm_session_idle_drain(
+    tmp_path: Path,
+    value: float,
+) -> None:
+    with pytest.raises(ValueError, match="warm_session_idle_drain_seconds"):
+        Settings(workdir=tmp_path, warm_session_idle_drain_seconds=value)
+
+
 @pytest.mark.parametrize("value", [-1, 65])
 def test_settings_rejects_invalid_dangling_member_repair_budget(
     tmp_path: Path,
@@ -242,12 +252,34 @@ def test_settings_from_env_reads_pool_overrides(
     _clear_environment(monkeypatch)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("FACTORY_DROID_OPENAI_WARM_SESSION_TTL_SECONDS", "90")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WARM_SESSION_IDLE_DRAIN_SECONDS", "3600")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_DETACHED_CLEANUP", "off")
 
     settings = Settings.from_env()
 
     assert settings.warm_session_ttl_seconds == 90.0
+    assert settings.warm_session_idle_drain_seconds == 3600.0
     assert settings.detached_cleanup is False
+
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WARM_SESSION_IDLE_DRAIN_SECONDS", " ")
+    assert Settings.from_env().warm_session_idle_drain_seconds is None
+
+
+@pytest.mark.parametrize("value", ["invalid", "0", "inf"])
+def test_settings_from_env_rejects_invalid_warm_session_idle_drain(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    value: str,
+) -> None:
+    _clear_environment(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_WARM_SESSION_IDLE_DRAIN_SECONDS", value)
+
+    with pytest.raises(
+        ValueError,
+        match="FACTORY_DROID_OPENAI_WARM_SESSION_IDLE_DRAIN_SECONDS",
+    ):
+        Settings.from_env()
 
 
 def test_settings_from_env_reads_repair_lost_prefix(
