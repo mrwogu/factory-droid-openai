@@ -1907,12 +1907,13 @@ def _model_output_retry_request(
     reason: ModelOutputRetryReason,
 ) -> RunRequest:
     if reason == "truncated_tool_call" and request.session_id is None:
-        return replace(
+        retry_request: RunRequest = replace(
             request,
             prompt=f"{request.prompt}\n\n{_MODEL_OUTPUT_RETRY_PROMPTS[reason]}",
             session_id=None,
             warm_session=None,
         )
+        return retry_request
     return replace(
         request,
         prompt=_MODEL_OUTPUT_RETRY_PROMPTS[reason],
