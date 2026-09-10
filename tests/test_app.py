@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import importlib.metadata
 import json
+from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import httpx
 import pytest
@@ -75,10 +76,44 @@ from factory_droid_openai.runner import (
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
-    from pathlib import Path
-    from typing import Any
 
     from factory_droid_openai.app import RunnerFactory
+
+
+def _recorded_usage(payload: dict[str, Any]) -> Usage:
+    details = payload.get("prompt_tokens_details") or {}
+    return Usage(
+        input_tokens=int(payload.get("prompt_tokens", 0)),
+        output_tokens=int(payload.get("completion_tokens", 0)),
+        cache_read_tokens=int(details.get("cached_tokens", 0)),
+    )
+
+
+def _recorded_event(record: dict[str, Any]) -> RunEvent:
+    kind = record["kind"]
+    if kind == "text_delta":
+        return TextDelta(record["text"])
+    if kind == "reasoning_delta":
+        return ReasoningDelta(record["text"])
+    if kind == "usage":
+        return UsageUpdate(_recorded_usage(record["usage"]))
+    if kind == "run_complete":
+        return RunComplete(_recorded_usage(record["usage"]))
+    if kind == "status":
+        return StatusUpdate(record["state"])
+    if kind == "session_started":
+        return SessionStarted("replay-session")
+    raise AssertionError(f"unknown recorded event kind: {kind}")
+
+
+def _recorded_events(name: str) -> list[RunEvent]:
+    path = Path(__file__).parent / "fixtures" / "events" / name
+    records = [
+        cast("dict[str, Any]", json.loads(line))
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    return [_recorded_event(record) for record in records if record["kind"] != "meta"]
 
 
 class FakeRunner:
@@ -188,8 +223,8 @@ class BlockingRunner(FakeRunner):
 
 
 class GateRunner(FakeRunner):
-    def __init__(self) -> None:
-        super().__init__([])
+    def __init__(self, events: list[RunEvent] | None = None) -> None:
+        super().__init__(events if events is not None else [RunComplete(Usage())])
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
@@ -198,7 +233,8 @@ class GateRunner(FakeRunner):
         self.started.set()
         try:
             await self.release.wait()
-            yield RunComplete(Usage())
+            for event in self.events:
+                yield event
         finally:
             self.closed = True
 
@@ -1559,7 +1595,7 @@ async def test_evicted_waiter_cancellation_after_removal_is_clean() -> None:
 async def test_priority_header_admits_foreground_before_backlog(
     tmp_path: Path,
 ) -> None:
-    runner = GateRunner()
+    runner = GateRunner(_recorded_events("hello--gpt-5-4-mini.jsonl"))
     app = create_app(
         Settings(
             workdir=tmp_path,
@@ -1626,7 +1662,7 @@ async def test_unknown_priority_header_fails_closed(tmp_path: Path) -> None:
 async def test_full_queue_rejects_newest_normal_waiter_for_priority_request(
     tmp_path: Path,
 ) -> None:
-    runner = GateRunner()
+    runner = GateRunner(_recorded_events("hello--gpt-5-4-mini.jsonl"))
     app = create_app(
         Settings(
             workdir=tmp_path,
@@ -1669,7 +1705,7 @@ async def test_full_queue_rejects_newest_normal_waiter_for_priority_request(
 async def test_priority_request_rejected_when_queue_full_of_priority_work_over_http(
     tmp_path: Path,
 ) -> None:
-    runner = GateRunner()
+    runner = GateRunner(_recorded_events("hello--gpt-5-4-mini.jsonl"))
     app = create_app(
         Settings(
             workdir=tmp_path,
