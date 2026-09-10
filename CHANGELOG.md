@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.9.0](https://github.com/mrwogu/factory-droid-openai/compare/v1.8.0...v1.9.0) (2026-09-10)
+
+
+### Features
+
+* **session:** cache Droid tool discovery ([#116](https://github.com/mrwogu/factory-droid-openai/issues/116)) ([ec09717](https://github.com/mrwogu/factory-droid-openai/commit/ec097178b6ae1219802c39286c40bb6e070b309e))
+
+
+### Bug Fixes
+
+* **api:** retry truncated calls in fresh sessions ([#117](https://github.com/mrwogu/factory-droid-openai/issues/117)) ([79b7645](https://github.com/mrwogu/factory-droid-openai/commit/79b764526d27c91205c24f0c977ed9a8dda4bf61))
+
 ## [1.8.0](https://github.com/mrwogu/factory-droid-openai/compare/v1.7.1...v1.8.0) (2026-09-10)
 
 
