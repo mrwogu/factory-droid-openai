@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.metadata
+import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ import pytest
 from fastapi.exceptions import RequestValidationError
 from jsonschema.validators import validator_for
 
+from factory_droid_openai import logs
 from factory_droid_openai import telemetry as telemetry_module
 from factory_droid_openai.app import (
     AdmissionController,
@@ -2450,11 +2452,78 @@ async def test_non_streaming_malformed_tool_call_retries_same_session(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_non_streaming_truncated_tool_call_retries_same_session(tmp_path: Path) -> None:
+async def test_non_streaming_truncated_tool_call_retries_fresh_session(tmp_path: Path) -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
     runner = RetryRunner(
         [
             "retry/truncated-tool.jsonl",
             "retry/plain-answer.jsonl",
+        ]
+    )
+    payload = _payload(
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ],
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Check weather"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,QUJD"},
+                    },
+                ],
+            }
+        ],
+    )
+    app = _app(tmp_path, runner)
+    key = SessionKey(model_id=None, reasoning_effort=None)
+    warm = WarmSession(
+        key=key,
+        client=cast("Any", object()),
+        transport=None,
+        session_id="warm-session",
+        created_at=asyncio.get_running_loop().time() - 1.0,
+    )
+    app.state.pool.note(key)
+    app.state.pool.offer(warm)
+
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "Direct answer"
+    assert len(runner.requests) == 2
+    assert runner.requests[0].warm_session is warm
+    assert runner.requests[1].session_id is None
+    assert runner.requests[1].warm_session is None
+    assert runner.requests[0].prompt in runner.requests[1].prompt
+    assert runner.requests[1].images == runner.requests[0].images
+    assert "incomplete" in runner.requests[1].prompt
+    records = [json.loads(line) for line in log_stream.getvalue().splitlines() if line.strip()]
+    attempts = [record for record in records if record["event"] == "chat.attempt_truncated"]
+    assert len(attempts) == 1
+    assert attempts[0]["attempt"] == 0
+    assert attempts[0]["choice"] == 0
+    assert attempts[0]["warm"] is True
+    assert attempts[0]["warm_age_ms"] >= 1000.0
+    assert attempts[0]["output_tokens"] == 0
+    assert not any(record["event"] == "chat.truncated" for record in records)
+
+
+@pytest.mark.asyncio
+async def test_repeated_truncated_tool_call_logs_final_outcome(tmp_path: Path) -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
+    runner = RetryRunner(
+        [
+            "retry/truncated-tool.jsonl",
+            "retry/truncated-tool.jsonl",
         ]
     )
     payload = _payload(
@@ -2469,9 +2538,52 @@ async def test_non_streaming_truncated_tool_call_retries_same_session(tmp_path: 
         response = await client.post("/v1/chat/completions", json=payload)
 
     assert response.status_code == 200
+    assert response.json()["choices"][0]["finish_reason"] == "length"
+    records = [json.loads(line) for line in log_stream.getvalue().splitlines() if line.strip()]
+    attempts = [record for record in records if record["event"] == "chat.attempt_truncated"]
+    final = [record for record in records if record["event"] == "chat.truncated"]
+    assert [record["attempt"] for record in attempts] == [0, 1]
+    assert len(final) == 1
+    assert final[0]["attempt"] == 1
+    assert final[0]["warm"] is False
+    assert final[0]["output_tokens"] == 0
+
+
+@pytest.mark.asyncio
+async def test_continuation_truncated_tool_call_retries_same_session(tmp_path: Path) -> None:
+    runner = RetryRunner(
+        [
+            "retry/truncated-tool.jsonl",
+            "retry/plain-answer.jsonl",
+        ]
+    )
+    settings = Settings(
+        droid_path="droid",
+        workdir=tmp_path,
+        timeout_seconds=30.0,
+        session_continuity=True,
+    )
+    app = create_app(settings, runner_factory=cast("RunnerFactory", lambda: runner))
+    app.state.sessions.remember("session-9", SessionKey(model_id=None, reasoning_effort=None))
+    payload = _payload(
+        factory_droid_session_id="session-9",
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ],
+    )
+
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
     assert response.json()["choices"][0]["message"]["content"] == "Direct answer"
     assert len(runner.requests) == 2
+    assert runner.requests[0].session_id == "session-9"
     assert runner.requests[1].session_id == "replay-session"
+    assert runner.requests[1].prompt != runner.requests[0].prompt
     assert "incomplete" in runner.requests[1].prompt
 
 
