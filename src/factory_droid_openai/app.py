@@ -10,7 +10,7 @@ import uuid
 from collections import OrderedDict, deque
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeVar
+from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeVar, cast
 
 from fastapi import Depends, FastAPI, Header, Request, Response, Security
 from fastapi.exceptions import RequestValidationError
@@ -88,6 +88,7 @@ from factory_droid_openai.runner import (
 )
 from factory_droid_openai.strictjson import (
     DuplicateKeyError,
+    JsonNestingError,
     check_no_duplicate_keys,
     json_depth_exceeds,
 )
@@ -98,6 +99,12 @@ if TYPE_CHECKING:
     from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 RunnerFactory = Callable[[], DroidRunner]
+ModelOutputRetryReason = Literal[
+    "malformed_tool_call",
+    "structured_output",
+    "tool_without_catalog",
+    "truncated_tool_call",
+]
 BearerCredentials = Annotated[
     HTTPAuthorizationCredentials | None,
     Security(HTTPBearer(auto_error=False)),
@@ -119,6 +126,25 @@ _PAYLOAD_SIZE_BUCKETS = (
     (102_400, "10kb_100kb"),
     (1_048_576, "100kb_1mb"),
 )
+_MODEL_OUTPUT_RETRY_PROMPTS: dict[ModelOutputRetryReason, str] = {
+    "malformed_tool_call": (
+        "Your previous tool call was malformed. Return the required tool call again as one "
+        "complete valid tool call. Output no explanation."
+    ),
+    "structured_output": (
+        "Your previous response did not satisfy the required JSON output format. Return "
+        "complete JSON again, matching the requested schema exactly. Output JSON only."
+    ),
+    "tool_without_catalog": (
+        "Your previous response attempted a tool call, but no tools are available. Answer "
+        "the original request directly without any tool call or explanation about this correction."
+    ),
+    "truncated_tool_call": (
+        "Your previous tool call was incomplete. Return the required tool call again as one "
+        "complete valid tool call. Output no explanation."
+    ),
+}
+_TOOL_WITHOUT_CATALOG_ERROR = "the model requested a tool when none are available"
 
 CHAT_COMPLETION_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {
@@ -1534,7 +1560,14 @@ def create_app(
                 (_tool_call_repair_feature(event, dialect=dialect, variant=variant),)
             )
 
-        def message_parser() -> ToolCallStreamParser:
+        def message_parser(*, attempt: int = 0, choice: int = 0) -> ToolCallStreamParser:
+            def trace_attempt_payload(event: str, payload: str, **fields: Any) -> None:
+                payload_tracer.trace(
+                    event,
+                    payload,
+                    **(fields | {"attempt": attempt, "choice": choice}),
+                )
+
             return ToolCallStreamParser(
                 plan.allowed_tool_names,
                 require_tool_call=plan.require_tool_call,
@@ -1545,7 +1578,7 @@ def create_app(
                 max_dangling_member_repairs=resolved_settings.max_dangling_member_repairs,
                 repair_lost_prefix=resolved_settings.repair_lost_prefix,
                 parse_message_json=structured is None,
-                trace_payload=payload_tracer.trace,
+                trace_payload=trace_attempt_payload,
                 record_repair=record_repair,
             )
 
@@ -1621,35 +1654,98 @@ def create_app(
                     choice_request = (
                         run_request if index == 0 else replace(run_request, warm_session=None)
                     )
-                    result = await _collect_completion_or_disconnect(
-                        request=request,
-                        runner=choice_runner,
-                        run_request=choice_request,
-                        parser=message_parser(),
-                        metrics=metrics,
-                        request_started_at=request_started_at,
-                        stop_sequences=payload.stop_sequences,
-                        drain_seconds=resolved_settings.tool_call_drain_seconds,
-                        trace_event=payload_tracer.trace,
-                    )
-                    if result is None:
-                        request.state.telemetry_error_type = "client_disconnected"
-                        return _error_response(
-                            "Client disconnected.",
-                            499,
-                            "client_disconnected",
+                    attempt_request = choice_request
+                    result: CollectedCompletion | None = None
+                    attempt = 0
+                    while True:
+                        attempt_session_id: str | None = None
+
+                        def record_attempt_session(started_id: str) -> None:
+                            nonlocal attempt_session_id
+                            attempt_session_id = started_id
+
+                        retry_reason: ModelOutputRetryReason | None = None
+                        try:
+                            result = await _collect_completion_or_disconnect(
+                                request=request,
+                                runner=choice_runner,
+                                run_request=attempt_request,
+                                parser=message_parser(attempt=attempt, choice=index),
+                                metrics=metrics,
+                                request_started_at=request_started_at,
+                                stop_sequences=payload.stop_sequences,
+                                drain_seconds=resolved_settings.tool_call_drain_seconds,
+                                trace_event=payload_tracer.trace,
+                                session_callback=record_attempt_session,
+                                observe_ttft=attempt == 0,
+                                trace_attempt=attempt,
+                                trace_choice=index,
+                            )
+                        except ProtocolError as exc:
+                            if (
+                                attempt == 0
+                                and attempt_session_id is not None
+                                and str(exc) == _TOOL_WITHOUT_CATALOG_ERROR
+                            ):
+                                retry_reason = "tool_without_catalog"
+                            else:
+                                raise
+                        else:
+                            if result is None:
+                                request.state.telemetry_error_type = "client_disconnected"
+                                return _error_response(
+                                    "Client disconnected.",
+                                    499,
+                                    "client_disconnected",
+                                )
+                            retry_reason = _completion_retry_reason(
+                                result,
+                                tools_available=bool(plan.allowed_tool_names),
+                            )
+                            if retry_reason is None and structured is not None:
+                                try:
+                                    _validate_structured_output(result.text, structured)
+                                except ProtocolError as exc:
+                                    if (
+                                        attempt == 0
+                                        and attempt_session_id is not None
+                                        and _retryable_structured_output_error(exc)
+                                    ):
+                                        retry_reason = "structured_output"
+                                    else:
+                                        raise
+
+                        if attempt != 0 or attempt_session_id is None or retry_reason is None:
+                            break
+                        log_warning(
+                            "chat.retry",
+                            stream=False,
+                            reason=retry_reason,
                         )
-                    if result.truncated:
+                        metrics.record_features((f"model_output_retry:{retry_reason}",))
+                        await _wait_for_retry_cleanup(
+                            reaper,
+                            session_id=attempt_session_id,
+                            deadline=deadline,
+                            timeout_seconds=timeout_seconds,
+                        )
+                        attempt_request = _model_output_retry_request(
+                            choice_request,
+                            session_id=attempt_session_id,
+                            reason=retry_reason,
+                        )
+                        attempt = 1
+
+                    completed_result = cast("CollectedCompletion", result)
+                    if completed_result.truncated:
                         request.state.stream_outcome = "truncated"
-                    elif result.malformed_note is not None:
+                    elif completed_result.malformed_note is not None:
                         request.state.stream_outcome = "malformed"
-                    if result.session_id is not None:
-                        sessions.remember(result.session_id, requested_key)
-                        started_session = result.session_id
-                    if structured is not None:
-                        _validate_structured_output(result.text, structured)
-                    total_usage = _add_usage(total_usage, result.usage)
-                    choices.append(_choice_dict(result, index))
+                    if completed_result.session_id is not None:
+                        sessions.remember(completed_result.session_id, requested_key)
+                        started_session = completed_result.session_id
+                    total_usage = _add_usage(total_usage, completed_result.usage)
+                    choices.append(_choice_dict(completed_result, index))
         except ProtocolError as exc:
             request.state.telemetry_error_type = "factory_protocol_error"
             log_warning(
@@ -1741,6 +1837,66 @@ class CollectedCompletion:
         return "".join(self.reasoning_parts)
 
 
+def _completion_retry_reason(
+    result: CollectedCompletion,
+    *,
+    tools_available: bool,
+) -> ModelOutputRetryReason | None:
+    if result.tool_calls:
+        return None
+    if result.malformed_note is not None:
+        return "malformed_tool_call" if tools_available else "tool_without_catalog"
+    if result.truncated:
+        return "truncated_tool_call" if tools_available else "tool_without_catalog"
+    return None
+
+
+def _retryable_structured_output_error(exc: ProtocolError) -> bool:
+    if isinstance(exc.__cause__, JsonNestingError):
+        return False
+    message = str(exc)
+    return message.startswith(
+        (
+            "Factory Droid returned invalid structured JSON output",
+            "Factory Droid structured output violated the requested schema",
+        )
+    )
+
+
+def _model_output_retry_request(
+    request: RunRequest,
+    *,
+    session_id: str,
+    reason: ModelOutputRetryReason,
+) -> RunRequest:
+    return replace(
+        request,
+        prompt=_MODEL_OUTPUT_RETRY_PROMPTS[reason],
+        images=(),
+        documents=(),
+        session_id=session_id,
+        warm_session=None,
+    )
+
+
+async def _wait_for_retry_cleanup(
+    reaper: BackgroundReaper,
+    *,
+    session_id: str,
+    deadline: float,
+    timeout_seconds: float,
+) -> None:
+    try:
+        async with asyncio.timeout_at(deadline):
+            await reaper.wait_for(session_id)
+    except TimeoutError as exc:
+        raise RunnerError(
+            f"Factory Droid timed out after {timeout_seconds:.1f} seconds.",
+            status_code=504,
+            error_type="factory_droid_timeout",
+        ) from exc
+
+
 def _event_record(event: RunEvent) -> dict[str, Any]:
     """Describe one SDK event as the JSON the replay fixtures are built from."""
     if isinstance(event, TextDelta):
@@ -1765,6 +1921,8 @@ async def _run_events(
     drain_seconds: float,
     saw_tool_call: Callable[[], bool],
     trace_event: Callable[..., None] | None = None,
+    trace_attempt: int = 0,
+    trace_choice: int = 0,
 ) -> AsyncGenerator[RunEvent, None]:
     """Yield runner events, bounding the wait once a tool call is complete.
 
@@ -1802,6 +1960,8 @@ async def _run_events(
                     "droid.event",
                     json.dumps(_event_record(event), ensure_ascii=False),
                     model=run_request.model,
+                    attempt=trace_attempt,
+                    choice=trace_choice,
                 )
             yield event
 
@@ -1816,10 +1976,14 @@ async def _collect_completion(
     stop_sequences: tuple[str, ...] = (),
     drain_seconds: float = DEFAULT_TOOL_CALL_DRAIN_SECONDS,
     trace_event: Callable[..., None] | None = None,
+    session_callback: Callable[[str], None] | None = None,
+    observe_ttft: bool = True,
+    trace_attempt: int = 0,
+    trace_choice: int = 0,
 ) -> CollectedCompletion:
     result = CollectedCompletion()
     stop_buffer = StopSequenceBuffer(stop_sequences)
-    observed_ttft = False
+    observed_ttft = not observe_ttft
 
     def record_malformed(exc: MalformedToolCallError) -> None:
         result.malformed_note = _malformed_tool_call_note(exc)
@@ -1840,6 +2004,8 @@ async def _collect_completion(
             drain_seconds=drain_seconds,
             saw_tool_call=lambda: bool(result.tool_calls),
             trace_event=trace_event,
+            trace_attempt=trace_attempt,
+            trace_choice=trace_choice,
         )
     ) as events:
         async for event in events:
@@ -1874,6 +2040,8 @@ async def _collect_completion(
                 result.reasoning_parts.append(event.text)
             elif isinstance(event, SessionStarted):
                 result.session_id = event.session_id
+                if session_callback is not None:
+                    session_callback(event.session_id)
             elif isinstance(event, UsageUpdate):
                 result.usage = event.usage
             elif isinstance(event, RunComplete):
@@ -1928,6 +2096,10 @@ async def _collect_completion_or_disconnect(
     stop_sequences: tuple[str, ...] = (),
     drain_seconds: float = DEFAULT_TOOL_CALL_DRAIN_SECONDS,
     trace_event: Callable[..., None] | None = None,
+    session_callback: Callable[[str], None] | None = None,
+    observe_ttft: bool = True,
+    trace_attempt: int = 0,
+    trace_choice: int = 0,
 ) -> CollectedCompletion | None:
     completion_task = asyncio.create_task(
         _collect_completion(
@@ -1939,6 +2111,10 @@ async def _collect_completion_or_disconnect(
             stop_sequences=stop_sequences,
             drain_seconds=drain_seconds,
             trace_event=trace_event,
+            session_callback=session_callback,
+            observe_ttft=observe_ttft,
+            trace_attempt=trace_attempt,
+            trace_choice=trace_choice,
         )
     )
     disconnect_task = asyncio.create_task(_wait_for_disconnect(request))

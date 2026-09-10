@@ -290,7 +290,12 @@ call, a mangled OpenAI `tool_calls` fragment, or a turn packing more calls than
 and a plain-text bridge notice. The malformed JSON and the call are dropped,
 never executed or returned to the client. The notice names no tool-call
 format, because anything it named would itself be tool-call-shaped text in
-assistant content: recovery is the client's retry, not the model's next turn.
+assistant content. Before returning that notice, a non-streaming request retries
+one malformed or incomplete call inside the same Droid session when no valid
+call was already produced. The retry uses a fixed correction prompt, keeps the
+original request deadline, and does not resend the original prompt or
+attachments. A repeated failure still returns the notice. Streaming requests
+are not retried because response bytes may already have reached the client.
 When an earlier call in the same turn did complete, the turn keeps
 `finish_reason="tool_calls"` so the client runs the call it already received.
 Close markers inside JSON strings are argument data, not framing. Ambiguous
@@ -686,7 +691,9 @@ response = client.chat.completions.create(
 The bridge sends the schema through Droid's native `outputFormat` RPC field,
 then independently parses and validates the completed JSON. Invalid JSON,
 duplicate keys, non-finite numbers, schema violations, and trailing output
-fail closed. Remote JSON Schema references are rejected. `response_format`
+trigger one non-streaming retry inside the same Droid session, then fail closed
+if the retry is also invalid. Size and depth limit failures are not retried.
+Remote JSON Schema references are rejected. `response_format`
 cannot be combined with bridge text tools or `stop`. Structured streaming
 buffers the JSON until it validates, then emits it in one content chunk, so no
 content chunks arrive while the model is generating. Buffered output is capped
@@ -1674,7 +1681,9 @@ docker run -d --rm --pull=always --name droid-bridge \
 Traced events cover the built prompt (`chat.prompt`), parser repairs, and the
 raw Droid event stream (`droid.event`, one record per text delta, reasoning
 delta, status, usage, and completion event). Session identifiers are never
-written. A `full` trace is what
+written. Every parser and Droid event carries zero-based choice and model-output
+attempt indexes, and fixture export keeps only each choice's final attempt after
+a bridge retry. A `full` trace is what
 [`scripts/e2e_fixtures.py`](CONTRIBUTING.md#end-to-end-matrix) replays offline.
 
 Both variables are required together, and the destination must be an existing

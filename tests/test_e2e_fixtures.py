@@ -25,12 +25,21 @@ def fixtures_script() -> ModuleType:
     return module
 
 
-def _trace_line(request_id: str, payload: dict[str, Any], *, event: str = "droid.event") -> str:
+def _trace_line(
+    request_id: str,
+    payload: dict[str, Any],
+    *,
+    event: str = "droid.event",
+    attempt: object | None = None,
+    choice: object | None = None,
+) -> str:
     return json.dumps(
         {
             "event": event,
             "request_id": request_id,
             "mode": "full",
+            **({"attempt": attempt} if attempt is not None else {}),
+            **({"choice": choice} if choice is not None else {}),
             "payload": json.dumps(payload),
         }
     )
@@ -53,14 +62,37 @@ def test_events_are_grouped_per_request_in_arrival_order(fixtures_script: Module
         json.loads(_trace_line("req-1", {"kind": "text_delta", "text": "a"})),
         json.loads(_trace_line("req-2", {"kind": "text_delta", "text": "b"})),
         json.loads(_trace_line("req-1", {"kind": "text_delta", "text": "c"})),
+        json.loads(_trace_line("req-1", {"kind": "text_delta", "text": "retry"}, attempt=1)),
+        json.loads(_trace_line("req-1", {"kind": "run_complete"}, attempt=1)),
+        json.loads(_trace_line("req-1", {"kind": "text_delta", "text": "stale"}, attempt=0)),
+        json.loads(
+            _trace_line(
+                "req-1",
+                {"kind": "text_delta", "text": "other choice"},
+                choice=1,
+            )
+        ),
         json.loads(_trace_line("req-1", {"kind": "text_delta", "text": "x"}, event="chat.prompt")),
         {"event": "droid.event", "request_id": "req-3", "payload_head": "truncated"},
         {"event": "droid.event", "payload": "{}"},
+        json.loads(_trace_line("req-4", {"kind": "text_delta"}, attempt=-1)),
+        json.loads(_trace_line("req-5", {"kind": "text_delta"}, attempt="bad")),
+        json.loads(_trace_line("req-6", {"kind": "text_delta"}, choice=-1)),
+        json.loads(_trace_line("req-7", {"kind": "text_delta"}, choice="bad")),
+        json.loads(_trace_line("req-8", {"kind": "text_delta"}, attempt=True)),
+        json.loads(_trace_line("req-9", {"kind": "text_delta"}, attempt=False)),
+        json.loads(_trace_line("req-10", {"kind": "text_delta"}, choice=True)),
+        json.loads(_trace_line("req-11", {"kind": "text_delta"}, choice=False)),
     ]
 
     grouped = fixtures_script.group_events(trace)
 
-    assert [event["text"] for event in grouped["req-1"]] == ["a", "c"]
+    assert grouped["req-1"] == [
+        {"kind": "text_delta", "text": "retry"},
+        {"kind": "run_complete"},
+        {"kind": "text_delta", "text": "other choice"},
+    ]
+    assert [event["text"] for event in grouped["req-2"]] == ["b"]
     assert set(grouped) == {"req-1", "req-2"}
 
 

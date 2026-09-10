@@ -48,14 +48,26 @@ class BackgroundReaper:
         self._metrics = metrics
         self._max_pending = max_pending
         self._tasks: set[asyncio.Task[None]] = set()
+        self._task_keys: dict[asyncio.Task[None], str] = {}
+        self._keyed_tasks: dict[str, set[asyncio.Task[None]]] = defaultdict(set)
 
-    def submit(self, coroutine: Coroutine[Any, Any, None]) -> None:
+    def submit(self, coroutine: Coroutine[Any, Any, None], *, key: str | None = None) -> None:
         if len(self._tasks) >= self._max_pending:
             log_warning("reaper.saturated", pending=len(self._tasks))
         task = asyncio.create_task(self._guard(coroutine))
         self._tasks.add(task)
+        if key is not None:
+            self._task_keys[task] = key
+            self._keyed_tasks[key].add(task)
         task.add_done_callback(self._forget)
         self._publish()
+
+    async def wait_for(self, key: str) -> None:
+        while pending := tuple(self._keyed_tasks.get(key, ())):
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in pending),
+                return_exceptions=True,
+            )
 
     async def drain(self, *, timeout: float = 10.0) -> None:
         while self._tasks:
@@ -77,6 +89,12 @@ class BackgroundReaper:
 
     def _forget(self, task: asyncio.Task[None]) -> None:
         self._tasks.discard(task)
+        key = self._task_keys.pop(task, None)
+        if key is not None:
+            keyed = self._keyed_tasks[key]
+            keyed.discard(task)
+            if not keyed:
+                del self._keyed_tasks[key]
         self._publish()
 
     def _publish(self) -> None:

@@ -40,6 +40,7 @@ from factory_droid_openai.app import (
     _telemetry_error_category,
     _validation_message,
     _wait_for_disconnect,
+    _wait_for_retry_cleanup,
     create_app,
 )
 from factory_droid_openai.config import Settings
@@ -204,6 +205,22 @@ class FakeRunner:
     async def close_session(self, session_id: str, *, timeout_seconds: float) -> None:
         del timeout_seconds
         self.session_operations.append(("close", session_id, None))
+
+
+class RetryRunner(FakeRunner):
+    def __init__(self, attempts: list[str]) -> None:
+        super().__init__([])
+        self.attempts = attempts
+
+    async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
+        self.requests.append(request)
+        if request.warm_session is not None:
+            request.warm_session.consumed = True
+        try:
+            for event in _recorded_events(self.attempts[len(self.requests) - 1]):
+                yield event
+        finally:
+            self.closed = True
 
 
 class BlockingRunner(FakeRunner):
@@ -2368,6 +2385,212 @@ async def test_non_streaming_malformed_tool_call_stops_with_note(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_non_streaming_malformed_tool_call_retries_same_session(tmp_path: Path) -> None:
+    trace_path = tmp_path / "trace.jsonl"
+    runner = RetryRunner(
+        [
+            "retry/malformed-tool.jsonl",
+            "retry/valid-tool.jsonl",
+        ]
+    )
+    payload = _payload(
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ]
+    )
+    app = _feature_app(
+        tmp_path,
+        runner,
+        trace_payloads="full",
+        trace_payload_file=trace_path,
+    )
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["tool_calls"][0]["function"] == {
+        "name": "weather",
+        "arguments": '{"city":"Gdansk"}',
+    }
+    assert response.json()["usage"] == {
+        "prompt_tokens": 16,
+        "completion_tokens": 8,
+        "total_tokens": 24,
+        "prompt_tokens_details": {"cached_tokens": 0},
+    }
+    assert len(runner.requests) == 2
+    assert runner.requests[1].session_id == "replay-session"
+    assert runner.requests[1].warm_session is None
+    assert runner.requests[1].images == ()
+    assert runner.requests[1].documents == ()
+    assert "malformed" in runner.requests[1].prompt
+    assert "factory_droid_openai_ttft_seconds_count 1" in app.state.metrics.render()
+    assert (
+        dict(app.state.metrics.telemetry_snapshot().features)[
+            "model_output_retry:malformed_tool_call"
+        ]
+        == 1
+    )
+    trace = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert [
+        (record["attempt"], record["choice"])
+        for record in trace
+        if record["event"] == "tool_call.unparsed"
+    ] == [(0, 0)]
+    assert {
+        (record["attempt"], record["choice"])
+        for record in trace
+        if record["event"] == "droid.event"
+    } == {(0, 0), (1, 0)}
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_truncated_tool_call_retries_same_session(tmp_path: Path) -> None:
+    runner = RetryRunner(
+        [
+            "retry/truncated-tool.jsonl",
+            "retry/plain-answer.jsonl",
+        ]
+    )
+    payload = _payload(
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ]
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "Direct answer"
+    assert len(runner.requests) == 2
+    assert runner.requests[1].session_id == "replay-session"
+    assert "incomplete" in runner.requests[1].prompt
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_truncated_phantom_tool_retries_without_tools(
+    tmp_path: Path,
+) -> None:
+    runner = RetryRunner(
+        [
+            "retry/truncated-tool.jsonl",
+            "retry/plain-answer.jsonl",
+        ]
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=_payload())
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "Direct answer"
+    assert len(runner.requests) == 2
+    assert "no tools are available" in runner.requests[1].prompt
+
+
+@pytest.mark.asyncio
+async def test_truncated_phantom_tool_keeps_no_tool_retry_for_structured_output(
+    tmp_path: Path,
+) -> None:
+    runner = RetryRunner(
+        [
+            "retry/truncated-tool.jsonl",
+            "retry/valid-structured-output.jsonl",
+        ]
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(response_format={"type": "json_object"}),
+        )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == '{"answer":7}'
+    assert len(runner.requests) == 2
+    assert "no tools are available" in runner.requests[1].prompt
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_tool_without_catalog_retries_same_session(tmp_path: Path) -> None:
+    runner = RetryRunner(
+        [
+            "retry/valid-tool.jsonl",
+            "retry/plain-answer.jsonl",
+        ]
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=_payload())
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "Direct answer"
+    assert len(runner.requests) == 2
+    assert runner.requests[1].session_id == "replay-session"
+    assert "no tools are available" in runner.requests[1].prompt
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_retry_stays_bounded_when_tool_call_is_still_malformed(
+    tmp_path: Path,
+) -> None:
+    runner = RetryRunner(
+        [
+            "retry/malformed-tool.jsonl",
+            "retry/malformed-tool.jsonl",
+        ]
+    )
+    payload = _payload(
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ]
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "stop"
+    assert choice["message"]["content"].startswith("[bridge notice: dropped a malformed tool call")
+    assert len(runner.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_retry_cleanup_wait_respects_expired_deadline() -> None:
+    reaper = BackgroundReaper()
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+
+    async def cleanup() -> None:
+        cleanup_started.set()
+        await cleanup_release.wait()
+
+    reaper.submit(cleanup(), key="replay-session")
+    await cleanup_started.wait()
+    try:
+        with pytest.raises(RunnerError) as exc_info:
+            await _wait_for_retry_cleanup(
+                reaper,
+                session_id="replay-session",
+                deadline=asyncio.get_running_loop().time() - 1.0,
+                timeout_seconds=10.0,
+            )
+    finally:
+        cleanup_release.set()
+        await reaper.drain()
+
+    assert exc_info.value.status_code == 504
+    assert exc_info.value.error_type == "factory_droid_timeout"
+
+
+@pytest.mark.asyncio
 async def test_repaired_tool_call_counts_a_bounded_telemetry_feature(tmp_path: Path) -> None:
     runner = FakeRunner(
         [
@@ -3966,6 +4189,48 @@ async def test_invalid_structured_output_fails_closed(
 
 
 @pytest.mark.asyncio
+async def test_invalid_structured_output_retries_same_session(tmp_path: Path) -> None:
+    runner = RetryRunner(
+        [
+            "retry/invalid-structured-output.jsonl",
+            "retry/valid-structured-output.jsonl",
+        ]
+    )
+    schema = {
+        "type": "object",
+        "properties": {"answer": {"type": "integer"}},
+        "required": ["answer"],
+    }
+    app = _app(tmp_path, runner)
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {"name": "answer", "schema": schema},
+                }
+            ),
+        )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == '{"answer":7}'
+    assert len(runner.requests) == 2
+    assert runner.requests[1].session_id == "replay-session"
+    assert runner.requests[1].output_format == {
+        "type": "json_schema",
+        "schema": schema,
+    }
+    assert "matching the requested schema" in runner.requests[1].prompt
+    assert (
+        dict(app.state.metrics.telemetry_snapshot().features)[
+            "model_output_retry:structured_output"
+        ]
+        == 1
+    )
+
+
+@pytest.mark.asyncio
 async def test_streaming_structured_output_is_checked_before_finish(
     tmp_path: Path,
 ) -> None:
@@ -4227,6 +4492,22 @@ async def test_structured_output_over_the_depth_limit_fails_closed(
         for choice in chunk.get("choices", [])
         if choice["delta"].get("content")
     ]
+
+
+@pytest.mark.asyncio
+async def test_structured_output_over_the_parser_depth_limit_is_not_retried(
+    tmp_path: Path,
+) -> None:
+    runner = RetryRunner(["retry/depth-limit-structured-output.jsonl"])
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(response_format={"type": "json_object"}),
+        )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "factory_protocol_error"
+    assert len(runner.requests) == 1
 
 
 @pytest.mark.asyncio
@@ -4989,7 +5270,11 @@ async def test_non_streaming_request_answers_499_when_the_client_disconnects(
 @pytest.mark.asyncio
 async def test_collect_completion_ignores_unmapped_runner_events() -> None:
     runner = FakeRunner(
-        [cast("RunEvent", SimpleNamespace(kind="unknown")), RunComplete(Usage())],
+        [
+            SessionStarted("session-private"),
+            cast("RunEvent", SimpleNamespace(kind="unknown")),
+            RunComplete(Usage()),
+        ],
     )
 
     result = await _collect_completion(
@@ -5006,6 +5291,7 @@ async def test_collect_completion_ignores_unmapped_runner_events() -> None:
 
     assert result.text == ""
     assert result.completed is True
+    assert result.session_id == "session-private"
 
 
 @pytest.mark.asyncio

@@ -1,0 +1,4 @@
+{"kind": "meta", "scenario": "retry_malformed_tool", "stream": false, "recorded_model": "seed", "expect_verdict": "model_behavior"}
+{"kind": "session_started"}
+{"kind": "text_delta", "text": "<tool_call>not json</tool_call>"}
+{"kind": "run_complete", "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14, "prompt_tokens_details": {"cached_tokens": 0}}}
