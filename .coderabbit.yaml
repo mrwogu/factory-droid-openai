@@ -12,7 +12,9 @@ tone_instructions: >-
 
 reviews:
   profile: chill
-  request_changes_workflow: false
+  # Approve automatically once all comments are resolved, the latest commit
+  # is reviewed, and no pre-merge checks fail.
+  request_changes_workflow: true
   high_level_summary: true
   poem: false
   # Generated or recorded artifacts: CI already gates contract drift.
