@@ -303,6 +303,37 @@ def test_tool_catalog_cache_uses_the_factory_profile_override(
     assert identity.profile_root == str(profile)
 
 
+def test_tool_catalog_cache_defaults_to_the_factory_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.delenv("FACTORY_HOME_OVERRIDE", raising=False)
+    monkeypatch.setattr("factory_droid_openai.droid_rpc.Path.home", lambda: home)
+    cache = ToolCatalogCache(droid_path="missing-droid", workdir=tmp_path)
+
+    identity = cache._current_identity()
+
+    assert identity.profile_root == str(home / ".factory")
+
+
+def test_tool_catalog_cache_resolves_a_bare_cli_from_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "droid"
+    executable.write_text("version one", encoding="utf-8")
+    monkeypatch.setattr(
+        "factory_droid_openai.droid_rpc.shutil.which",
+        lambda _: str(executable),
+    )
+    cache = ToolCatalogCache(droid_path="droid", workdir=tmp_path)
+
+    identity = cache._current_identity()
+
+    assert identity.droid.path == str(executable.resolve())
+
+
 def test_tool_catalog_cache_resolves_relative_cli_and_project_paths(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
     workdir = repository / "nested"
