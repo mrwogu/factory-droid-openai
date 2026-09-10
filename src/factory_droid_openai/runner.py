@@ -291,7 +291,12 @@ class RunnerMetrics(Protocol):
 
 
 class SessionReaper(Protocol):
-    def submit(self, coroutine: Coroutine[Any, Any, None]) -> None: ...
+    def submit(
+        self,
+        coroutine: Coroutine[Any, Any, None],
+        *,
+        key: str | None = None,
+    ) -> None: ...
 
 
 class _ManagedProcessTransport(ProcessTransport):
@@ -792,7 +797,10 @@ class DroidRunner:
                 # Interrupting and reaping a Droid process costs about a second
                 # of grace period, which the client would otherwise wait for
                 # after the last token.
-                self._reaper.submit(self._cleanup(client, transport, interrupt=interrupt))
+                self._reaper.submit(
+                    self._cleanup(client, transport, interrupt=interrupt),
+                    key=client.session_id,
+                )
             else:
                 cleanup_task = asyncio.create_task(
                     self._cleanup(client, transport, interrupt=interrupt)

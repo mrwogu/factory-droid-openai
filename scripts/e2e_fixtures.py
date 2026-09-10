@@ -47,8 +47,9 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def group_events(trace: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    """Collect the SDK events of each request, in the order they arrived."""
-    grouped: dict[str, list[dict[str, Any]]] = {}
+    """Collect SDK events from the final attempt of each request choice."""
+    grouped_choices: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    latest_attempt: dict[tuple[str, int], int] = {}
     for record in trace:
         if record.get("event") != TRACE_EVENT:
             continue
@@ -57,7 +58,23 @@ def group_events(trace: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]
         if not isinstance(payload, str) or not isinstance(request_id, str):
             # Head mode truncates payloads, so only full traces can be replayed.
             continue
-        grouped.setdefault(request_id, []).append(json.loads(payload))
+        attempt = record.get("attempt", 0)
+        if not isinstance(attempt, int) or attempt < 0:
+            continue
+        choice = record.get("choice", 0)
+        if not isinstance(choice, int) or choice < 0:
+            continue
+        key = (request_id, choice)
+        previous_attempt = latest_attempt.get(key)
+        if previous_attempt is None or attempt > previous_attempt:
+            grouped_choices[key] = []
+            latest_attempt[key] = attempt
+        elif attempt < previous_attempt:
+            continue
+        grouped_choices.setdefault(key, []).append(json.loads(payload))
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for (request_id, _choice), events in sorted(grouped_choices.items()):
+        grouped.setdefault(request_id, []).extend(events)
     return grouped
 
 

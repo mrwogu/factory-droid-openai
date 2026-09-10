@@ -1817,7 +1817,8 @@ async def test_runner_hands_cleanup_to_the_reaper(tmp_path: Path) -> None:
     reaped: list[object] = []
 
     class Reaper:
-        def submit(self, coroutine: Any) -> None:
+        def submit(self, coroutine: Any, *, key: str | None = None) -> None:
+            assert key == "session-1"
             reaped.append(coroutine)
 
     runner = DroidRunner(
