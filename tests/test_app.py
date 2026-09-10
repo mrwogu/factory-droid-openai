@@ -4920,6 +4920,23 @@ async def test_detached_cleanup_can_be_disabled(tmp_path: Path) -> None:
         assert "factory_droid_openai_warm_sessions 0" in app.state.metrics.render()
 
 
+def test_default_runner_factory_shares_the_tool_catalog_cache(tmp_path: Path) -> None:
+    app = create_app(
+        Settings(
+            droid_path="droid",
+            workdir=tmp_path,
+            warm_sessions=0,
+            telemetry=False,
+        )
+    )
+
+    first = app.state.pool._runner_factory()
+    second = app.state.pool._runner_factory()
+
+    assert first._rpc is second._rpc
+    assert first._rpc._tool_catalog_cache is app.state.tool_catalog_cache
+
+
 @pytest.mark.asyncio
 async def test_lifespan_flushes_anonymous_telemetry(
     monkeypatch: pytest.MonkeyPatch,

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
+import shutil
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 from urllib.parse import urlsplit
 
@@ -16,6 +19,8 @@ from droid_sdk.schemas.enums import (
 from factory_droid_openai.mcp_tools import MCP_SERVER_NAME, MCP_TOOL_ID_PREFIX
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from droid_sdk import DroidClient
 
 _RPC_TIMEOUT_SECONDS = 30.0
@@ -36,6 +41,12 @@ _CONNECTED_MCP_STATUS = "connected"
 _FAILED_MCP_STATUSES = frozenset({"failed", "disconnected", "disabled"})
 _MCP_URL_FIELDS = ("url", "uri")
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+_TOOL_CATALOG_PROFILE_FILES = (
+    "settings.json",
+    "settings.local.json",
+    "org-managed-settings.json",
+    "mcp.json",
+)
 _MCP_POLICY_PATTERN = re.compile(
     r"(?:mcp\s*policy|allowlist|allow\s+list|organization\s+policy)",
     re.IGNORECASE,
@@ -54,6 +65,102 @@ class _ProtocolEngine(Protocol):
         timeout: float | None = None,
         request_id: str | None = None,
     ) -> dict[str, Any]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _FileIdentity:
+    path: str
+    device: int | None = None
+    inode: int | None = None
+    size: int | None = None
+    modified_ns: int | None = None
+    changed_ns: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolCatalogIdentity:
+    droid: _FileIdentity
+    profile_root: str
+    settings: tuple[_FileIdentity, ...]
+    workdir: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolCatalogRevision:
+    identity: _ToolCatalogIdentity
+    generation: int
+
+
+class ToolCatalogCache:
+    """Caches Droid-owned tool IDs while the CLI and profile stay unchanged."""
+
+    def __init__(
+        self,
+        *,
+        droid_path: str,
+        workdir: Path,
+        profile_root: Callable[[], Path] = lambda: Path(
+            os.environ.get("FACTORY_HOME_OVERRIDE") or Path.home() / ".factory"
+        ),
+    ) -> None:
+        self._droid_path = droid_path
+        self._workdir = workdir
+        self._profile_root = profile_root
+        self._lock = asyncio.Lock()
+        self._identity: _ToolCatalogIdentity | None = None
+        self._tool_ids: frozenset[str] | None = None
+        self._generation = 0
+
+    async def get(
+        self,
+        discover: Callable[[], Awaitable[list[dict[str, Any]]]],
+        *,
+        dynamic_prefix: str | None,
+    ) -> tuple[_ToolCatalogRevision, set[str], bool]:
+        identity = await asyncio.to_thread(self._current_identity)
+        async with self._lock:
+            if identity == self._identity and self._tool_ids is not None:
+                tool_ids = set(self._tool_ids)
+                tool_ids.difference_update(_matching(tool_ids, dynamic_prefix))
+                return _ToolCatalogRevision(identity, self._generation), tool_ids, True
+            tool_ids = _required_tool_ids(await discover())
+            self._identity = identity
+            self._tool_ids = frozenset(tool_ids - _matching(tool_ids, dynamic_prefix))
+            self._generation += 1
+            return _ToolCatalogRevision(identity, self._generation), tool_ids, False
+
+    async def remember(
+        self,
+        revision: _ToolCatalogRevision,
+        tool_ids: set[str],
+        *,
+        dynamic_prefix: str | None,
+    ) -> None:
+        async with self._lock:
+            if revision.identity != self._identity:
+                return
+            remembered = tool_ids - _matching(tool_ids, dynamic_prefix)
+            if revision.generation != self._generation:
+                concurrent = set(self._tool_ids or ())
+                concurrent.difference_update(_matching(concurrent, dynamic_prefix))
+                remembered.update(concurrent)
+            self._tool_ids = frozenset(remembered)
+            self._generation += 1
+
+    def _current_identity(self) -> _ToolCatalogIdentity:
+        profile_root = self._profile_root().expanduser()
+        executable = _resolve_executable(self._droid_path, self._workdir)
+        project_root = _project_root(self._workdir)
+        settings_paths = {profile_root / name for name in _TOOL_CATALOG_PROFILE_FILES}
+        settings_paths.update(
+            project_root / ".factory" / name for name in _TOOL_CATALOG_PROFILE_FILES
+        )
+        return _ToolCatalogIdentity(
+            droid=_file_identity(executable),
+            profile_root=str(profile_root.resolve(strict=False)),
+            settings=tuple(_file_identity(path) for path in sorted(settings_paths)),
+            workdir=str(self._workdir.resolve(strict=False)),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,8 +198,14 @@ class CompactionResult:
 class DroidRpcExtension:
     """Compatibility shim for RPCs not yet exposed by droid-sdk-python."""
 
-    def __init__(self, *, mcp_settle_seconds: float = 0.0) -> None:
+    def __init__(
+        self,
+        *,
+        mcp_settle_seconds: float = 0.0,
+        tool_catalog_cache: ToolCatalogCache | None = None,
+    ) -> None:
         self._mcp_settle_seconds = max(0.0, mcp_settle_seconds)
+        self._tool_catalog_cache = tool_catalog_cache
 
     async def add_user_message(
         self,
@@ -151,15 +264,31 @@ class DroidRpcExtension:
         MCP callable. Everything Droid owns still goes away, so a turn can only
         reach tools the OpenAI client asked for.
         """
-        if expected_tool_ids is None:
-            await self._wait_for_mcp_catalog(client)
-        else:
-            await self._wait_for_native_mcp_server(client, native_server_url)
-        tools = await self._list_tools(client)
-        if not tools:
-            raise DroidClientError("Droid returned an empty native tool catalog")
-        tool_ids = {_required_str(tool, "id") for tool in tools}
         if expected_tool_ids is not None:
+            await self._wait_for_native_mcp_server(client, native_server_url)
+
+        async def discover() -> list[dict[str, Any]]:
+            if expected_tool_ids is None:
+                await self._wait_for_mcp_catalog(client)
+            return await self._list_tools(client)
+
+        cache = (
+            self._tool_catalog_cache
+            if keep_tool_prefix is None or expected_tool_ids is not None
+            else None
+        )
+        cache_revision: _ToolCatalogRevision | None = None
+        cache_hit = False
+        if cache is None:
+            tool_ids = _required_tool_ids(await discover())
+        else:
+            cache_revision, tool_ids, cache_hit = await cache.get(
+                discover,
+                dynamic_prefix=keep_tool_prefix,
+            )
+        if expected_tool_ids is not None:
+            if cache_hit:
+                tool_ids.update(expected_tool_ids)
             self._verify_native_tool_ids(tool_ids, expected_tool_ids)
         tolerated = _UNAVOIDABLE_TOOL_IDS
         if keep_tool_prefix is not None:
@@ -182,17 +311,28 @@ class DroidRpcExtension:
                     "disabledToolIds": sorted(tool_ids - kept),
                 },
             )
+            verification = await self._list_tools(client)
+            if not verification:
+                raise DroidClientError("Droid returned an empty native tool catalog")
             remaining: set[str] = set()
-            for tool in await self._list_tools(client):
+            verified_tool_ids: set[str] = set()
+            for tool in verification:
                 tool_id = _required_str(tool, "id")
-                tool_ids.add(tool_id)
+                verified_tool_ids.add(tool_id)
                 if _required_bool(tool, "currentlyAllowed"):
                     remaining.add(tool_id)
+            tool_ids = verified_tool_ids
             if expected_tool_ids is not None:
                 self._verify_native_tool_ids(tool_ids, expected_tool_ids)
                 missing_expected = set(expected_tool_ids - remaining)
             unexpected = remaining - tolerated - _matching(remaining, keep_tool_prefix)
             if not unexpected and not missing_expected:
+                if cache is not None and cache_revision is not None:
+                    await cache.remember(
+                        cache_revision,
+                        tool_ids,
+                        dynamic_prefix=keep_tool_prefix,
+                    )
                 return
             if attempt + 1 < _TOOL_DISABLE_RETRIES:
                 await asyncio.sleep(_TOOL_DISABLE_RETRY_SECONDS)
@@ -362,6 +502,44 @@ class DroidRpcExtension:
         if not isinstance(result, dict):
             raise DroidClientError(f"{method} returned a malformed result")
         return result
+
+
+def _required_tool_ids(tools: list[dict[str, Any]]) -> set[str]:
+    if not tools:
+        raise DroidClientError("Droid returned an empty native tool catalog")
+    return {_required_str(tool, "id") for tool in tools}
+
+
+def _resolve_executable(droid_path: str, workdir: Path) -> Path:
+    candidate = Path(droid_path).expanduser()
+    if candidate.is_absolute():
+        return candidate
+    if droid_path != candidate.name:
+        return workdir / candidate
+    return Path(shutil.which(droid_path) or workdir / candidate)
+
+
+def _project_root(workdir: Path) -> Path:
+    for directory in (workdir, *workdir.parents):
+        if (directory / ".git").exists():
+            return directory
+    return workdir
+
+
+def _file_identity(path: Path) -> _FileIdentity:
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+        stat = resolved.stat()
+    except (OSError, RuntimeError):
+        return _FileIdentity(str(path.expanduser().absolute()))
+    return _FileIdentity(
+        path=str(resolved),
+        device=stat.st_dev,
+        inode=stat.st_ino,
+        size=stat.st_size,
+        modified_ns=stat.st_mtime_ns,
+        changed_ns=stat.st_ctime_ns,
+    )
 
 
 def _matching(tool_ids: set[str], prefix: str | None) -> set[str]:

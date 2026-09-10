@@ -22,7 +22,7 @@ from jsonschema.validators import validator_for
 
 from factory_droid_openai.availability import ModelQuarantine
 from factory_droid_openai.config import DEFAULT_TOOL_CALL_DRAIN_SECONDS, Settings
-from factory_droid_openai.droid_rpc import DroidRpcExtension
+from factory_droid_openai.droid_rpc import DroidRpcExtension, ToolCatalogCache
 from factory_droid_openai.logs import bind_request, current_timeline
 from factory_droid_openai.logs import debug as log_debug
 from factory_droid_openai.logs import info as log_info
@@ -807,6 +807,14 @@ def create_app(
     )
     metrics = BridgeMetrics()
     reaper = BackgroundReaper(metrics=metrics)
+    tool_catalog_cache = ToolCatalogCache(
+        droid_path=resolved_settings.droid_path,
+        workdir=resolved_settings.workdir,
+    )
+    rpc_extension = DroidRpcExtension(
+        mcp_settle_seconds=resolved_settings.mcp_settle_seconds,
+        tool_catalog_cache=tool_catalog_cache,
+    )
     resolved_runner_factory = runner_factory or (
         lambda: DroidRunner(
             droid_path=resolved_settings.droid_path,
@@ -817,9 +825,7 @@ def create_app(
             metrics=metrics,
             worktree=resolved_settings.worktree,
             append_system_prompt_file=resolved_settings.append_system_prompt_file,
-            rpc_extension=DroidRpcExtension(
-                mcp_settle_seconds=resolved_settings.mcp_settle_seconds,
-            ),
+            rpc_extension=rpc_extension,
             reaper=reaper if resolved_settings.detached_cleanup else None,
         )
     )
@@ -926,6 +932,7 @@ def create_app(
     application.state.reaper = reaper
     application.state.quarantine = quarantine
     application.state.telemetry = telemetry
+    application.state.tool_catalog_cache = tool_catalog_cache
     application.state.native_tools = native_tools
     if resolved_settings.native_tool_calls:
         # The token in each path is the credential, so the endpoint carries no

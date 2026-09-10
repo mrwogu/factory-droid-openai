@@ -1729,13 +1729,19 @@ For every Droid session, the bridge:
 1. Selects Droid's `auto` interaction mode with autonomy `off`.
 2. Requests no additional MCP servers from the SDK.
 3. Cancels permission requests and interactive questions.
-4. Optionally waits `FACTORY_DROID_OPENAI_MCP_SETTLE_SECONDS` for configured MCP
-   servers, which only widens the verification snapshot and is off by default.
-5. Discovers the native and MCP tool catalog known at that moment through
-   `droid.list_tools`.
-6. Disables every discovered tool ID and verifies no unexpected tool remains.
-   Tools that appear after this point stay denied, because Droid defaults to
-   deny once a disabled set has been sent.
+4. Before an uncached discovery, optionally waits
+   `FACTORY_DROID_OPENAI_MCP_SETTLE_SECONDS` for configured MCP servers. This
+   only widens the snapshot and is off by default.
+5. Discovers Droid-owned native and MCP tool IDs through `droid.list_tools`.
+   The bridge caches this snapshot for the resolved Droid executable and the
+   active user and project settings and MCP files. A CLI replacement or
+   profile change invalidates it. Per-request `openai-bridge` IDs are never
+   cached.
+6. Applies the discovered or cached disabled set, then calls
+   `droid.list_tools` once to verify no unexpected tool remains. A new tool
+   found during verification is disabled in the bounded retry and added to the
+   snapshot. Tools that appear after this point stay denied, because Droid
+   defaults to deny once a disabled set has been sent.
 7. Rejects any Factory-native tool event as a second line of defense, naming the
    tool in the error. Droid keeps two of its own meta tools callable whatever a
    session disables, `exit-spec-mode` and the deferred-tool loader; weaker
