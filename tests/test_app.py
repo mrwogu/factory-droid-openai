@@ -15,7 +15,9 @@ from factory_droid_openai import telemetry as telemetry_module
 from factory_droid_openai.app import (
     AdmissionController,
     AdmissionLease,
+    AdmissionRejectedError,
     FinalizingStreamingResponse,
+    RequestPriority,
     RequestSizeLimitMiddleware,
     SessionRegistry,
     StructuredOutput,
@@ -28,6 +30,7 @@ from factory_droid_openai.app import (
     _payload_size_bucket,
     _request_mode,
     _request_outcome,
+    _request_priority,
     _request_route,
     _request_telemetry_features,
     _RequestPayloadLimitError,
@@ -1424,6 +1427,284 @@ async def test_bounded_queue_rejects_overload_before_stream_headers(
         )
 
     assert retried.status_code == 200
+
+
+def test_priority_header_parsing() -> None:
+    assert _request_priority(None) == "normal"
+    assert _request_priority("normal") == "normal"
+    assert _request_priority("HIGH") == "high"
+    assert _request_priority("urgent") is None
+
+
+def test_overload_rejection_metrics_render_both_priorities_at_zero() -> None:
+    text = BridgeMetrics().render()
+
+    assert 'factory_droid_openai_overload_rejections_total{priority="high"} 0' in text
+    assert 'factory_droid_openai_overload_rejections_total{priority="normal"} 0' in text
+
+
+@pytest.mark.asyncio
+async def test_priority_admission_jumps_queued_normal_work() -> None:
+    metrics = BridgeMetrics()
+    admission = AdmissionController(max_concurrency=1, max_queue_size=4, metrics=metrics)
+    deadline = asyncio.get_running_loop().time() + 30
+    active = await admission.acquire(deadline)
+    first = asyncio.create_task(admission.acquire(deadline))
+    await asyncio.sleep(0)
+    second = asyncio.create_task(admission.acquire(deadline))
+    await asyncio.sleep(0)
+    foreground = asyncio.create_task(admission.acquire(deadline, priority="high"))
+    await asyncio.sleep(0)
+
+    await active.release()
+    foreground_lease = await foreground
+    assert not first.done()
+    assert not second.done()
+
+    await foreground_lease.release()
+    first_lease = await first
+    await first_lease.release()
+    second_lease = await second
+    await second_lease.release()
+
+
+@pytest.mark.asyncio
+async def test_normal_request_queues_behind_priority_waiter() -> None:
+    admitted: list[str] = []
+    metrics = BridgeMetrics()
+    admission = AdmissionController(max_concurrency=1, max_queue_size=2, metrics=metrics)
+    deadline = asyncio.get_running_loop().time() + 30
+
+    async def acquire_and_release(priority: RequestPriority) -> None:
+        lease = await admission.acquire(deadline, priority=priority)
+        admitted.append(priority)
+        await lease.release()
+
+    active = await admission.acquire(deadline)
+    foreground = asyncio.create_task(acquire_and_release("high"))
+    await asyncio.sleep(0)
+    await active.release()
+    # Same task continues before the woken priority waiter can run, so this
+    # acquire is queued while the slot is already free.
+    background_lease = await admission.acquire(deadline)
+    admitted.append("normal")
+    await background_lease.release()
+    await foreground
+
+    assert admitted == ["high", "normal"]
+
+
+@pytest.mark.asyncio
+async def test_priority_admission_rejects_newest_normal_waiter_when_queue_full() -> None:
+    metrics = BridgeMetrics()
+    admission = AdmissionController(max_concurrency=1, max_queue_size=2, metrics=metrics)
+    deadline = asyncio.get_running_loop().time() + 30
+    active = await admission.acquire(deadline)
+    first = asyncio.create_task(admission.acquire(deadline))
+    await asyncio.sleep(0)
+    second = asyncio.create_task(admission.acquire(deadline))
+    await asyncio.sleep(0)
+    foreground = asyncio.create_task(admission.acquire(deadline, priority="high"))
+
+    with pytest.raises(AdmissionRejectedError):
+        await second
+    assert not first.done()
+
+    await active.release()
+    foreground_lease = await foreground
+    await foreground_lease.release()
+    first_lease = await first
+    await first_lease.release()
+
+
+@pytest.mark.asyncio
+async def test_priority_request_rejected_when_queue_full_of_priority_work() -> None:
+    metrics = BridgeMetrics()
+    admission = AdmissionController(max_concurrency=1, max_queue_size=1, metrics=metrics)
+    deadline = asyncio.get_running_loop().time() + 30
+    active = await admission.acquire(deadline)
+    queued_high = asyncio.create_task(admission.acquire(deadline, priority="high"))
+    await asyncio.sleep(0)
+
+    with pytest.raises(AdmissionRejectedError):
+        await admission.acquire(deadline, priority="high")
+
+    await active.release()
+    high_lease = await queued_high
+    await high_lease.release()
+
+
+@pytest.mark.asyncio
+async def test_evicted_waiter_cancellation_after_removal_is_clean() -> None:
+    metrics = BridgeMetrics()
+    admission = AdmissionController(max_concurrency=1, max_queue_size=1, metrics=metrics)
+    deadline = asyncio.get_running_loop().time() + 30
+    active = await admission.acquire(deadline)
+    evicted = asyncio.create_task(admission.acquire(deadline))
+    await asyncio.sleep(0)
+    foreground = asyncio.create_task(admission.acquire(deadline, priority="high"))
+    evicted.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await evicted
+
+    await active.release()
+    foreground_lease = await foreground
+    await foreground_lease.release()
+
+    assert "factory_droid_openai_queued_requests 0" in metrics.render()
+
+
+@pytest.mark.asyncio
+async def test_priority_header_admits_foreground_before_backlog(
+    tmp_path: Path,
+) -> None:
+    runner = GateRunner()
+    app = create_app(
+        Settings(
+            workdir=tmp_path,
+            timeout_seconds=30,
+            max_concurrency=1,
+            max_queue_size=4,
+        ),
+        runner_factory=cast("RunnerFactory", lambda: runner),
+    )
+    async with _client(app) as client:
+        active = asyncio.create_task(
+            client.post(
+                "/v1/chat/completions",
+                json=_payload(messages=[{"role": "user", "content": "active"}]),
+            )
+        )
+        await runner.started.wait()
+        background = asyncio.create_task(
+            client.post(
+                "/v1/chat/completions",
+                json=_payload(
+                    stream=True,
+                    messages=[{"role": "user", "content": "background"}],
+                ),
+            )
+        )
+        await _wait_for_metric(app, "factory_droid_openai_queued_requests 1")
+        foreground = asyncio.create_task(
+            client.post(
+                "/v1/chat/completions",
+                json=_payload(messages=[{"role": "user", "content": "foreground"}]),
+                headers={"X-Factory-Droid-Priority": "HIGH"},
+            )
+        )
+        await _wait_for_metric(app, "factory_droid_openai_queued_requests 2")
+
+        runner.release.set()
+        assert (await active).status_code == 200
+        assert (await foreground).status_code == 200
+        assert (await background).status_code == 200
+
+    prompts = [request.prompt for request in runner.requests]
+    background_at = next(index for index, prompt in enumerate(prompts) if "background" in prompt)
+    foreground_at = next(index for index, prompt in enumerate(prompts) if "foreground" in prompt)
+    assert foreground_at < background_at
+
+
+@pytest.mark.asyncio
+async def test_unknown_priority_header_fails_closed(tmp_path: Path) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(),
+            headers={"X-Factory-Droid-Priority": "urgent"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert runner.requests == []
+
+
+@pytest.mark.asyncio
+async def test_full_queue_rejects_newest_normal_waiter_for_priority_request(
+    tmp_path: Path,
+) -> None:
+    runner = GateRunner()
+    app = create_app(
+        Settings(
+            workdir=tmp_path,
+            timeout_seconds=30,
+            max_concurrency=1,
+            max_queue_size=1,
+            retry_after_seconds=2,
+        ),
+        runner_factory=cast("RunnerFactory", lambda: runner),
+    )
+    async with _client(app) as client:
+        active = asyncio.create_task(client.post("/v1/chat/completions", json=_payload()))
+        await runner.started.wait()
+        background = asyncio.create_task(
+            client.post("/v1/chat/completions", json=_payload(stream=True))
+        )
+        await _wait_for_metric(app, "factory_droid_openai_queued_requests 1")
+        foreground = asyncio.create_task(
+            client.post(
+                "/v1/chat/completions",
+                json=_payload(),
+                headers={"X-Factory-Droid-Priority": "high"},
+            )
+        )
+
+        rejected = await background
+        runner.release.set()
+        assert (await active).status_code == 200
+        assert (await foreground).status_code == 200
+
+    assert rejected.status_code == 429
+    assert rejected.headers["retry-after"] == "2"
+    assert rejected.json()["error"]["type"] == "rate_limit_error"
+    metrics = app.state.metrics.render()
+    assert 'factory_droid_openai_overload_rejections_total{priority="normal"} 1' in metrics
+    assert 'factory_droid_openai_overload_rejections_total{priority="high"} 0' in metrics
+
+
+@pytest.mark.asyncio
+async def test_priority_request_rejected_when_queue_full_of_priority_work_over_http(
+    tmp_path: Path,
+) -> None:
+    runner = GateRunner()
+    app = create_app(
+        Settings(
+            workdir=tmp_path,
+            timeout_seconds=30,
+            max_concurrency=1,
+            max_queue_size=1,
+            retry_after_seconds=3,
+        ),
+        runner_factory=cast("RunnerFactory", lambda: runner),
+    )
+    async with _client(app) as client:
+        active = asyncio.create_task(client.post("/v1/chat/completions", json=_payload()))
+        await runner.started.wait()
+        queued_high = asyncio.create_task(
+            client.post(
+                "/v1/chat/completions",
+                json=_payload(stream=True),
+                headers={"X-Factory-Droid-Priority": "high"},
+            )
+        )
+        await _wait_for_metric(app, "factory_droid_openai_queued_requests 1")
+        rejected = await client.post(
+            "/v1/chat/completions",
+            json=_payload(),
+            headers={"X-Factory-Droid-Priority": "high"},
+        )
+        runner.release.set()
+        assert (await active).status_code == 200
+        assert (await queued_high).status_code == 200
+
+    assert rejected.status_code == 429
+    assert rejected.headers["retry-after"] == "3"
+    metrics = app.state.metrics.render()
+    assert 'factory_droid_openai_overload_rejections_total{priority="high"} 1' in metrics
+    assert 'factory_droid_openai_overload_rejections_total{priority="normal"} 0' in metrics
 
 
 @pytest.mark.asyncio

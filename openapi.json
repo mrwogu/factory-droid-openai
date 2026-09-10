@@ -1066,6 +1066,24 @@
     "/v1/chat/completions": {
       "post": {
         "operationId": "chat_completions_v1_chat_completions_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Factory-Droid-Priority",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Factory-Droid-Priority"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
