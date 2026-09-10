@@ -10,12 +10,14 @@ from factory_droid_openai import droid_rpc as rpc_module
 from factory_droid_openai.droid_rpc import (
     DroidRpcExtension,
     NativeToolUnavailableError,
+    ToolCatalogCache,
     _ProtocolEngine,
 )
 from factory_droid_openai.mcp_tools import MCP_TOOL_ID_PREFIX
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
     from droid_sdk import DroidClient
 
@@ -245,6 +247,318 @@ async def test_disable_native_tools_skips_the_mcp_probe_by_default() -> None:
         "droid.update_session_settings",
         "droid.list_tools",
     ]
+
+
+def _tool_catalog_protocol(tool_ids: list[str]) -> FakeProtocol:
+    disabled: set[str] = set()
+
+    def handler(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if method == "droid.list_mcp_servers":
+            return {"result": {"servers": [{"name": "openai-bridge", "status": "connected"}]}}
+        if method == "droid.list_tools":
+            return {
+                "result": {
+                    "tools": [
+                        {
+                            "id": tool_id,
+                            "currentlyAllowed": (
+                                tool_id not in disabled or tool_id == "exit-spec-mode"
+                            ),
+                        }
+                        for tool_id in tool_ids
+                    ]
+                }
+            }
+        if method == "droid.update_session_settings":
+            disabled.update(params["disabledToolIds"])
+            return {"result": {}}
+        raise AssertionError(method)
+
+    return FakeProtocol(handler)
+
+
+def _tool_catalog_cache(tmp_path: Path) -> tuple[ToolCatalogCache, Path, Path]:
+    executable = tmp_path / "droid"
+    executable.write_text("version one", encoding="utf-8")
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    cache = ToolCatalogCache(
+        droid_path=str(executable),
+        workdir=tmp_path,
+        profile_root=lambda: profile,
+    )
+    return cache, executable, profile
+
+
+def test_tool_catalog_cache_uses_the_factory_profile_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    profile = tmp_path / "factory-home"
+    monkeypatch.setenv("FACTORY_HOME_OVERRIDE", str(profile))
+    cache = ToolCatalogCache(droid_path="missing-droid", workdir=tmp_path)
+
+    identity = cache._current_identity()
+
+    assert identity.profile_root == str(profile)
+
+
+def test_tool_catalog_cache_resolves_relative_cli_and_project_paths(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    workdir = repository / "nested"
+    workdir.mkdir(parents=True)
+    (repository / ".git").mkdir()
+    executable = workdir / "bin" / "droid"
+    executable.parent.mkdir()
+    executable.write_text("version one", encoding="utf-8")
+    profile = tmp_path / "profile"
+    cache = ToolCatalogCache(
+        droid_path="bin/droid",
+        workdir=workdir,
+        profile_root=lambda: profile,
+    )
+
+    identity = cache._current_identity()
+
+    assert identity.droid.path == str(executable)
+    assert str(repository / ".factory" / "mcp.json") in {
+        setting.path for setting in identity.settings
+    }
+
+
+@pytest.mark.asyncio
+async def test_disable_native_tools_reuses_a_cached_discovery(tmp_path: Path) -> None:
+    cache, _, _ = _tool_catalog_cache(tmp_path)
+    extension = DroidRpcExtension(tool_catalog_cache=cache)
+    first = _tool_catalog_protocol(["read-cli", "exit-spec-mode"])
+    second = _tool_catalog_protocol(["read-cli", "exit-spec-mode"])
+
+    await extension.disable_native_tools(_client(first))
+    await extension.disable_native_tools(_client(second))
+
+    assert [method for method, _, _ in first.calls] == [
+        "droid.list_tools",
+        "droid.update_session_settings",
+        "droid.list_tools",
+    ]
+    assert [method for method, _, _ in second.calls] == [
+        "droid.update_session_settings",
+        "droid.list_tools",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["cli", "profile", "project", "mcp"])
+async def test_tool_catalog_cache_invalidates_with_its_identity(
+    tmp_path: Path,
+    changed: str,
+) -> None:
+    cache, executable, profile = _tool_catalog_cache(tmp_path)
+    extension = DroidRpcExtension(tool_catalog_cache=cache)
+
+    await extension.disable_native_tools(
+        _client(_tool_catalog_protocol(["read-cli", "exit-spec-mode"]))
+    )
+    if changed == "cli":
+        executable.write_text("version two is different", encoding="utf-8")
+    elif changed == "profile":
+        (profile / "settings.json").write_text('{"mcpServers": {}}', encoding="utf-8")
+    elif changed == "project":
+        project_settings = tmp_path / ".factory"
+        project_settings.mkdir()
+        (project_settings / "settings.local.json").write_text(
+            '{"mcpServers": {}}',
+            encoding="utf-8",
+        )
+    else:
+        (profile / "mcp.json").write_text('{"mcpServers": {}}', encoding="utf-8")
+    protocol = _tool_catalog_protocol(["read-cli", "exit-spec-mode"])
+
+    await extension.disable_native_tools(_client(protocol))
+
+    assert [method for method, _, _ in protocol.calls] == [
+        "droid.list_tools",
+        "droid.update_session_settings",
+        "droid.list_tools",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cached_discovery_absorbs_new_tools_found_by_verification(tmp_path: Path) -> None:
+    cache, _, _ = _tool_catalog_cache(tmp_path)
+    extension = DroidRpcExtension(tool_catalog_cache=cache)
+    await extension.disable_native_tools(
+        _client(_tool_catalog_protocol(["read-cli", "exit-spec-mode"]))
+    )
+    second = _tool_catalog_protocol(["read-cli", "write-cli", "exit-spec-mode"])
+
+    await extension.disable_native_tools(_client(second))
+    third = _tool_catalog_protocol(["read-cli", "write-cli", "exit-spec-mode"])
+    await extension.disable_native_tools(_client(third))
+
+    updates = [
+        params for method, params, _ in second.calls if method == "droid.update_session_settings"
+    ]
+    assert [params["disabledToolIds"] for params in updates] == [
+        ["exit-spec-mode", "read-cli"],
+        ["exit-spec-mode", "read-cli", "write-cli"],
+    ]
+    assert [method for method, _, _ in third.calls] == [
+        "droid.update_session_settings",
+        "droid.list_tools",
+    ]
+    assert third.calls[0][1]["disabledToolIds"] == [
+        "exit-spec-mode",
+        "read-cli",
+        "write-cli",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cached_discovery_drops_tools_absent_from_verification(tmp_path: Path) -> None:
+    cache, _, _ = _tool_catalog_cache(tmp_path)
+    extension = DroidRpcExtension(tool_catalog_cache=cache)
+    await extension.disable_native_tools(_client(_tool_catalog_protocol(["read-cli", "write-cli"])))
+    await extension.disable_native_tools(_client(_tool_catalog_protocol(["read-cli"])))
+    protocol = _tool_catalog_protocol(["read-cli"])
+
+    await extension.disable_native_tools(_client(protocol))
+
+    assert protocol.calls[0][1]["disabledToolIds"] == ["read-cli"]
+
+
+@pytest.mark.asyncio
+async def test_cached_discovery_uses_each_bridge_tool_catalog(tmp_path: Path) -> None:
+    cache, _, _ = _tool_catalog_cache(tmp_path)
+    extension = DroidRpcExtension(tool_catalog_cache=cache)
+    weather = f"{MCP_TOOL_ID_PREFIX}get_weather"
+    news = f"{MCP_TOOL_ID_PREFIX}get_news"
+
+    await extension.disable_native_tools(
+        _client(_tool_catalog_protocol(["read-cli", weather])),
+        keep_tool_prefix=MCP_TOOL_ID_PREFIX,
+        expected_tool_ids=frozenset({weather}),
+    )
+    protocol = _tool_catalog_protocol(["read-cli", news])
+    await extension.disable_native_tools(
+        _client(protocol),
+        keep_tool_prefix=MCP_TOOL_ID_PREFIX,
+        expected_tool_ids=frozenset({news}),
+    )
+
+    assert [method for method, _, _ in protocol.calls] == [
+        "droid.list_mcp_servers",
+        "droid.update_session_settings",
+        "droid.list_tools",
+    ]
+    assert protocol.calls[1][1]["enabledToolIds"] == [news]
+    assert protocol.calls[1][1]["disabledToolIds"] == ["read-cli"]
+
+
+@pytest.mark.asyncio
+async def test_cached_discovery_filters_stale_bridge_tool_ids(tmp_path: Path) -> None:
+    cache, _, _ = _tool_catalog_cache(tmp_path)
+    extension = DroidRpcExtension(tool_catalog_cache=cache)
+    stale = f"{MCP_TOOL_ID_PREFIX}stale"
+    weather = f"{MCP_TOOL_ID_PREFIX}get_weather"
+    await extension.disable_native_tools(_client(_tool_catalog_protocol(["read-cli", stale])))
+    protocol = _tool_catalog_protocol(["read-cli", weather])
+
+    await extension.disable_native_tools(
+        _client(protocol),
+        keep_tool_prefix=MCP_TOOL_ID_PREFIX,
+        expected_tool_ids=frozenset({weather}),
+    )
+
+    assert protocol.calls[1][1]["enabledToolIds"] == [weather]
+    assert protocol.calls[1][1]["disabledToolIds"] == ["read-cli"]
+
+
+@pytest.mark.asyncio
+async def test_cached_discovery_bypasses_an_unknown_dynamic_catalog(tmp_path: Path) -> None:
+    cache, _, _ = _tool_catalog_cache(tmp_path)
+    extension = DroidRpcExtension(tool_catalog_cache=cache)
+    first = f"{MCP_TOOL_ID_PREFIX}first"
+    second = f"{MCP_TOOL_ID_PREFIX}second"
+
+    await extension.disable_native_tools(
+        _client(_tool_catalog_protocol(["read-cli", first])),
+        keep_tool_prefix=MCP_TOOL_ID_PREFIX,
+    )
+    protocol = _tool_catalog_protocol(["read-cli", second])
+    await extension.disable_native_tools(
+        _client(protocol),
+        keep_tool_prefix=MCP_TOOL_ID_PREFIX,
+    )
+
+    assert [method for method, _, _ in protocol.calls] == [
+        "droid.list_tools",
+        "droid.update_session_settings",
+        "droid.list_tools",
+    ]
+    assert protocol.calls[1][1]["enabledToolIds"] == [second]
+
+
+@pytest.mark.asyncio
+async def test_tool_catalog_cache_ignores_a_stale_verification(tmp_path: Path) -> None:
+    cache, _, profile = _tool_catalog_cache(tmp_path)
+
+    async def discover_first() -> list[dict[str, Any]]:
+        return [{"id": "read-cli", "currentlyAllowed": True}]
+
+    first_identity, _, _ = await cache.get(discover_first, dynamic_prefix=None)
+    (profile / "settings.json").write_text("{}", encoding="utf-8")
+
+    async def discover_second() -> list[dict[str, Any]]:
+        return [{"id": "write-cli", "currentlyAllowed": True}]
+
+    second_identity, _, _ = await cache.get(discover_second, dynamic_prefix=None)
+    assert first_identity != second_identity
+    await cache.remember(first_identity, {"stale-cli"}, dynamic_prefix=None)
+
+    async def must_not_discover() -> list[dict[str, Any]]:
+        raise AssertionError("the new profile snapshot should remain cached")
+
+    _, tool_ids, cache_hit = await cache.get(must_not_discover, dynamic_prefix=None)
+
+    assert cache_hit is True
+    assert tool_ids == {"write-cli"}
+
+
+@pytest.mark.asyncio
+async def test_tool_catalog_cache_merges_concurrent_verifications(tmp_path: Path) -> None:
+    cache, _, _ = _tool_catalog_cache(tmp_path)
+
+    async def discover() -> list[dict[str, Any]]:
+        return [{"id": "read-cli", "currentlyAllowed": True}]
+
+    first_revision, _, _ = await cache.get(discover, dynamic_prefix=None)
+    second_revision, _, _ = await cache.get(discover, dynamic_prefix=None)
+
+    await cache.remember(first_revision, {"read-cli", "write-cli"}, dynamic_prefix=None)
+    await cache.remember(second_revision, {"read-cli", "search-cli"}, dynamic_prefix=None)
+    _, tool_ids, cache_hit = await cache.get(discover, dynamic_prefix=None)
+
+    assert cache_hit is True
+    assert tool_ids == {"read-cli", "search-cli", "write-cli"}
+
+
+@pytest.mark.asyncio
+async def test_disable_native_tools_rejects_an_empty_verification() -> None:
+    catalog_reads = 0
+
+    def handler(method: str, _params: dict[str, Any]) -> dict[str, Any]:
+        nonlocal catalog_reads
+        if method == "droid.list_tools":
+            catalog_reads += 1
+            tools = [{"id": "read-cli", "currentlyAllowed": True}] if catalog_reads == 1 else []
+            return {"result": {"tools": tools}}
+        if method == "droid.update_session_settings":
+            return {"result": {}}
+        raise AssertionError(method)
+
+    with pytest.raises(DroidClientError, match="empty native tool catalog"):
+        await DroidRpcExtension().disable_native_tools(_client(FakeProtocol(handler)))
 
 
 @pytest.mark.asyncio
