@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.8.0](https://github.com/mrwogu/factory-droid-openai/compare/v1.7.1...v1.8.0) (2026-09-10)
+
+
+### Features
+
+* add repair budget and OpenCode support ([ad8f24e](https://github.com/mrwogu/factory-droid-openai/commit/ad8f24ee2c6ac53c638246f5563cb1aebd8fb2f4))
+* **pool:** drain warm sessions after sustained idle ([#111](https://github.com/mrwogu/factory-droid-openai/issues/111)) ([2ff0e6b](https://github.com/mrwogu/factory-droid-openai/commit/2ff0e6be5e8889a0d88502bd3dbbcb8e3d755a34))
+* **pool:** refresh warm session TTL on hit ([db726ef](https://github.com/mrwogu/factory-droid-openai/commit/db726ef4aa42d650008d78ac118fbea07e972803))
+* **queue:** admit foreground requests ahead of normal backlog ([#113](https://github.com/mrwogu/factory-droid-openai/issues/113)) ([a5fd15b](https://github.com/mrwogu/factory-droid-openai/commit/a5fd15bff9aa37f323d79893a1c6406cbf84a259))
+
+
+### Bug Fixes
+
+* **api:** retry invalid model output once ([#114](https://github.com/mrwogu/factory-droid-openai/issues/114)) ([4d03bd3](https://github.com/mrwogu/factory-droid-openai/commit/4d03bd34c5f5a5609d4ea9234d82a4b053c027c3))
+* **protocol:** repair dropped member keys in tool-call JSON ([42d3717](https://github.com/mrwogu/factory-droid-openai/commit/42d37170129c7b5ea104e41c69e4b237b7443ef4))
+
 ## [1.7.1](https://github.com/mrwogu/factory-droid-openai/compare/v1.7.0...v1.7.1) (2026-09-08)
 
 
