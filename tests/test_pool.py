@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -87,6 +88,7 @@ def _pool(
     *,
     size: int = 1,
     ttl_seconds: float = 600.0,
+    idle_drain_seconds: float | None = None,
     max_keys: int = 2,
     retry_seconds: float = 0.0,
     metrics: BridgeMetrics | None = None,
@@ -98,6 +100,7 @@ def _pool(
         size=size,
         warm_timeout_seconds=5.0,
         ttl_seconds=ttl_seconds,
+        idle_drain_seconds=idle_drain_seconds,
         max_keys=max_keys,
         retry_seconds=retry_seconds,
         metrics=metrics,
@@ -198,6 +201,116 @@ async def test_pool_reports_miss_for_unwarmed_key() -> None:
 
     assert pool.acquire(KEY) is None
     assert "factory_droid_openai_warm_session_misses_total 1" in metrics.render()
+
+
+@pytest.mark.asyncio
+async def test_pool_drains_after_sustained_idle_and_rewarms_on_demand() -> None:
+    log: list[str] = []
+    metrics = BridgeMetrics()
+    runner = FakeRunner(log=log)
+    pool = _pool(runner, idle_drain_seconds=10.0, metrics=metrics)
+
+    pool.start(initial_key=KEY)
+    await asyncio.sleep(0.05)
+    assert "factory_droid_openai_warm_sessions 1" in metrics.render()
+
+    pool._last_activity_at = time.monotonic() - 11.0
+    await pool._refill()
+    await asyncio.sleep(0)
+
+    assert log == ["warm:model-a", "discard:model-a"]
+    assert "factory_droid_openai_warm_sessions 0" in metrics.render()
+    assert pool.acquire(KEY) is None
+    assert "factory_droid_openai_warm_session_misses_total 1" in metrics.render()
+
+    await asyncio.sleep(0.05)
+    assert pool.acquire(KEY) is not None
+    assert "factory_droid_openai_warm_session_hits_total 1" in metrics.render()
+    await pool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_first_request_after_idle_deadline_drains_before_acquire() -> None:
+    log: list[str] = []
+    pool = _pool(FakeRunner(log=log), idle_drain_seconds=10.0)
+    pool.note(KEY)
+    pool.offer(_session(created_at=asyncio.get_running_loop().time()))
+    pool._last_activity_at = time.monotonic() - 11.0
+
+    assert pool.acquire(KEY) is None
+    await asyncio.sleep(0)
+
+    assert log == ["discard:model-a"]
+    await pool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_recording_activity_does_not_refill_before_acquire() -> None:
+    runner = FakeRunner()
+    pool = _pool(runner, idle_drain_seconds=10.0)
+    pool.start(initial_key=KEY)
+    await asyncio.sleep(0.05)
+    pool._last_activity_at = time.monotonic() - 11.0
+
+    pool.record_activity()
+    await pool._refill()
+
+    assert runner.warmed == 1
+    assert pool.acquire(KEY) is None
+    await pool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_idle_drain_discards_an_in_flight_warmup() -> None:
+    class DelayedRunner(FakeRunner):
+        def __init__(self, *, log: list[str]) -> None:
+            super().__init__(log=log)
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def warm(
+            self,
+            key: SessionKey,
+            *,
+            timeout_seconds: float,
+            native_tools: NativeToolBinding | None = None,
+        ) -> WarmSession:
+            self.started.set()
+            await self.release.wait()
+            return await super().warm(
+                key,
+                timeout_seconds=timeout_seconds,
+                native_tools=native_tools,
+            )
+
+    log: list[str] = []
+    runner = DelayedRunner(log=log)
+    pool = _pool(runner, idle_drain_seconds=10.0)
+    pool.start(initial_key=KEY)
+    await runner.started.wait()
+    pool._last_activity_at = time.monotonic() - 11.0
+
+    pool.record_activity()
+    runner.release.set()
+    await asyncio.sleep(0.05)
+
+    assert runner.warmed == 1
+    assert log == ["warm:model-a", "discard:model-a"]
+    assert pool.acquire(KEY) is None
+    await pool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_pool_idle_drain_stays_disabled_without_activity_or_setting() -> None:
+    configured = _pool(FakeRunner(), idle_drain_seconds=10.0)
+    disabled = _pool(FakeRunner())
+
+    assert configured._idle_drain_due() is False
+    configured._drain_idle()
+    disabled.record_activity()
+    disabled.start(initial_key=KEY)
+    assert disabled._idle_drain_due() is False
+    await disabled.aclose()
 
 
 @pytest.mark.asyncio

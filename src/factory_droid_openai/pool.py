@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass
@@ -116,6 +117,7 @@ class WarmSessionPool:
         size: int,
         warm_timeout_seconds: float,
         ttl_seconds: float = 600.0,
+        idle_drain_seconds: float | None = None,
         max_keys: int = 2,
         retry_seconds: float = 5.0,
         metrics: PoolMetrics | None = None,
@@ -126,6 +128,7 @@ class WarmSessionPool:
         self._size = max(0, size)
         self._warm_timeout_seconds = warm_timeout_seconds
         self._ttl_seconds = ttl_seconds
+        self._idle_drain_seconds = idle_drain_seconds
         self._max_keys = max(1, max_keys)
         self._retry_seconds = retry_seconds
         self._metrics = metrics
@@ -136,6 +139,8 @@ class WarmSessionPool:
         self._native_wanted: list[_WarmDemand] = []
         # Startup cannot know which explicit model the first request will use.
         self._initial_key: SessionKey | None = None
+        self._last_activity_at: float | None = None
+        self._idle_drained = False
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
@@ -146,6 +151,7 @@ class WarmSessionPool:
     def start(self, *, initial_key: SessionKey | None = None) -> None:
         if not self.enabled or self._task is not None:
             return
+        self._mark_activity()
         if initial_key is not None:
             self._initial_key = initial_key
             self.note(initial_key)
@@ -169,6 +175,8 @@ class WarmSessionPool:
         self._wanted.clear()
         self._native_wanted.clear()
         self._initial_key = None
+        self._last_activity_at = None
+        self._idle_drained = False
         self._publish()
         for session in sessions:
             self._reaper.submit(self._discard_session(session))
@@ -198,7 +206,7 @@ class WarmSessionPool:
             session.native_binding.catalog if session.native_binding is not None else None,
         )
         queues = self._native_sessions if demand.catalog is not None else self._sessions
-        if len(queues.get(demand, ())) >= self._targets().get(demand, 0):
+        if self._idle_drained or len(queues.get(demand, ())) >= self._targets().get(demand, 0):
             self._discard(session)
             return
         queues[demand].append(session)
@@ -213,6 +221,8 @@ class WarmSessionPool:
         """Take a ready session for ``key``, or ``None`` when none is warm yet."""
         if not self.enabled:
             return None
+        self.record_activity()
+        self._idle_drained = False
         demand = _WarmDemand(key, catalog)
         initial_demand: _WarmDemand | None = None
         if self._initial_key is not None:
@@ -252,6 +262,14 @@ class WarmSessionPool:
         log_debug("pool.miss", model=key.model_id, warm_sessions=self._total())
         return None
 
+    def record_activity(self) -> None:
+        """Drain expired idle capacity before starting a new activity window."""
+        if not self.enabled:
+            return
+        if self._idle_drain_due():
+            self._drain_idle()
+        self._mark_activity()
+
     def _take_demand(self, demand: _WarmDemand) -> WarmSession | None:
         queues = self._native_sessions if demand.catalog is not None else self._sessions
         queue = queues.get(demand)
@@ -290,10 +308,18 @@ class WarmSessionPool:
             await self._refill()
 
     def _refill_interval(self) -> float:
-        return min(_MAX_IDLE_SWEEP_SECONDS, max(1.0, self._ttl_seconds / 2))
+        intervals = [_MAX_IDLE_SWEEP_SECONDS, max(1.0, self._ttl_seconds / 2)]
+        if self._idle_drain_seconds is not None:
+            intervals.append(max(1.0, self._idle_drain_seconds / 2))
+        return min(intervals)
 
     async def _refill(self) -> None:
         self._drop_stale()
+        if self._idle_drain_due():
+            self._drain_idle()
+            return
+        if self._idle_drained:
+            return
         self._rebalance()
         while True:
             deficits = self._deficits()
@@ -305,6 +331,8 @@ class WarmSessionPool:
             for session in warmed:
                 if session is not None:
                     self.offer(session)
+            if self._idle_drained:
+                return
             if any(session is None for session in warmed):
                 await asyncio.sleep(self._retry_seconds)
                 return
@@ -402,6 +430,30 @@ class WarmSessionPool:
         now = asyncio.get_running_loop().time()
         for session in queue:
             session.created_at = now
+
+    def _mark_activity(self) -> None:
+        self._last_activity_at = time.monotonic()
+
+    def _idle_drain_due(self) -> bool:
+        if self._idle_drain_seconds is None or self._last_activity_at is None:
+            return False
+        return time.monotonic() - self._last_activity_at >= self._idle_drain_seconds
+
+    def _drain_idle(self) -> None:
+        sessions = [
+            session
+            for queues in (self._sessions, self._native_sessions)
+            for queue in queues.values()
+            for session in queue
+        ]
+        self._sessions.clear()
+        self._native_sessions.clear()
+        self._idle_drained = True
+        self._publish()
+        for session in sessions:
+            self._discard(session)
+        if sessions:
+            log_debug("pool.drained", warm_sessions=0)
 
     def _drop_stale(self) -> None:
         for queues in (self._sessions, self._native_sessions):

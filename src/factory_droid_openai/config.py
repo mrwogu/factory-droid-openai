@@ -80,6 +80,7 @@ class Settings:
     log_format: str = "text"
     warm_sessions: int = -1
     warm_session_ttl_seconds: float = 600.0
+    warm_session_idle_drain_seconds: float | None = None
     detached_cleanup: bool = True
     telemetry: bool = True
     # Off by default: the payload lost bytes, so the repair trusts less of the
@@ -115,6 +116,11 @@ class Settings:
                 "session_init_timeout_seconds must be at most "
                 f"{MAX_SESSION_INIT_TIMEOUT_SECONDS:g} seconds"
             )
+        if self.warm_session_idle_drain_seconds is not None and (
+            not math.isfinite(self.warm_session_idle_drain_seconds)
+            or self.warm_session_idle_drain_seconds <= 0
+        ):
+            raise ValueError("warm_session_idle_drain_seconds must be greater than zero and finite")
         # Every warm session pins one catalog for its whole warm life, and every
         # admitted request publishes one of its own, so the registry has to hold
         # both at once. Sizing it any smaller makes the registry evict the
@@ -179,6 +185,9 @@ class Settings:
         warm_session_ttl_seconds = _positive_float(
             "FACTORY_DROID_OPENAI_WARM_SESSION_TTL_SECONDS",
             default=600.0,
+        )
+        warm_session_idle_drain_seconds = _optional_positive_float(
+            "FACTORY_DROID_OPENAI_WARM_SESSION_IDLE_DRAIN_SECONDS",
         )
         detached_cleanup = _boolean(
             "FACTORY_DROID_OPENAI_DETACHED_CLEANUP",
@@ -381,6 +390,7 @@ class Settings:
             log_format=log_format,
             warm_sessions=warm_sessions,
             warm_session_ttl_seconds=warm_session_ttl_seconds,
+            warm_session_idle_drain_seconds=warm_session_idle_drain_seconds,
             detached_cleanup=detached_cleanup,
             telemetry=telemetry,
             repair_lost_prefix=repair_lost_prefix,
@@ -406,6 +416,13 @@ def _positive_float(name: str, *, default: float) -> float:
     if not math.isfinite(value) or value <= 0:
         raise ValueError(f"{name} must be greater than zero and finite")
     return value
+
+
+def _optional_positive_float(name: str) -> float | None:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    return _positive_float(name, default=1.0)
 
 
 def _non_negative_float(name: str, *, default: float) -> float:

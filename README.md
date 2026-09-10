@@ -1325,6 +1325,7 @@ error types.
 | `FACTORY_DROID_OPENAI_MAX_CONCURRENCY` | `2` | Concurrent Droid subprocesses |
 | `FACTORY_DROID_OPENAI_WARM_SESSIONS` | `MAX_CONCURRENCY + 1` | Pre-started Droid sessions kept ready (`0` disables) |
 | `FACTORY_DROID_OPENAI_WARM_SESSION_TTL_SECONDS` | `600` | Idle age at which a warm session is replaced; every pool hit refreshes it |
+| `FACTORY_DROID_OPENAI_WARM_SESSION_IDLE_DRAIN_SECONDS` | unset | Drain all ready warm sessions after this much time without requests; the next request that needs one re-warms on demand |
 | `FACTORY_DROID_OPENAI_DETACHED_CLEANUP` | `true` | Tear down Droid processes after the response is sent |
 | `FACTORY_DROID_OPENAI_MAX_QUEUE_SIZE` | `8` | Requests waiting for a Droid slot |
 | `FACTORY_DROID_OPENAI_RETRY_AFTER_SECONDS` | `1` | `Retry-After` value sent with `429` |
@@ -1519,6 +1520,16 @@ fixed schedule.
 The initial default-model demand is only a startup seed. When the first
 request asks for another model or reasoning effort, the pool retires that
 unused seed and moves all capacity to the observed demand.
+
+Set `FACTORY_DROID_OPENAI_WARM_SESSION_IDLE_DRAIN_SECONDS` to release the
+resident Droid processes after a sustained period without requests. The pool
+keeps its learned demand but pauses refill while idle. The first request
+that asks the pool for a session logs `pool.miss`, starts refill, and pays
+the normal cold-start cost; following requests converge back to warm hits.
+Continuation requests carry their own session and never ask the pool, so
+they reset the idle clock without restarting refill; the next new
+conversation is the one that re-warms. Leave it unset to keep warm capacity
+resident.
 
 Teardown runs after the response is finished, so session close and the second
 `droid exec` needs to exit no longer delay the last token. Set

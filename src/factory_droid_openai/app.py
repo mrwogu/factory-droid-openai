@@ -754,6 +754,7 @@ def create_app(
         size=resolved_settings.warm_session_count(),
         warm_timeout_seconds=min(resolved_settings.timeout_seconds, _WARM_TIMEOUT_CEILING),
         ttl_seconds=resolved_settings.warm_session_ttl_seconds,
+        idle_drain_seconds=resolved_settings.warm_session_idle_drain_seconds,
         metrics=metrics,
         native_registry=native_tools,
     )
@@ -1217,6 +1218,7 @@ def create_app(
         deadline = request_started_at + timeout_seconds
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         timeline = bind_request(request_id)
+        pool.record_activity()
         log_debug(
             "chat.received",
             model=payload.model,
