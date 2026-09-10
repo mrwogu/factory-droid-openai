@@ -10,6 +10,12 @@ from dataclasses import dataclass
 WARM_RETUNE_EFFORT = "effort"
 _WARM_RETUNE_REASONS = (WARM_RETUNE_EFFORT,)
 
+# Admission rejection priorities, rendered even at zero so a dashboard keeps
+# its series between restarts.
+PRIORITY_HIGH = "high"
+PRIORITY_NORMAL = "normal"
+_REJECTION_PRIORITIES = (PRIORITY_HIGH, PRIORITY_NORMAL)
+
 
 @dataclass(frozen=True, slots=True)
 class RequestMetric:
@@ -41,7 +47,7 @@ class BridgeMetrics:
         self._ttft_count = 0
         self._active_sessions = 0
         self._queued_requests = 0
-        self._overload_rejections = 0
+        self._overload_rejections: Counter[str] = Counter()
         self._payload_rejections = 0
         self._forced_kills = 0
         self._model_discovery_failures = 0
@@ -101,9 +107,9 @@ class BridgeMetrics:
             self._active_sessions = active
             self._queued_requests = queued
 
-    def increment_overload_rejections(self) -> None:
+    def increment_overload_rejections(self, priority: str = PRIORITY_NORMAL) -> None:
         with self._lock:
-            self._overload_rejections += 1
+            self._overload_rejections[priority] += 1
 
     def increment_payload_rejections(self) -> None:
         with self._lock:
@@ -182,6 +188,10 @@ class BridgeMetrics:
                 (reason, self._warm_retunes[reason])
                 for reason in sorted({*_WARM_RETUNE_REASONS, *self._warm_retunes})
             ]
+            overload_rejections = [
+                (priority, self._overload_rejections[priority])
+                for priority in _REJECTION_PRIORITIES
+            ]
             values = {
                 "request_duration_sum": self._request_duration_sum,
                 "request_duration_count": self._request_duration_count,
@@ -193,7 +203,6 @@ class BridgeMetrics:
                 "ttft_count": self._ttft_count,
                 "active_sessions": self._active_sessions,
                 "queued_requests": self._queued_requests,
-                "overload_rejections": self._overload_rejections,
                 "payload_rejections": self._payload_rejections,
                 "forced_kills": self._forced_kills,
                 "model_discovery_failures": self._model_discovery_failures,
@@ -234,7 +243,10 @@ class BridgeMetrics:
             "# TYPE factory_droid_openai_queued_requests gauge",
             f"factory_droid_openai_queued_requests {values['queued_requests']}",
             "# TYPE factory_droid_openai_overload_rejections_total counter",
-            (f"factory_droid_openai_overload_rejections_total {values['overload_rejections']}"),
+            *[
+                (f'factory_droid_openai_overload_rejections_total{{priority="{priority}"}} {count}')
+                for priority, count in overload_rejections
+            ],
             "# TYPE factory_droid_openai_payload_rejections_total counter",
             (f"factory_droid_openai_payload_rejections_total {values['payload_rejections']}"),
             "# TYPE factory_droid_openai_forced_kills_total counter",

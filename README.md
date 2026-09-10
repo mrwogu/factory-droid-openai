@@ -1444,6 +1444,17 @@ Admission control then bounds how many requests reach Droid. Requests beyond
 `FACTORY_DROID_OPENAI_MAX_QUEUE_SIZE`; once that is full the bridge answers
 `429` with a `Retry-After` header rather than queueing without limit.
 
+Chat requests may carry `X-Factory-Droid-Priority: high` to mark foreground
+traffic. High-priority requests are admitted ahead of queued normal work, so
+they wait for a free Droid slot rather than behind the backlog. When a full
+queue contains a normal waiter, a high-priority request replaces the newest
+normal waiter - the one that has waited least. When the queue contains only
+high-priority waiters, the new high-priority request is rejected with `429`.
+A normal request that finds the queue full is rejected as before. An unknown
+header value fails closed with `400`. The header only affects
+`/v1/chat/completions`; session operations and model discovery always use the
+normal lane.
+
 `GET /metrics` renders Prometheus-style text. It is excluded from the OpenAPI
 contract because it is an operational endpoint, not part of the OpenAI API
 surface.
@@ -1457,7 +1468,7 @@ surface.
 | `factory_droid_openai_ttft_seconds` | Time to first token |
 | `factory_droid_openai_active_sessions` | Droid sessions running now |
 | `factory_droid_openai_queued_requests` | Requests waiting for admission |
-| `factory_droid_openai_overload_rejections_total` | Requests rejected with `429` |
+| `factory_droid_openai_overload_rejections_total` | Requests rejected with `429`, labelled `priority="high"` or `priority="normal"` |
 | `factory_droid_openai_payload_rejections_total` | Requests rejected with `413` |
 | `factory_droid_openai_forced_kills_total` | Droid processes that needed a kill |
 | `factory_droid_openai_model_discovery_failures_total` | Failed Droid model discovery attempts |

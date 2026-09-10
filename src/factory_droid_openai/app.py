@@ -10,9 +10,9 @@ import uuid
 from collections import OrderedDict, deque
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Annotated, Any, TypeVar
+from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeVar
 
-from fastapi import Depends, FastAPI, Request, Response, Security
+from fastapi import Depends, FastAPI, Header, Request, Response, Security
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -226,6 +226,24 @@ MODEL_RETRIEVE_RESPONSES: dict[int | str, dict[str, Any]] = {
 
 FactoryOperationResult = TypeVar("FactoryOperationResult")
 
+# Priority hint for the admission queue. Unknown header values fail closed
+# so a typo cannot silently demote foreground traffic to the normal lane.
+RequestPriority = Literal["high", "normal"]
+_PRIORITY_HEADER = "X-Factory-Droid-Priority"
+_PRIORITY_HIGH: RequestPriority = "high"
+_PRIORITY_NORMAL: RequestPriority = "normal"
+
+
+def _request_priority(value: str | None) -> RequestPriority | None:
+    if value is None:
+        return _PRIORITY_NORMAL
+    lowered = value.lower()
+    if lowered == _PRIORITY_HIGH:
+        return _PRIORITY_HIGH
+    if lowered == _PRIORITY_NORMAL:
+        return _PRIORITY_NORMAL
+    return None
+
 
 class AdmissionRejectedError(RuntimeError):
     pass
@@ -427,7 +445,22 @@ class AdmissionLease:
             raise cancelled
 
 
+@dataclass(eq=False)
+class _AdmissionTicket:
+    priority: RequestPriority
+    rejected: bool = False
+
+
 class AdmissionController:
+    """Bounded admission with a priority lane in front of the FIFO queue.
+
+    A high-priority request is admitted ahead of queued normal work, so it
+    waits only for a free slot rather than behind the whole backlog. When the
+    queue is full, a high-priority request still gets in by rejecting the
+    newest queued normal waiter - the one that has waited least - while a
+    normal request that finds the queue full is rejected as before.
+    """
+
     def __init__(
         self,
         *,
@@ -440,33 +473,49 @@ class AdmissionController:
         self._metrics = metrics
         self._condition = asyncio.Condition()
         self._active = 0
-        self._waiters: deque[object] = deque()
+        self._waiters: deque[_AdmissionTicket] = deque()
+        self._priority_waiters: deque[_AdmissionTicket] = deque()
 
-    async def acquire(self, deadline: float) -> AdmissionLease:
+    async def acquire(
+        self,
+        deadline: float,
+        *,
+        priority: RequestPriority = _PRIORITY_NORMAL,
+    ) -> AdmissionLease:
         loop = asyncio.get_running_loop()
         started = loop.time()
-        ticket: object | None = None
+        ticket: _AdmissionTicket | None = None
         async with self._condition:
             if deadline <= loop.time():
                 raise TimeoutError
-            if self._active >= self._max_concurrency or self._waiters:
-                if len(self._waiters) >= self._max_queue_size:
-                    raise AdmissionRejectedError
-                ticket = object()
-                self._waiters.append(ticket)
+            if self._active >= self._max_concurrency or self._waiters or self._priority_waiters:
+                if len(self._waiters) + len(self._priority_waiters) >= self._max_queue_size:
+                    if priority == _PRIORITY_HIGH and self._waiters:
+                        # The queue is full of background work: reject the
+                        # newest normal waiter rather than the foreground
+                        # request trying to get in.
+                        self._waiters.pop().rejected = True
+                        self._condition.notify_all()
+                    else:
+                        raise AdmissionRejectedError
+                ticket = _AdmissionTicket(priority)
+                lane = self._priority_waiters if priority == _PRIORITY_HIGH else self._waiters
+                lane.append(ticket)
                 self._publish()
                 try:
                     async with asyncio.timeout_at(deadline):
-                        while (
-                            self._active >= self._max_concurrency or self._waiters[0] is not ticket
+                        while not ticket.rejected and (
+                            self._active >= self._max_concurrency or not self._is_next(ticket)
                         ):
                             await self._condition.wait()
                 except (TimeoutError, asyncio.CancelledError):
-                    self._waiters.remove(ticket)
+                    self._discard_ticket(ticket)
                     self._publish()
                     self._condition.notify_all()
                     raise
-                self._waiters.popleft()
+                if ticket.rejected:
+                    raise AdmissionRejectedError
+                self._discard_ticket(ticket)
 
             self._active += 1
             self._publish()
@@ -480,10 +529,22 @@ class AdmissionController:
             self._publish()
             self._condition.notify_all()
 
+    def _is_next(self, ticket: _AdmissionTicket) -> bool:
+        if ticket.priority == _PRIORITY_HIGH:
+            return self._priority_waiters[0] is ticket
+        return not self._priority_waiters and self._waiters[0] is ticket
+
+    def _discard_ticket(self, ticket: _AdmissionTicket) -> None:
+        # An evicted waiter may time out or be cancelled before it wakes up,
+        # so the ticket can already be gone from its lane.
+        lane = self._priority_waiters if ticket.priority == _PRIORITY_HIGH else self._waiters
+        if ticket in lane:
+            lane.remove(ticket)
+
     def _publish(self) -> None:
         self._metrics.set_admission(
             active=self._active,
-            queued=len(self._waiters),
+            queued=len(self._waiters) + len(self._priority_waiters),
         )
 
 
@@ -1205,11 +1266,21 @@ def create_app(
     async def chat_completions(
         payload: ChatCompletionRequest,
         request: Request,
+        priority_header: Annotated[str | None, Header(alias=_PRIORITY_HEADER)] = None,
     ) -> JSONResponse | StreamingResponse:
         # Requests rejected before the handler (validation, auth, request size)
         # never reach this line, so they stay reported as "not_applicable".
         request.state.telemetry_mode = "stream" if payload.stream else "non_stream"
         request.state.telemetry_model_family = model_family(payload.model)
+        priority = _request_priority(priority_header)
+        if priority is None:
+            request.state.telemetry_error_type = "invalid_request_error"
+            log_warning("chat.rejected", status=400, phase="priority")
+            return _error_response(
+                f"{_PRIORITY_HEADER} must be '{_PRIORITY_HIGH}' or '{_PRIORITY_NORMAL}'.",
+                400,
+                "invalid_request_error",
+            )
         timeout_seconds = min(
             payload.timeout or resolved_settings.timeout_seconds,
             resolved_settings.timeout_seconds,
@@ -1230,6 +1301,7 @@ def create_app(
             reasoning_effort=_effective_reasoning_effort(payload, resolved_settings),
             reasoning_effort_overridden=resolved_settings.reasoning_effort is not None,
             continuation=payload.factory_droid_session_id is not None,
+            priority=priority,
         )
 
         rejection = _validate_options(payload, resolved_settings)
@@ -1347,11 +1419,11 @@ def create_app(
         session_use = acquire_session_use(session_id) if session_id is not None else None
 
         try:
-            lease = await admission.acquire(deadline)
+            lease = await admission.acquire(deadline, priority=priority)
         except AdmissionRejectedError:
             if session_use is not None:
                 session_use.release()
-            metrics.increment_overload_rejections()
+            metrics.increment_overload_rejections(priority)
             request.state.telemetry_error_type = "rate_limit_error"
             log_warning("chat.rejected", status=429, phase="queue")
             return _error_response(
