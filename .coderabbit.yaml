@@ -1,8 +1,8 @@
 # CodeRabbit AI review configuration.
 # Reference: https://docs.coderabbit.ai/reference/configuration
 
-# Findings in Polish; keep tags, paths, and code identifiers in English.
-language: pl
+# Review output in English.
+language: en
 
 tone_instructions: >-
   Report only verified, actionable findings. Skip hypothetical races,
