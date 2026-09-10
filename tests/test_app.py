@@ -2400,6 +2400,36 @@ async def test_lost_prefix_repair_recovers_tool_call_when_enabled(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_dangling_member_repair_uses_configured_budget(tmp_path: Path) -> None:
+    facts = "".join(f'{{"a":{index},"}},' for index in range(9)) + '{"end":1}'
+    marker = (
+        f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"facts":[{facts}]}}}}{TOOL_CALL_CLOSE}'
+    )
+    runner = FakeRunner([TextDelta(marker), RunComplete(Usage())])
+    app = create_app(
+        Settings(workdir=tmp_path, max_dangling_member_repairs=9),
+        runner_factory=cast("RunnerFactory", lambda: runner),
+    )
+    payload = _payload(
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ]
+    )
+
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    tool_call = response.json()["choices"][0]["message"]["tool_calls"][0]
+    assert json.loads(tool_call["function"]["arguments"]) == {
+        "facts": [{"a": index} for index in range(9)] + [{"end": 1}]
+    }
+
+
+@pytest.mark.asyncio
 async def test_non_streaming_truncation_keeps_completed_tool_calls(tmp_path: Path) -> None:
     complete = (
         f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Gdansk"}}}}{TOOL_CALL_CLOSE}'

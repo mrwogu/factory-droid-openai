@@ -1,6 +1,6 @@
-# CLAUDE.md
+# OPENCODE.md
 
-<!-- PromptScript 2026-09-08T13:23:04.993Z | source: .promptscript/project.prs | target: claude - do not edit -->
+<!-- PromptScript 2026-09-08T13:23:04.993Z | source: .promptscript/project.prs | target: opencode - do not edit -->
 
 ## Project
 
@@ -54,10 +54,10 @@ One Droid session is created per request. The full OpenAI transcript and
 external tool schemas are serialized into one strict prompt. The client
 executes tool calls and resubmits tool results in the next request.
 
-## Don'ts
+## Restrictions
 
-- Don't expose credentials, Factory account data, or private prompt content
-- Don't enable Factory-native tools, permission prompts, or interactive questions
-- Don't weaken duplicate-key, tool-name, payload-size, or trailing-output validation
-- Don't advertise unsupported OpenAI API families as implemented
-- Don't commit generated build, cache, coverage, or virtual-environment artifacts
+- Never expose credentials, Factory account data, or private prompt content
+- Never enable Factory-native tools, permission prompts, or interactive questions
+- Never weaken duplicate-key, tool-name, payload-size, or trailing-output validation
+- Never advertise unsupported OpenAI API families as implemented
+- Never commit generated build, cache, coverage, or virtual-environment artifacts

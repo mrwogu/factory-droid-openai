@@ -8,15 +8,15 @@ from typing import TYPE_CHECKING, Any
 
 from factory_droid_openai.attachments import AttachmentSet, extract_attachments
 from factory_droid_openai.dialects import (
+    DEFAULT_DANGLING_MEMBER_REPAIRS,
     LOST_PREFIX_DECODER,
     MARKER_DIALECTS,
     MAX_PACKED_CALLS,
     NATIVE_DIALECT,
-    PAYLOAD_DECODERS,
     TOOL_CALL_CLOSE,
     TOOL_CALL_OPEN,
-    PayloadDecoder,
     find_open_marker,
+    payload_decoders,
     strip_code_fence,
 )
 from factory_droid_openai.errors import (
@@ -380,6 +380,7 @@ class ToolCallStreamParser:
         require_tool_call: bool = False,
         max_tool_calls: int = 1,
         max_json_depth: int = 32,
+        max_dangling_member_repairs: int = DEFAULT_DANGLING_MEMBER_REPAIRS,
         repair_lost_prefix: bool = False,
         parse_message_json: bool = True,
         trace_payload: PayloadTrace | None = None,
@@ -389,9 +390,9 @@ class ToolCallStreamParser:
         self._require_tool_call = require_tool_call
         self._max_tool_calls = max(1, max_tool_calls)
         self._max_json_depth = max(1, max_json_depth)
-        self._payload_decoders: tuple[PayloadDecoder, ...] = PAYLOAD_DECODERS
+        self._payload_decoders = payload_decoders(max_dangling_member_repairs)
         if repair_lost_prefix:
-            self._payload_decoders = (*PAYLOAD_DECODERS, LOST_PREFIX_DECODER)
+            self._payload_decoders = (*self._payload_decoders, LOST_PREFIX_DECODER)
         self._trace_payload: PayloadTrace = trace_payload or NULL_PAYLOAD_TRACER.trace
         self._record_repair = record_repair
         self._parse_message_json = parse_message_json

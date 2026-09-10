@@ -1987,6 +1987,48 @@ def test_stream_parser_repairs_dropped_member_keys_with_pretty_whitespace() -> N
     assert json.loads(emissions[0].arguments) == {"facts": [{"content": ["x"]}, {"heading": "y"}]}
 
 
+def test_stream_parser_repairs_dropped_member_keys_at_budget() -> None:
+    parser = ToolCallStreamParser(frozenset({"done"}))
+    facts = "".join(f'{{"a":{index},"}},' for index in range(8)) + '{"end":1}'
+    body = f'{{"name":"done","arguments":{{"facts":[{facts}]}}}}'
+
+    emissions = parser.feed(f"{TOOL_CALL_OPEN}{body}{TOOL_CALL_CLOSE}")
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == {
+        "facts": [{"a": index} for index in range(8)] + [{"end": 1}]
+    }
+
+
+def test_stream_parser_uses_configured_dangling_member_repair_budget() -> None:
+    parser = ToolCallStreamParser(
+        frozenset({"done"}),
+        max_dangling_member_repairs=9,
+    )
+    facts = "".join(f'{{"a":{index},"}},' for index in range(9)) + '{"end":1}'
+    body = f'{{"name":"done","arguments":{{"facts":[{facts}]}}}}'
+
+    emissions = parser.feed(f"{TOOL_CALL_OPEN}{body}{TOOL_CALL_CLOSE}")
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    assert json.loads(emissions[0].arguments) == {
+        "facts": [{"a": index} for index in range(9)] + [{"end": 1}]
+    }
+
+
+def test_stream_parser_disables_dangling_member_repair_at_zero() -> None:
+    parser = ToolCallStreamParser(
+        frozenset({"done"}),
+        max_dangling_member_repairs=0,
+    )
+    body = '{"name":"done","arguments":{"facts":[{"a":1,"},{"end":1}]}}'
+
+    with pytest.raises(MalformedToolCallError, match="invalid tool-call JSON"):
+        parser.feed(f"{TOOL_CALL_OPEN}{body}{TOOL_CALL_CLOSE}")
+
+
 def test_stream_parser_stops_repairing_after_the_dangling_member_budget() -> None:
     parser = ToolCallStreamParser(frozenset({"done"}))
     facts = "".join(f'{{"a":{index},"}},' for index in range(9)) + '{"end":1}'

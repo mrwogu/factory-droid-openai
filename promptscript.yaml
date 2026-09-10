@@ -3,6 +3,7 @@ syntax: 1.4.0
 targets:
   - claude
   - factory
+  - opencode
 validation:
   rules:
     empty-block: warning

@@ -1468,6 +1468,7 @@ def create_app(
                     resolved_settings.max_tool_calls if payload.parallel_tool_calls else 1
                 ),
                 max_json_depth=resolved_settings.max_json_depth,
+                max_dangling_member_repairs=resolved_settings.max_dangling_member_repairs,
                 repair_lost_prefix=resolved_settings.repair_lost_prefix,
                 parse_message_json=structured is None,
                 trace_payload=payload_tracer.trace,

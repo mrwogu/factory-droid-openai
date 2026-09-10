@@ -280,6 +280,7 @@ text. Every accepted form lives in one table in
 | `name","key":"value"...}` with the opening `{"name":"` bytes lost | GLM, only with `FACTORY_DROID_OPENAI_REPAIR_LOST_PREFIX=true` |
 | `namekey":"value"...}` with both the `{"name":"` opening and the `","arguments":{"` infix lost, name fused to the first key | GLM 5.2 |
 | the same fused form with the escaping lost inside a value, so `"command":"echo "x""}` carries bare quotes and raw newlines | GLM 5.2 |
+| strict JSON with dropped member keys leaving dangling `,"` fragments | gpt-5.6-luna, up to `FACTORY_DROID_OPENAI_MAX_DANGLING_MEMBER_REPAIRS` repairs |
 
 Translation never widens validation. An unknown tool name, a duplicate
 argument key, or prose after a call still fails the turn. A payload truncated
@@ -1339,6 +1340,7 @@ error types.
 | `FACTORY_DROID_OPENAI_UVICORN_LIMIT_CONCURRENCY` | `64` | Uvicorn connection limit |
 | `FACTORY_DROID_OPENAI_UVICORN_BACKLOG` | `128` | Uvicorn listen backlog |
 | `FACTORY_DROID_OPENAI_MAX_TOOL_CALLS` | `64` | Tool calls accepted per Droid turn, from 1 through 64; the prompt asks the model for at most 8 at a time |
+| `FACTORY_DROID_OPENAI_MAX_DANGLING_MEMBER_REPAIRS` | `8` | Dropped-member fragments repaired per tool-call payload, from 0 through 64; `0` disables this repair |
 | `FACTORY_DROID_OPENAI_TOOL_CALL_DRAIN_SECONDS` | `0.5` | Wait for further events after a complete tool call |
 | `FACTORY_DROID_OPENAI_REPAIR_LOST_PREFIX` | `false` | Repair tool-call payloads missing their opening `{"name":"` bytes |
 | `FACTORY_DROID_OPENAI_NATIVE_TOOL_CALLS` | `false` | Publish client tools to Droid over MCP instead of describing them in the prompt |

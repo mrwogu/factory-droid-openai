@@ -7,7 +7,11 @@ from pathlib import Path
 
 from droid_sdk.schemas.enums import ReasoningEffort
 
-from factory_droid_openai.dialects import MAX_PACKED_CALLS
+from factory_droid_openai.dialects import (
+    DEFAULT_DANGLING_MEMBER_REPAIRS,
+    MAX_DANGLING_MEMBER_REPAIRS,
+    MAX_PACKED_CALLS,
+)
 from factory_droid_openai.logs import LOG_FORMATS, LOG_LEVELS
 from factory_droid_openai.payloadlog import PAYLOAD_TRACE_MODES
 
@@ -56,6 +60,7 @@ class Settings:
     # burst of calls is asking the client for work it can run, and dropping the
     # turn over the count alone only costs a retry.
     max_tool_calls: int = MAX_PACKED_CALLS
+    max_dangling_member_repairs: int = DEFAULT_DANGLING_MEMBER_REPAIRS
     tool_call_drain_seconds: float = DEFAULT_TOOL_CALL_DRAIN_SECONDS
     max_attachments: int = 16
     max_attachment_bytes: int = 8_388_608
@@ -95,6 +100,12 @@ class Settings:
     def __post_init__(self) -> None:
         if self.max_tool_calls > MAX_PACKED_CALLS:
             raise ValueError(f"max_tool_calls must be at most {MAX_PACKED_CALLS}")
+        if self.max_dangling_member_repairs < 0:
+            raise ValueError("max_dangling_member_repairs must be zero or greater")
+        if self.max_dangling_member_repairs > MAX_DANGLING_MEMBER_REPAIRS:
+            raise ValueError(
+                f"max_dangling_member_repairs must be at most {MAX_DANGLING_MEMBER_REPAIRS}"
+            )
         if not math.isfinite(self.session_init_timeout_seconds) or (
             self.session_init_timeout_seconds <= 0
         ):
@@ -249,6 +260,10 @@ class Settings:
             "FACTORY_DROID_OPENAI_MAX_TOOL_CALLS",
             default=MAX_PACKED_CALLS,
         )
+        max_dangling_member_repairs = _non_negative_int(
+            "FACTORY_DROID_OPENAI_MAX_DANGLING_MEMBER_REPAIRS",
+            default=DEFAULT_DANGLING_MEMBER_REPAIRS,
+        )
         tool_call_drain_seconds = _positive_float(
             "FACTORY_DROID_OPENAI_TOOL_CALL_DRAIN_SECONDS",
             default=DEFAULT_TOOL_CALL_DRAIN_SECONDS,
@@ -347,6 +362,7 @@ class Settings:
             server_limit_concurrency=server_limit_concurrency,
             server_backlog=server_backlog,
             max_tool_calls=max_tool_calls,
+            max_dangling_member_repairs=max_dangling_member_repairs,
             tool_call_drain_seconds=tool_call_drain_seconds,
             max_attachments=max_attachments,
             max_attachment_bytes=max_attachment_bytes,

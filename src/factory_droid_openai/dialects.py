@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 
 from factory_droid_openai.strictjson import (
@@ -120,8 +121,10 @@ _HARMONY_CONTROL_TOKENS = (
 _FUNCTIONS_PREFIX = "functions."
 
 __all__ = [
+    "DEFAULT_DANGLING_MEMBER_REPAIRS",
     "LOST_PREFIX_DECODER",
     "MARKER_DIALECTS",
+    "MAX_DANGLING_MEMBER_REPAIRS",
     "MAX_PACKED_CALLS",
     "PAYLOAD_DECODERS",
     "TOOL_CALL_CLOSE",
@@ -129,6 +132,7 @@ __all__ = [
     "MarkerDialect",
     "PayloadDecoder",
     "find_open_marker",
+    "payload_decoders",
     "strip_code_fence",
 ]
 
@@ -1359,7 +1363,8 @@ def _decode_lost_prefix(
 
 # One dropped member per repair, so a payload that keeps failing is a shape
 # this decoder does not exist for and the budget stops the surgery.
-_MAX_DANGLING_MEMBER_REPAIRS = 8
+DEFAULT_DANGLING_MEMBER_REPAIRS = 8
+MAX_DANGLING_MEMBER_REPAIRS = 64
 _MEMBER_SEPARATOR_AT_END = re.compile(r",[ \t\r\n]*\Z")
 
 
@@ -1387,6 +1392,8 @@ def _drop_dangling_member(value: str, pos: int) -> str | None:
 def _decode_dangling_member(
     body: str,
     allowed_tool_names: frozenset[str],
+    *,
+    max_repairs: int = DEFAULT_DANGLING_MEMBER_REPAIRS,
 ) -> list[dict[str, Any]] | None:
     """Rebuilds a JSON call whose members lost their keys entirely.
 
@@ -1400,16 +1407,20 @@ def _decode_dangling_member(
     payload fails the strict re-parse instead of being guessed apart.
     """
     value = body
-    for _ in range(_MAX_DANGLING_MEMBER_REPAIRS):
+    repairs = 0
+    while True:
         try:
             parsed = parse_strict_json(value)
         except json.JSONDecodeError as exc:
             if exc.msg != "Expecting ':' delimiter":
                 return None
+            if repairs >= max_repairs:
+                return None
             repaired = _drop_dangling_member(value, exc.pos)
             if repaired is None:
                 return None
             value = repaired
+            repairs += 1
         except ValueError:
             return None
         else:
@@ -1439,6 +1450,19 @@ PAYLOAD_DECODERS: tuple[PayloadDecoder, ...] = (
     PayloadDecoder("bare_name", _decode_bare_name),
     PayloadDecoder("bare_call", _decode_bare_call),
 )
+
+
+def payload_decoders(max_dangling_member_repairs: int) -> tuple[PayloadDecoder, ...]:
+    """Return decoders with the configured dangling-member repair budget."""
+    dangling_member = PayloadDecoder(
+        "dangling_member",
+        partial(_decode_dangling_member, max_repairs=max_dangling_member_repairs),
+    )
+    return tuple(
+        dangling_member if decoder.name == dangling_member.name else decoder
+        for decoder in PAYLOAD_DECODERS
+    )
+
 
 # Opt-in only: the payload lost bytes, so the repair trusts less of the wire
 # than the always-on decoders do. The stream parser appends this decoder only

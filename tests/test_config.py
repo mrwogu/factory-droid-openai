@@ -36,6 +36,7 @@ _ENVIRONMENT_KEYS = (
     "FACTORY_DROID_OPENAI_PROCESS_GRACE_SECONDS",
     "FACTORY_DROID_OPENAI_CLEANUP_TIMEOUT_SECONDS",
     "FACTORY_DROID_OPENAI_MAX_TOOL_CALLS",
+    "FACTORY_DROID_OPENAI_MAX_DANGLING_MEMBER_REPAIRS",
     "FACTORY_DROID_OPENAI_TOOL_CALL_DRAIN_SECONDS",
     "FACTORY_DROID_OPENAI_MAX_ATTACHMENTS",
     "FACTORY_DROID_OPENAI_MAX_ATTACHMENT_BYTES",
@@ -158,6 +159,15 @@ def test_settings_rejects_invalid_session_init_timeout(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         Settings(workdir=tmp_path, session_init_timeout_seconds=value)
+
+
+@pytest.mark.parametrize("value", [-1, 65])
+def test_settings_rejects_invalid_dangling_member_repair_budget(
+    tmp_path: Path,
+    value: int,
+) -> None:
+    with pytest.raises(ValueError, match="max_dangling_member_repairs"):
+        Settings(workdir=tmp_path, max_dangling_member_repairs=value)
 
 
 def test_warm_session_count_tracks_max_concurrency_unless_set(
@@ -301,6 +311,7 @@ def test_settings_from_env_reads_all_overrides(
     monkeypatch.setenv("FACTORY_DROID_OPENAI_CLEANUP_TIMEOUT_SECONDS", "6.5")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_UVICORN_LIMIT_CONCURRENCY", "24")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_UVICORN_BACKLOG", "96")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_DANGLING_MEMBER_REPAIRS", "12")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_MODEL_ALIAS", "droid-default")
 
     settings = Settings.from_env()
@@ -331,6 +342,7 @@ def test_settings_from_env_reads_all_overrides(
         cleanup_timeout_seconds=6.5,
         server_limit_concurrency=24,
         server_backlog=96,
+        max_dangling_member_repairs=12,
         model_alias="droid-default",
     )
 
@@ -418,6 +430,21 @@ def test_settings_from_env_reads_all_overrides(
             "FACTORY_DROID_OPENAI_UVICORN_BACKLOG",
             "0",
             "must be greater than zero",
+        ),
+        (
+            "FACTORY_DROID_OPENAI_MAX_DANGLING_MEMBER_REPAIRS",
+            "invalid",
+            "must be an integer",
+        ),
+        (
+            "FACTORY_DROID_OPENAI_MAX_DANGLING_MEMBER_REPAIRS",
+            "-1",
+            "must be zero or greater",
+        ),
+        (
+            "FACTORY_DROID_OPENAI_MAX_DANGLING_MEMBER_REPAIRS",
+            "65",
+            "must be at most 64",
         ),
         ("FACTORY_DROID_OPENAI_PORT", "70000", "must be at most 65535"),
     ],

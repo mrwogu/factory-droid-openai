@@ -1,5 +1,5 @@
 ---
-# promptscript-generated: 2026-07-25T21:59:45.011Z | source: .promptscript/project.prs | target: factory
+# promptscript-generated: 2026-09-08T13:23:04.993Z | source: .promptscript/project.prs | target: promptscript
 name: promptscript
 description: >-
   PromptScript language expert for reading, writing, modifying, and
@@ -7,8 +7,9 @@ description: >-
   creating or editing .prs files, adding blocks like @identity, @standards,
   @restrictions, @shortcuts, @skills, or @agents, configuring
   promptscript.yaml, resolving compilation errors, understanding inheritance
-  (@inherit) and composition (@use, @extend), or migrating AI instructions
-  to PromptScript. Also use when asked about the 48 built-in compilation
+  (@inherit), composition (@use, @extend, @override), contextual @header
+  metadata, or migrating AI instructions
+  to PromptScript. Also use when asked about the 49 built-in compilation
   targets, including GitHub Copilot, Claude Code, Cursor, Antigravity,
   Factory AI, and AGENTS.md-based platforms.
 user-invocable: true
@@ -20,7 +21,9 @@ PromptScript is a domain-specific language that compiles `.prs` files into nativ
 
 ## File Structure
 
-A `.prs` file is made of blocks. Order doesn't matter except `@meta` should come first by convention.
+A `.prs` file contains ordered declarations. Syntax `1.5.0` applies `@inherit`,
+`@use`, local blocks, `@extend`, and `@override` in source order. Put `@meta`
+first.
 
 ```
 # Comments start with #
@@ -37,17 +40,25 @@ A `.prs` file is made of blocks. Order doesn't matter except `@meta` should come
 @knowledge { ... }      # Reference documentation
 @skills { ... }         # Reusable skill definitions
 @agents { ... }         # Subagent definitions
+@workflows { ... }      # Repeatable agent procedures
 @examples { ... }       # Few-shot input/output examples (syntax 1.2.0+)
 @params { ... }         # Template parameters
 @guards { ... }         # File globs and priorities
+@hooks { ... }          # Portable lifecycle hooks (syntax 1.4.0+)
+@mcpServers { ... }     # MCP server configurations (syntax 1.4.0+)
+@plugins { ... }        # Capability bundles (syntax 1.4.0+)
 @local { ... }          # Private config (not committed)
 @extend path { ... }    # Modify imported blocks
+@override path { ... }  # Replace one complete existing target (syntax 1.5.0+)
 @custom-name { ... }    # Arbitrary named blocks
 ```
 
+Contextual `@header` entries appear inside supported owner blocks, not at the
+top level.
+
 ## Content Types
 
-PromptScript has three content types inside blocks:
+PromptScript has four canonical content shapes inside blocks:
 
 ### Text Content
 
@@ -137,6 +148,29 @@ Category-based conventions. Any category name is valid:
   }
 }
 ```
+
+Category names are arbitrary. `@standards` can also contain free-form text:
+
+```
+@standards {
+  """
+  ## Formatting
+  Preserve heading structure and use four-space indentation.
+
+  ## Testing
+  Add regression coverage for every behavior change.
+  """
+  typescript: ["Strict mode", "Named exports only"]
+  git: {
+    format: "Conventional Commits"
+  }
+}
+```
+
+Free-form text is dedented and rendered with its Markdown heading structure. Factory
+monolith output nests it under `Conventions & Patterns`; split Factory rules adjust
+heading levels relative to the generated section. Custom structured categories remain
+available to formatters that support them.
 
 ### @restrictions
 
@@ -229,6 +263,10 @@ Review the code using {{language}} conventions following {{standard}}.
 
 The `references` field in SKILL.md frontmatter lists files to attach to the skill's context.
 Paths are relative to the SKILL.md file.
+
+Imported SKILL.md frontmatter is bounded: 256 KiB per document, 10,000 YAML nodes, 32 nesting
+levels, 2,000 entries per mapping or sequence, and 64 KiB per string value. Documents over any
+limit are rejected before their YAML values are converted.
 
 Pass values in `@skills` block:
 
@@ -329,6 +367,19 @@ Custom subagent definitions. Compiles to `.claude/agents/` for Claude Code,
 }
 ```
 
+Imported agent definitions are qualified by an aliased `@use`:
+
+```
+@use ./frontend-team as frontend
+@use ./backend-team as backend
+```
+
+If both imports define `reviewer`, the resolved names are `frontend.reviewer` and
+`backend.reviewer`. Unique unaliased imports keep their original names. Conflicting unaliased
+definitions stop compilation with source and import diagnostics instead of silently overwriting
+one another. Native targets map dots to hyphens, so `frontend.reviewer` becomes
+`frontend-reviewer`.
+
 Supports mixed models per agent: `specModel` sets a different model for
 Specification/planning mode (GitHub, Factory), `specReasoningEffort` sets reasoning
 effort for the spec model (Factory only, values: "low", "medium", "high").
@@ -336,6 +387,26 @@ effort for the spec model (Factory only, values: "low", "medium", "high").
 Factory AI droids support additional properties: `model` (any model ID or "inherit"),
 `reasoningEffort` ("low", "medium", "high"), and `tools` (category name like "read-only"
 or array of tool IDs).
+
+### @workflows
+
+Repeatable multi-step agent procedures. Requires syntax `1.1.0`.
+
+```
+@workflows {
+  release: {
+    description: "Prepare a validated release"
+    content: """
+      1. Run formatting, linting, type checks, and tests.
+      2. Validate compiled output.
+      3. Stop before publishing and request approval.
+    """
+  }
+}
+```
+
+Targets with native workflow discovery emit dedicated workflow files. Other targets
+retain workflow instructions in their main output when supported.
 
 ### @examples
 
@@ -389,6 +460,141 @@ Optional parameters use `?` suffix. Defaults use `= value`.
 ### @guards
 
 File glob patterns and priority rules for path-specific instructions.
+
+### @hooks
+
+Portable lifecycle hooks. Requires syntax `1.4.0`. Each hook needs exactly one of
+`command` or `script`.
+
+```
+@hooks {
+  validate-types: {
+    event: "post-tool-use"
+    matcher: "Edit|Write"
+    script: {
+      path: ".promptscript/scripts/validate.py"
+      interpreter: "python3"
+      args: ["--strict"]
+    }
+    cwd: "project"
+    timeoutMs: 120000
+    statusMessage: "Checking TypeScript"
+    continueOnFailure: false
+    enabled: true
+    targets: {
+      factory: { matcher: "Execute" }
+      vscode: { matcher: "run_in_terminal" }
+      github: { enabled: false }
+    }
+  }
+}
+```
+
+Portable events:
+
+| Event                  | Meaning                   |
+| ---------------------- | ------------------------- |
+| `pre-terminal-command` | Before a terminal command |
+| `pre-tool-use`         | Before a tool invocation  |
+| `post-tool-use`        | After a tool invocation   |
+| `session-start`        | Agent session start       |
+| `setup`                | Session setup             |
+| `subagent-start`       | Subagent start            |
+| `notification`         | Agent notification        |
+| `stop`                 | Agent stop                |
+
+`command` is a non-empty string array. Shell interpolation (`$()`, backticks,
+`${...}`) is forbidden. `script` requires:
+
+- `path` under `.promptscript/scripts/`, using forward slashes.
+- Existing regular file at compile time.
+- No traversal, absolute path, invalid segment, or symlink escape.
+- Explicit interpreter: `python3`, `python`, `node`, `deno`, `bun`, `ruby`, `php`,
+  `perl`, `bash`, `sh`, `zsh`, `pwsh`, or `powershell`.
+- Optional `args` string array; each argument remains one argument.
+
+`cwd: "project"` runs from project root. Other values are portable forward-slash
+paths relative to project root. Hook config file location does not set command cwd.
+Environment-root and Git-root wrappers exit before script or command execution when
+the required root is unavailable. Native-cwd and workspace-cwd targets retain host
+cwd fields and report `PS4002` when PromptScript cannot verify that cwd.
+`timeoutMs` range is 100-600000. `matcher` uses target-native tool names, so a
+matcher valid for one target may match nothing on another.
+
+`pre-terminal-command` supplies native defaults: Factory `Execute`, Claude and
+Codex `Bash`, Windsurf `pre_run_command`, Cursor `run_terminal_cmd`, Gemini
+`run_shell_command`, and VS Code `run_in_terminal`. Override a native tool name
+with `targets.<name>.matcher`. Cursor, Gemini, and VS Code report best-effort
+`PS4002` warnings. GitHub and Grok omit the event with `PS4002`.
+
+Target overrides may change `event`, `matcher`, `timeoutMs`, `statusMessage`,
+`continueOnFailure`, `enabled`, or `cwd`. Native hook files are emitted only in
+target modes that support additional files:
+
+| Target         | Hook output                                                            | Mode                |
+| -------------- | ---------------------------------------------------------------------- | ------------------- |
+| Claude Code    | `.claude/settings.json`                                                | `full`              |
+| Factory AI     | `.factory/hooks.json`                                                  | `multifile`, `full` |
+| GitHub Copilot | `.github/hooks/promptscript.json`                                      | `multifile`, `full` |
+| Cursor         | `.cursor/hooks.json`                                                   | `full`              |
+| Codex          | `.codex/hooks.json`                                                    | `multifile`, `full` |
+| Gemini CLI     | `.gemini/settings.json`                                                | `multifile`, `full` |
+| Windsurf       | `.windsurf/hooks.json`                                                 | `multifile`, `full` |
+| Grok Build     | `.grok/hooks/promptscript.json`                                        | `full`              |
+| VS Code Agent  | `.github/hooks/promptscript-vscode.json` when `vscode` override exists | target-specific     |
+
+Simple mode and targets without native project hooks report `PS4002` instead of
+silently dropping hooks. Use `prs compile --watch` as fallback. Plugin-only and
+agent-scoped integrations are not emitted as universal project hooks.
+
+Each generated command carries a PromptScript ownership marker. CLI cleanup removes
+only marked entries and preserves user hooks/settings. Removing `@hooks` removes a
+fully owned generated hook file and prunes directories left empty. `prs hooks install factory`
+migrates unambiguous legacy hooks from `.factory/settings.json`; ambiguous
+entries remain for manual review.
+
+Factory compilation performs the same migration when `.factory/hooks.json` is
+absent. Use `prs compile --dry-run` to preview the changes or
+`--no-migrate-factory-hooks` to keep warning-only behavior. Unknown events,
+malformed entries, and mixed ownership abort without a partial migration.
+
+`@hooks` compilation is separate from `prs hooks install`. The latter installs
+auto-compilation and generated-output protection for supported AI tools. Copilot VS
+Code Agent hooks use `promptscript-vscode.json`; GitHub Copilot repository hooks use
+`promptscript.json`.
+
+### @mcpServers
+
+Project-local Model Context Protocol servers. Requires syntax `1.4.0`.
+
+```
+@mcpServers {
+  issue-tracker: {
+    transport: "stdio"
+    command: ["node", "./tools/issues.mjs"]
+    env: { LOG_LEVEL: "info" }
+  }
+}
+```
+
+Use `stdio` with `command`, or `http`/`sse` with `url`. Keep credentials out of
+`.prs` files and provide them through target-native secret management.
+
+### @plugins
+
+Portable capability bundles. Requires syntax `1.4.0`.
+
+```
+@plugins {
+  security-suite: {
+    description: "Security review tooling"
+    version: "1.0.0"
+    skills: ["security-review"]
+    hooks: ["validate-types"]
+    mcpServers: ["issue-tracker"]
+  }
+}
+```
 
 ### @local
 
@@ -454,8 +660,12 @@ Then use the alias as scope prefix:
 Merge rules:
 
 - Text: concatenated with deduplication
-- Objects: deep merged (target wins on conflicts)
+- Objects: deep merged (imported source wins same-shape conflicts)
 - Arrays: unique concatenation
+- Shape mismatch: existing target body wins
+
+Under syntax `1.5.0`, later local blocks, `@extend`, and `@override`
+operations apply to the accumulated import result in declaration order.
 
 ### Block Filtering
 
@@ -537,16 +747,38 @@ Replacement works after `@inherit` and `@use`, including aliases and nested targ
 A missing field is set. The modifier is rejected for `@skills`, which retain their dedicated
 merge and sealing semantics.
 
+#### Replacing complete targets with @override
+
+Syntax `1.5.0` adds atomic replacement for an existing block or nested value:
+
+```
+@meta { id: "project" syntax: "1.5.0" }
+
+@standards {
+  testing: ["Use Jest", "Use Mocha"]
+}
+
+@override standards.testing {
+  ["Use Vitest"]
+}
+```
+
+`@override` requires the complete target path to exist, applies in declaration
+order, and cannot bypass sealed skill properties. Later `@extend` declarations
+merge into the replacement. Use `@extend` for additive changes, `field!` for
+compatibility replacement of one direct regular field, and `@override` for
+intentional complete replacement.
+
 #### Skill-aware @extend semantics
 
 When extending a skill definition via `@extend`, individual skill properties follow specific merge
 strategies rather than the generic block merge rules:
 
-| Strategy          | Properties                                                                                         |
-| ----------------- | -------------------------------------------------------------------------------------------------- |
-| **Replace**       | content, description, trigger, userInvocable, allowedTools, disableModelInvocation, context, agent |
-| **Append**        | references, examples, requires                                                                     |
-| **Shallow merge** | params, inputs, outputs                                                                            |
+| Strategy          | Properties                                                                                                  |
+| ----------------- | ----------------------------------------------------------------------------------------------------------- |
+| **Replace**       | content, description, trigger, userInvocable, allowedTools, disableModelInvocation, context, agent, license |
+| **Append**        | references, examples, requires                                                                              |
+| **Shallow merge** | params, inputs, outputs                                                                                     |
 
 Example — extending a base skill to add references and override content:
 
@@ -743,11 +975,11 @@ policies:
 
 ### Lockfile: `promptscript.lock`
 
-When remote imports are used, `prs compile` automatically generates a lockfile
-recording the exact resolved commit for each dependency. Integrity hashes
-(SHA-256) are included for registry references to detect tampering or drift.
-This enables reproducible builds across machines and CI. Commit `promptscript.lock`
-to version control.
+When remote imports are used, run `prs lock` to generate or update the lockfile
+before compilation. It records the exact resolved commit for each dependency.
+Integrity hashes (SHA-256) are included for registry references to detect
+tampering or drift. This enables reproducible builds across machines and CI.
+Commit `promptscript.lock` to version control.
 
 Use `--ignore-hashes` on `prs compile` or `prs validate` to skip integrity
 hash verification when needed.
@@ -796,6 +1028,7 @@ The `syntax` field in `@meta` declares the PromptScript language version (semver
 | `1.2.0` | Adds `@examples` (few-shot input/output pairs)                                                                          |
 | `1.3.0` | Adds explicit regular block field replacement in `@extend`                                                              |
 | `1.4.0` | Adds `@hooks`, `@mcpServers`, and `@plugins`                                                                            |
+| `1.5.0` | Adds `@header` section titles, `@override` replacement, and unquoted `${VAR}` values                                    |
 
 ### Block Version Requirements
 
@@ -810,11 +1043,41 @@ The `syntax` field in `@meta` declares the PromptScript language version (semver
 
 All other built-in blocks are available from `1.0.0`.
 Regular block field replacement with `field!: value` requires syntax `1.3.0`.
+Generated section title overrides with `@header` require syntax `1.5.0`.
+Atomic replacement with `@override` requires syntax `1.5.0`.
+Unquoted `${VAR}` references as values require syntax `1.5.0`.
+
+### Generated Section Headers
+
+Use `@header` inside a registered owner block to rename human-readable output
+sections without changing filenames, frontmatter, XML tags, or structured keys:
+
+```promptscript
+@meta { id: "localized" syntax: "1.5.0" }
+
+@standards {
+  @header "Coding Rules"
+  @header git-commits "Commit Rules"
+  code: ["Use strict TypeScript"]
+}
+```
+
+- `@header "Title"` targets the block's primary section.
+- `@header <section-key> "Title"` targets an owned derived section.
+- Titles must be non-empty, single-line strings.
+- Source overrides take precedence over formatter configuration and target defaults.
+- Child inheritance, imported source, and the latest root extension take precedence.
+- An initial `## Heading` in a registered text-only primary owner is a syntax
+  `1.5.0` compatibility fallback. Explicit `@header` metadata wins.
+- Ordinary `header` and `headers` fields remain domain data.
 
 ### Validation Rules
 
 - **PS018 (`syntax-version-compat`)**: warns when resolved blocks or syntax features require a higher version than declared. Requirements from inheritance, imports, and skill composition are included. Suggestion: run `prs validate --fix`.
 - **PS019 (`unknown-block-name`)**: warns when a block name is not a known PromptScript type, with fuzzy-match suggestions for typos.
+- **PS037 (`valid-section-headers`)**: rejects invalid titles, unknown or unowned section keys, duplicate overrides, and nested extension overrides.
+- **PS038 (`valid-block-shape`)**: rejects unsupported built-in block shapes and warns about formatter-sensitive legacy shapes or multiline shortcut scalars.
+- **PS039 (`agent-namespaces`)**: validates qualified agent name segments and checks them against recorded import provenance.
 - **PS021 (`use-block-filter`)**: errors when `only` and `exclude` are both specified in `@use` parameters.
 - **PS025 (`valid-skill-references`)**: errors when a `references` entry points to a file with a disallowed extension or a path that cannot be resolved.
 - **PS026 (`safe-reference-content`)**: warns when a referenced file contains potentially sensitive content (e.g., secrets, credentials).
@@ -822,6 +1085,11 @@ Regular block field replacement with `field!: value` requires syntax `1.3.0`.
 - **PS028 (`valid-append-negation`)**: warns when negation prefix `!` appears in base skill definitions (only effective in `@extend`).
 - **PS029 (`valid-sealed-property`)**: warns when `sealed` contains non-replace-strategy property names.
 - **PS030 (`policy-compliance`)**: validates skill extensions against organizational policies defined in `promptscript.yaml`.
+- **PS034 (`valid-hooks`)**: validates portable hook events, commands/scripts, paths, interpreters, timeouts, cwd, and target overrides.
+
+Target formatters report **PS4002** when a hook event or field has no native equivalent,
+when a target cannot guarantee project-root execution, or when output mode cannot emit
+the additional hook file.
 
 ### Fixing Syntax Versions
 
@@ -857,8 +1125,12 @@ prs import CLAUDE.md        # Import existing AI instructions
 prs import CLAUDE.md --dry-run # Preview import conversion
 prs inspect <skill>         # Show skill composition provenance
 prs inspect <skill> --layers # Show layer-level breakdown
+prs explain <path>          # Explain source and composition provenance
+prs explain <path> --format json # Machine-readable provenance history
 prs hooks install           # Install auto-compilation hooks for AI tools
 prs hooks install claude    # Install hooks for a specific tool
+prs hooks uninstall         # Remove installed auto-compilation hooks
+prs hooks uninstall claude  # Remove hooks for a specific tool
 prs skills add <source>     # Add a remote skill (@use + lock update + SKILL.md validation)
 prs skills add <source> --strict          # Treat validation warnings as errors
 prs skills add <source> --skip-validation # Bypass Agent Skills spec checks (not recommended)
@@ -867,6 +1139,8 @@ prs skills list             # List all imported skills
 prs skills update           # Re-resolve markdown-imported skills (re-validates + re-hashes)
 prs pull                    # Update registry
 prs diff --target claude    # Show compilation diff
+prs diff --all --format json # Machine-readable diff report for CI
+prs diff --format json --include-content # Include generated content in the report
 prs lock                    # Generate/update promptscript.lock
 prs lock --dry-run          # Preview lockfile changes
 prs update                  # Re-resolve all remote imports to latest
@@ -885,7 +1159,7 @@ writes when no candidates are detected.
 
 ## Output Targets
 
-48 supported targets. Key examples:
+49 supported targets. Key examples:
 
 | Target      | Main File                       | Skills                                             |
 | ----------- | ------------------------------- | -------------------------------------------------- |
@@ -901,16 +1175,23 @@ writes when no candidates are detected.
 | Roo Code    | .roorules                       | -                                                  |
 | Codex       | AGENTS.md                       | .agents/skills/\*/SKILL.md                         |
 | Continue    | .continue/rules/project.md      | -                                                  |
+| Hermes      | AGENTS.md                       | -                                                  |
 | + 36 more   |                                 | See full list in documentation                     |
+
+Targets that share an output path (for example Factory, Codex, and every AGENTS.md target) are
+reconciled in one output plan before anything is written. Identical content merges silently;
+differing content reports `PS4001`, where a formatter output replaces an earlier one and a
+resource or the auto-injected PromptScript skill keeps the file already planned. Paths are compared
+case-insensitively and NFC-normalized on every platform.
 
 ### Formatter Documentation
 
 For detailed information about each formatter's output paths, supported features, quirks, and example outputs:
 
-- **Full formatter reference:** `docs/reference/formatters/` (7 dedicated pages + index of all 48)
+- **Full formatter reference:** `docs/reference/formatters/` (7 dedicated pages + index of all 49)
 - **llms-full.txt:** Available at the docs site root - contains all documentation in a single file for LLM consumption
 - **Dedicated pages exist for:** Claude Code, GitHub Copilot, Cursor, Antigravity, Factory AI, Gemini CLI, OpenCode
-- **All 48 formatters indexed at:** `docs/reference/formatters/index.md` with output paths, tier, and feature flags
+- **All 49 formatters indexed at:** `docs/reference/formatters/index.md` with output paths, tier, and feature flags
 
 ### Auto-Compilation Hooks
 
@@ -966,7 +1247,7 @@ The fastest way to convert existing AI instructions to PromptScript:
 ```
 prs import CLAUDE.md                    # Convert a single file
 prs import .github/copilot-instructions.md
-prs import AGENTS.md --output ./imported.prs
+prs import AGENTS.md --output ./imported
 prs import --dry-run CLAUDE.md          # Preview without writing
 ```
 
