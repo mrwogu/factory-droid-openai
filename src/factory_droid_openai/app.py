@@ -1366,6 +1366,7 @@ def create_app(
         if auth_probe is not None and auth_probe.failing:
             # Every doomed request pays for a full Droid spawn before failing,
             # so the probe gate turns an auth outage into one cheap rejection.
+            auth_probe.suspect()
             request.state.telemetry_error_type = "factory_auth_error"
             log_warning(
                 "chat.rejected",
@@ -1662,6 +1663,7 @@ def create_app(
                 note_runner_failure(model, exc)
                 if auth_probe is not None and exc.error_type == "factory_auth_error":
                     auth_probe.suspect()
+                    request.state.telemetry_error_type = exc.error_type
 
             event_stream = _stream_completion(
                 request_id=request_id,
@@ -1877,7 +1879,11 @@ def create_app(
                     choice = _choice_dict(completed_result, index)
                     choices.append(choice)
                     choice_message = cast("dict[str, Any]", choice["message"])
-                    if choice_message["content"] is None and not choice_message.get("tool_calls"):
+                    if (
+                        choice_message["content"] is None
+                        and not choice_message.get("tool_calls")
+                        and not completed_result.stopped
+                    ):
                         # A dead Factory key answers with empty 200s before it
                         # answers with errors (issue #122), so an empty body
                         # has to be its own loud event instead of a silent one.
@@ -2692,7 +2698,12 @@ async def _stream_completion(
         if outcome_callback is not None:
             outcome_callback(outcome)
         if outcome == "success" and completion_callback is not None:
-            completion_callback(not saw_text and not saw_tool_call and structured is None)
+            completion_callback(
+                not saw_text
+                and not saw_tool_call
+                and structured is None
+                and not stop_buffer.triggered
+            )
         _log_stream_outcome(outcome, model=model, usage=usage, tool_calls=tool_call_index)
         yield "data: [DONE]\n\n"
 

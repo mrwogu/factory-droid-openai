@@ -1748,7 +1748,10 @@ def test_runner_maps_invalid_model_id_as_unavailable() -> None:
     "message",
     [
         "Request failed with status code 401",
+        "Invalid API key",
         "API key is invalid",
+        "API key has expired",
+        "Expired API key",
         "403 Forbidden",
         "Authentication failed",
     ],

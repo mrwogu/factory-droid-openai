@@ -82,8 +82,10 @@ _TRANSIENT_CONNECTION_PATTERN = re.compile(r"connection error\.?", re.IGNORECASE
 # dedicated code, so the wording is what separates an auth outage from a
 # bridge failure (issue #122: a dead key hid behind three unrelated shapes).
 _AUTH_FAILURE_PATTERN = re.compile(
-    r"(?:unauthorized|forbidden|api key (?:is )?(?:invalid|revoked|expired|not found)"
-    r"|authentication (?:failed|error)|invalid authentication|"
+    r"(?:unauthorized|forbidden|"
+    r"(?:invalid|revoked|expired|not found) api key|"
+    r"api key (?:is |has )?(?:invalid|revoked|expired|not found)|"
+    r"authentication (?:failed|error)|invalid authentication|"
     r"status code (?:401|403)\b|\b(?:401|403)\b)",
     re.IGNORECASE,
 )

@@ -5743,6 +5743,7 @@ async def test_chat_requests_fail_fast_while_the_auth_gate_is_open(
     assert "auth probes" in body["error"]["message"]
     # The gate must reject before any Droid process is spawned.
     assert runner.requests == []
+    assert probe._trigger.is_set()
     rejected = [
         json.loads(line)
         for line in log_stream.getvalue().splitlines()
@@ -5802,6 +5803,8 @@ async def test_streaming_auth_failure_triggers_an_immediate_probe(
     assert response.status_code == 200
     assert "factory_auth_error" in response.text
     assert probe._trigger.is_set()
+    features = dict(app.state.metrics.telemetry_snapshot().features)
+    assert features["request_error:chat_completions:factory_auth"] == 1
 
 
 @pytest.mark.asyncio
@@ -5898,6 +5901,29 @@ async def test_empty_completions_suspect_the_probe(
 
     assert response.status_code == 200
     assert probe._trigger.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_stop_sequence_does_not_count_as_an_empty_completion(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    runner = FakeRunner([TextDelta("STOP"), RunComplete(Usage())])
+    app = _probe_app(tmp_path, runner)
+    probe = app.state.auth_probe
+    assert probe is not None
+
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(stream=stream, stop="STOP"),
+        )
+
+    assert response.status_code == 200
+    assert "factory_droid_openai_empty_completions_total 0" in app.state.metrics.render()
+    assert probe._trigger.is_set() is False
+    assert probe.status == "ok"
 
 
 @pytest.mark.asyncio

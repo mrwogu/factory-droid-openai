@@ -181,7 +181,10 @@ jobs:
           for _ in range(50):
               try:
                   with urllib.request.urlopen(f"{base_url}/health") as response:
-                      assert json.load(response) == {"status": "ok"}
+                      assert json.load(response) == {
+                          "status": "ok",
+                          "auth": "unknown",
+                      }
                   break
               except urllib.error.URLError:
                   time.sleep(0.1)
