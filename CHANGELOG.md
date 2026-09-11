@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.9.1](https://github.com/mrwogu/factory-droid-openai/compare/v1.9.0...v1.9.1) (2026-09-11)
+
+
+### Bug Fixes
+
+* **api:** deduplicate truncation telemetry ([#120](https://github.com/mrwogu/factory-droid-openai/issues/120)) ([7a9f2f6](https://github.com/mrwogu/factory-droid-openai/commit/7a9f2f66580a97ae5765f43b338e41bca573a025))
+
 ## [1.9.0](https://github.com/mrwogu/factory-droid-openai/compare/v1.8.0...v1.9.0) (2026-09-10)
 
 
