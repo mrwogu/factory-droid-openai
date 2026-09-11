@@ -570,7 +570,7 @@ async def test_health_and_models(tmp_path: Path) -> None:
         health = await client.get("/health")
         models = await client.get("/v1/models")
 
-    assert health.json() == {"status": "ok"}
+    assert health.json() == {"status": "ok", "auth": "unknown"}
     alias = models.json()["data"][0]
     assert alias["id"] == "factory-droid"
     assert alias["created"] > 0
@@ -5652,6 +5652,8 @@ async def test_runner_factory_failure_releases_the_session_lease(tmp_path: Path)
 async def test_non_streaming_request_answers_499_when_the_client_disconnects(
     tmp_path: Path,
 ) -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
     runner = BlockingRunner()
     app = _app(tmp_path, runner)
     body = json.dumps(_payload()).encode()
@@ -5664,6 +5666,238 @@ async def test_non_streaming_request_answers_499_when_the_client_disconnects(
 
     assert sent[0]["status"] == 499
     assert runner.closed is True
+    cancelled = [
+        json.loads(line)
+        for line in log_stream.getvalue().splitlines()
+        if json.loads(line)["event"] == "chat.cancelled"
+    ]
+    assert len(cancelled) == 1
+    assert cancelled[0]["stream"] is False
+    assert cancelled[0]["status"] == 499
+    assert cancelled[0]["model"] == "factory-droid"
+
+
+def _probe_app(
+    tmp_path: Path,
+    runner: Any,
+    *,
+    auth_probe_seconds: float = 60.0,
+    auth_failure_threshold: int = 3,
+) -> Any:
+    return create_app(
+        Settings(
+            workdir=tmp_path,
+            timeout_seconds=30.0,
+            warm_sessions=0,
+            telemetry=False,
+            auth_probe_seconds=auth_probe_seconds,
+            auth_failure_threshold=auth_failure_threshold,
+        ),
+        runner_factory=cast("RunnerFactory", lambda: runner),
+    )
+
+
+def _auth_error() -> RunnerError:
+    return RunnerError(
+        "Factory rejected the bridge's API key: revoked",
+        status_code=503,
+        error_type="factory_auth_error",
+    )
+
+
+@pytest.mark.asyncio
+async def test_health_reports_probe_auth_status(tmp_path: Path) -> None:
+    runner = FakeRunner([TextDelta("ok"), RunComplete(Usage())])
+    app = _probe_app(tmp_path, runner, auth_probe_seconds=0.05)
+    probe = app.state.auth_probe
+    assert probe is not None
+
+    async with app.router.lifespan_context(app):
+        async with asyncio.timeout(5.0):
+            while probe.status != "ok":
+                await asyncio.sleep(0)
+        async with _client(app) as client:
+            response = await client.get("/health")
+
+    assert response.json() == {"status": "ok", "auth": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_chat_requests_fail_fast_while_the_auth_gate_is_open(
+    tmp_path: Path,
+) -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
+    runner = FakeRunner([TextDelta("ok"), RunComplete(Usage())])
+    app = _probe_app(tmp_path, runner, auth_failure_threshold=3)
+    probe = app.state.auth_probe
+    assert probe is not None
+    probe._consecutive_failures = 3
+
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=_payload())
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["error"]["type"] == "factory_auth_error"
+    assert "auth probes" in body["error"]["message"]
+    # The gate must reject before any Droid process is spawned.
+    assert runner.requests == []
+    rejected = [
+        json.loads(line)
+        for line in log_stream.getvalue().splitlines()
+        if json.loads(line)["event"] == "chat.rejected"
+    ]
+    assert len(rejected) == 1
+    assert rejected[0]["phase"] == "auth_probe"
+    assert rejected[0]["consecutive"] == 3
+
+
+@pytest.mark.asyncio
+async def test_chat_traffic_success_resets_the_probe(tmp_path: Path) -> None:
+    runner = FakeRunner([TextDelta("ok"), RunComplete(Usage())])
+    app = _probe_app(tmp_path, runner)
+    probe = app.state.auth_probe
+    assert probe is not None
+    probe._consecutive_failures = 2
+
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=_payload())
+
+    assert response.status_code == 200
+    assert len(runner.requests) == 1
+    assert probe._consecutive_failures == 0
+    assert probe.status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_auth_shaped_failure_triggers_an_immediate_probe(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner([], error=_auth_error())
+    app = _probe_app(tmp_path, runner)
+    probe = app.state.auth_probe
+    assert probe is not None
+
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=_payload())
+
+    assert response.status_code == 503
+    assert len(runner.requests) == 1
+    assert probe._trigger.is_set()
+
+
+@pytest.mark.asyncio
+async def test_streaming_auth_failure_triggers_an_immediate_probe(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner([], error=_auth_error())
+    app = _probe_app(tmp_path, runner)
+    probe = app.state.auth_probe
+    assert probe is not None
+
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=_payload(stream=True))
+
+    assert response.status_code == 200
+    assert "factory_auth_error" in response.text
+    assert probe._trigger.is_set()
+
+
+@pytest.mark.asyncio
+async def test_streaming_traffic_success_resets_the_probe(tmp_path: Path) -> None:
+    runner = FakeRunner([TextDelta("hi"), RunComplete(Usage())])
+    app = _probe_app(tmp_path, runner)
+    probe = app.state.auth_probe
+    assert probe is not None
+    probe._consecutive_failures = 2
+
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=_payload(stream=True))
+
+    assert response.status_code == 200
+    assert probe._consecutive_failures == 0
+    assert probe.status == "ok"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_chat_failed_reports_the_failure_reason(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
+    runner = FakeRunner(
+        [],
+        error=RunnerError(
+            "Factory Droid SDK failed: boom",
+            error_type="factory_droid_sdk_error",
+        ),
+    )
+    app = _app(tmp_path, runner)
+
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=_payload(stream=stream))
+
+    if stream:
+        assert response.status_code == 200
+        assert "factory_droid_sdk_error" in response.text
+    else:
+        assert response.status_code == 502
+    failures = [
+        json.loads(line)
+        for line in log_stream.getvalue().splitlines()
+        if json.loads(line)["event"] == "chat.failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["reason"] == "Factory Droid SDK failed: boom"
+    assert failures[0]["error_type"] == "factory_droid_sdk_error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_empty_completions_are_logged_and_counted(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
+    runner = FakeRunner([RunComplete(Usage())])
+    app = _app(tmp_path, runner)
+
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=_payload(stream=stream))
+
+    assert response.status_code == 200
+    if not stream:
+        assert response.json()["choices"][0]["message"]["content"] is None
+    empties = [
+        json.loads(line)
+        for line in log_stream.getvalue().splitlines()
+        if json.loads(line)["event"] == "chat.empty_completion"
+    ]
+    assert len(empties) == 1
+    assert empties[0]["stream"] is stream
+    assert "factory_droid_openai_empty_completions_total 1" in app.state.metrics.render()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_empty_completions_suspect_the_probe(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+    app = _probe_app(tmp_path, runner)
+    probe = app.state.auth_probe
+    assert probe is not None
+
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=_payload(stream=stream))
+
+    assert response.status_code == 200
+    assert probe._trigger.is_set()
 
 
 @pytest.mark.asyncio

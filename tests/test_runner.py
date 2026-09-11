@@ -1744,6 +1744,42 @@ def test_runner_maps_invalid_model_id_as_unavailable() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Request failed with status code 401",
+        "API key is invalid",
+        "403 Forbidden",
+        "Authentication failed",
+    ],
+)
+async def test_runner_maps_auth_failures_as_auth_errors(
+    tmp_path: Path,
+    message: str,
+) -> None:
+    client = FakeClient([ErrorEvent(message, "Error")])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    with pytest.raises(RunnerError, match="Factory rejected the bridge's API key") as error:
+        _ = [event async for event in runner.run(_request())]
+
+    assert error.value.status_code == 503
+    assert error.value.error_type == "factory_auth_error"
+
+
+def test_sdk_error_classifies_auth_failures() -> None:
+    error = sdk_error(DroidClientError("Unauthorized: API key revoked"))
+
+    assert error.status_code == 503
+    assert error.error_type == "factory_auth_error"
+    assert "API key revoked" in str(error)
+
+
+@pytest.mark.asyncio
 async def test_runner_keeps_other_sdk_failures_as_bridge_errors(tmp_path: Path) -> None:
     class BrokenClient(FakeClient):
         async def initialize_session(self, **kwargs: Any) -> None:

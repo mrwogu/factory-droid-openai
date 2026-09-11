@@ -55,6 +55,9 @@ class StreamOptions(BaseModel):
 
 class HealthResponse(BaseModel):
     status: Literal["ok"]
+    # Last known state of the Factory key from the auth probe: "unknown" when
+    # the probe is disabled or has not finished its first run yet.
+    auth: Literal["ok", "degraded", "unknown"] = "unknown"
 
 
 class VersionResponse(BaseModel):

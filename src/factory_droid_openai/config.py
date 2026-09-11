@@ -71,6 +71,15 @@ class Settings:
     mcp_settle_seconds: float = 0.0
     model_cache_seconds: float = 300.0
     model_quarantine_seconds: float = 900.0
+    # How often the auth probe runs one minimal Droid exec to check the
+    # Factory key. Off by default because every probe is a real model turn
+    # that costs tokens; enabling it catches a dead key within one interval
+    # instead of hours of opaque failures (issue #122). Zero disables the
+    # probe, its health field, and the gate.
+    auth_probe_seconds: float = 0.0
+    # Consecutive probe failures before chat requests fail fast with 503
+    # instead of each paying for a doomed Droid spawn.
+    auth_failure_threshold: int = 3
     worktree: str | None = None
     append_system_prompt_file: Path | None = None
     model_alias: str = DEFAULT_MODEL_ALIAS
@@ -121,6 +130,10 @@ class Settings:
             or self.warm_session_idle_drain_seconds <= 0
         ):
             raise ValueError("warm_session_idle_drain_seconds must be greater than zero and finite")
+        if not math.isfinite(self.auth_probe_seconds) or self.auth_probe_seconds < 0:
+            raise ValueError("auth_probe_seconds must be zero or greater and finite")
+        if self.auth_failure_threshold < 1:
+            raise ValueError("auth_failure_threshold must be at least 1")
         # Every warm session pins one catalog for its whole warm life, and every
         # admitted request publishes one of its own, so the registry has to hold
         # both at once. Sizing it any smaller makes the registry evict the
@@ -313,6 +326,14 @@ class Settings:
             "FACTORY_DROID_OPENAI_MODEL_QUARANTINE_SECONDS",
             default=900.0,
         )
+        auth_probe_seconds = _non_negative_float(
+            "FACTORY_DROID_OPENAI_AUTH_PROBE_SECONDS",
+            default=0.0,
+        )
+        auth_failure_threshold = _positive_int(
+            "FACTORY_DROID_OPENAI_AUTH_FAILURE_THRESHOLD",
+            default=3,
+        )
         worktree = os.getenv("FACTORY_DROID_OPENAI_WORKTREE") or None
         append_system_prompt_file = _optional_file(
             "FACTORY_DROID_OPENAI_APPEND_SYSTEM_PROMPT_FILE",
@@ -382,6 +403,8 @@ class Settings:
             mcp_settle_seconds=mcp_settle_seconds,
             model_cache_seconds=model_cache_seconds,
             model_quarantine_seconds=model_quarantine_seconds,
+            auth_probe_seconds=auth_probe_seconds,
+            auth_failure_threshold=auth_failure_threshold,
             worktree=worktree,
             append_system_prompt_file=append_system_prompt_file,
             model_alias=os.getenv("FACTORY_DROID_OPENAI_MODEL_ALIAS", DEFAULT_MODEL_ALIAS),

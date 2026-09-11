@@ -58,6 +58,8 @@ def test_metrics_snapshot_contains_only_telemetry_dimensions() -> None:
     metrics.increment_warm_misses()
     metrics.increment_warm_retunes("effort")
     metrics.increment_warm_failures()
+    metrics.increment_empty_completions()
+    metrics.increment_auth_probe_failures()
 
     snapshot = metrics.telemetry_snapshot()
 
@@ -73,6 +75,8 @@ def test_metrics_snapshot_contains_only_telemetry_dimensions() -> None:
         ("tools", 2),
     )
     assert snapshot.internal == (
+        ("auth_probe_failure", 1),
+        ("empty_completion", 1),
         ("forced_kill", 1),
         ("model_discovery_failure", 1),
         ("model_quarantine", 1),
