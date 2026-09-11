@@ -236,6 +236,42 @@ class RetryRunner(FakeRunner):
             self.closed = True
 
 
+class TruncationRetryRunner(FakeRunner):
+    """Serves one truncated attempt, then a configurable second attempt."""
+
+    def __init__(
+        self,
+        *,
+        retry_events: list[RunEvent] | None = None,
+        retry_error: RunnerError | None = None,
+        retry_gate: asyncio.Event | None = None,
+    ) -> None:
+        super().__init__([])
+        self.first = _recorded_events("retry/truncated-tool.jsonl")
+        self.retry_events = retry_events
+        self.retry_error = retry_error
+        self.retry_gate = retry_gate
+
+    async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
+        self.requests.append(request)
+        if request.warm_session is not None:
+            request.warm_session.consumed = True
+        try:
+            if len(self.requests) == 1:
+                for event in self.first:
+                    yield event
+            elif self.retry_gate is not None:
+                self.retry_gate.set()
+                await asyncio.Event().wait()
+            elif self.retry_error is not None:
+                raise self.retry_error
+            elif self.retry_events is not None:
+                for event in self.retry_events:
+                    yield event
+        finally:
+            self.closed = True
+
+
 class BlockingRunner(FakeRunner):
     def __init__(self) -> None:
         super().__init__([])
@@ -357,6 +393,72 @@ def _client(app: Any) -> httpx.AsyncClient:
         transport=httpx.ASGITransport(app=app),
         base_url="http://test",
     )
+
+
+def _warning_records(log_stream: io.StringIO) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in log_stream.getvalue().splitlines() if line.strip()]
+
+
+def _weather_payload() -> dict[str, object]:
+    return _payload(
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {}},
+            }
+        ]
+    )
+
+
+def _single_retry_outcome(records: list[dict[str, Any]]) -> dict[str, Any]:
+    outcomes = [record for record in records if record["event"] == "chat.retry_outcome"]
+    assert len(outcomes) == 1
+    return outcomes[0]
+
+
+def _chat_scope(body: bytes) -> dict[str, Any]:
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/chat/completions",
+        "raw_path": b"/v1/chat/completions",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"host", b"test"),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode()),
+        ],
+        "client": ("127.0.0.1", 4242),
+        "server": ("test", 80),
+    }
+
+
+def _request_then_disconnect_receive(body: bytes, gate: asyncio.Event) -> Any:
+    delivered = False
+
+    async def receive() -> Any:
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        await gate.wait()
+        return {"type": "http.disconnect"}
+
+    return receive
+
+
+async def _run_chat_request(app: Any, *, body: bytes, receive: Any) -> list[Any]:
+    sent: list[Any] = []
+
+    async def send(message: Any) -> None:
+        sent.append(message)
+
+    await app(_chat_scope(body), receive, send)
+    return sent
 
 
 @pytest.mark.asyncio
@@ -2485,26 +2587,17 @@ async def test_non_streaming_malformed_without_session_logs_not_attempted(
         ["retry/malformed-tool.jsonl", "retry/valid-tool.jsonl"],
         omit_session_started_attempts=frozenset({0}),
     )
-    payload = _payload(
-        tools=[
-            {
-                "type": "function",
-                "function": {"name": "weather", "parameters": {}},
-            }
-        ]
-    )
 
     async with _client(_app(tmp_path, runner)) as client:
-        response = await client.post("/v1/chat/completions", json=payload)
+        response = await client.post("/v1/chat/completions", json=_weather_payload())
 
     assert response.status_code == 200
     assert len(runner.requests) == 1
-    records = [json.loads(line) for line in log_stream.getvalue().splitlines() if line.strip()]
-    outcomes = [record for record in records if record["event"] == "chat.retry_outcome"]
-    assert len(outcomes) == 1
-    assert outcomes[0]["reason"] == "malformed_tool_call"
-    assert outcomes[0]["outcome"] == "not_attempted"
-    assert outcomes[0]["attempt"] == 0
+    records = _warning_records(log_stream)
+    outcome = _single_retry_outcome(records)
+    assert outcome["reason"] == "malformed_tool_call"
+    assert outcome["outcome"] == "not_attempted"
+    assert outcome["attempt"] == 0
     assert not any(record["event"] == "chat.retry" for record in records)
 
 
@@ -2512,158 +2605,56 @@ async def test_non_streaming_malformed_without_session_logs_not_attempted(
 async def test_retry_refailed_when_protocol_error_on_retry(tmp_path: Path) -> None:
     log_stream = io.StringIO()
     logs.configure_logging(level="warning", log_format="json", stream=log_stream)
-    truncated = _recorded_events("retry/truncated-tool.jsonl")
+    runner = TruncationRetryRunner(retry_events=[TextDelta("\ud800"), RunComplete(Usage())])
 
-    class RetryThenProtocolError(FakeRunner):
-        def __init__(self) -> None:
-            super().__init__([])
-
-        async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
-            self.requests.append(request)
-            if request.warm_session is not None:
-                request.warm_session.consumed = True
-            try:
-                if len(self.requests) == 1:
-                    for event in truncated:
-                        yield event
-                else:
-                    yield TextDelta("\ud800")
-                    yield RunComplete(Usage())
-            finally:
-                self.closed = True
-
-    async with _client(_app(tmp_path, RetryThenProtocolError())) as client:
-        response = await client.post(
-            "/v1/chat/completions",
-            json=_payload(
-                tools=[{"type": "function", "function": {"name": "weather", "parameters": {}}}]
-            ),
-        )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=_weather_payload())
 
     assert response.status_code == 502
-    records = [json.loads(line) for line in log_stream.getvalue().splitlines() if line.strip()]
-    outcomes = [record for record in records if record["event"] == "chat.retry_outcome"]
-    assert len(outcomes) == 1
-    assert outcomes[0]["reason"] == "truncated_tool_call"
-    assert outcomes[0]["outcome"] == "refailed"
-    assert outcomes[0]["attempt"] == 1
+    outcome = _single_retry_outcome(_warning_records(log_stream))
+    assert outcome["reason"] == "truncated_tool_call"
+    assert outcome["outcome"] == "refailed"
+    assert outcome["attempt"] == 1
 
 
 @pytest.mark.asyncio
 async def test_retry_refailed_when_runner_error_on_retry(tmp_path: Path) -> None:
     log_stream = io.StringIO()
     logs.configure_logging(level="warning", log_format="json", stream=log_stream)
-    truncated = _recorded_events("retry/truncated-tool.jsonl")
+    runner = TruncationRetryRunner(
+        retry_error=RunnerError("boom", status_code=503, error_type="factory_droid_sdk_error")
+    )
 
-    class RetryThenRunnerError(FakeRunner):
-        def __init__(self) -> None:
-            super().__init__([])
-
-        async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
-            self.requests.append(request)
-            if request.warm_session is not None:
-                request.warm_session.consumed = True
-            try:
-                if len(self.requests) == 1:
-                    for event in truncated:
-                        yield event
-                else:
-                    raise RunnerError("boom", status_code=503, error_type="factory_droid_sdk_error")
-            finally:
-                self.closed = True
-
-    async with _client(_app(tmp_path, RetryThenRunnerError())) as client:
-        response = await client.post(
-            "/v1/chat/completions",
-            json=_payload(
-                tools=[{"type": "function", "function": {"name": "weather", "parameters": {}}}]
-            ),
-        )
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=_weather_payload())
 
     assert response.status_code == 503
-    records = [json.loads(line) for line in log_stream.getvalue().splitlines() if line.strip()]
-    outcomes = [record for record in records if record["event"] == "chat.retry_outcome"]
-    assert len(outcomes) == 1
-    assert outcomes[0]["reason"] == "truncated_tool_call"
-    assert outcomes[0]["outcome"] == "refailed"
-    assert outcomes[0]["attempt"] == 1
+    outcome = _single_retry_outcome(_warning_records(log_stream))
+    assert outcome["reason"] == "truncated_tool_call"
+    assert outcome["outcome"] == "refailed"
+    assert outcome["attempt"] == 1
 
 
 @pytest.mark.asyncio
 async def test_retry_refailed_when_client_disconnects_on_retry(tmp_path: Path) -> None:
     log_stream = io.StringIO()
     logs.configure_logging(level="warning", log_format="json", stream=log_stream)
-    truncated = _recorded_events("retry/truncated-tool.jsonl")
-
-    class RetryThenBlock(FakeRunner):
-        def __init__(self) -> None:
-            super().__init__([])
-            self.retry_started = asyncio.Event()
-
-        async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
-            self.requests.append(request)
-            if request.warm_session is not None:
-                request.warm_session.consumed = True
-            try:
-                if len(self.requests) == 1:
-                    for event in truncated:
-                        yield event
-                else:
-                    self.retry_started.set()
-                    await asyncio.Event().wait()
-            finally:
-                self.closed = True
-
-    runner = RetryThenBlock()
+    retry_gate = asyncio.Event()
+    runner = TruncationRetryRunner(retry_gate=retry_gate)
     app = _app(tmp_path, runner)
-    body = json.dumps(
-        _payload(tools=[{"type": "function", "function": {"name": "weather", "parameters": {}}}])
-    ).encode()
-    delivered = False
+    body = json.dumps(_weather_payload()).encode()
 
-    async def receive() -> Any:
-        nonlocal delivered
-        if not delivered:
-            delivered = True
-            return {"type": "http.request", "body": body, "more_body": False}
-        await runner.retry_started.wait()
-        return {"type": "http.disconnect"}
-
-    sent: list[Any] = []
-
-    async def send(message: Any) -> None:
-        sent.append(message)
-
-    await app(
-        {
-            "type": "http",
-            "asgi": {"version": "3.0", "spec_version": "2.4"},
-            "http_version": "1.1",
-            "method": "POST",
-            "scheme": "http",
-            "path": "/v1/chat/completions",
-            "raw_path": b"/v1/chat/completions",
-            "query_string": b"",
-            "root_path": "",
-            "headers": [
-                (b"host", b"test"),
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(body)).encode()),
-            ],
-            "client": ("127.0.0.1", 4242),
-            "server": ("test", 80),
-        },
-        receive,
-        send,
+    sent = await _run_chat_request(
+        app,
+        body=body,
+        receive=_request_then_disconnect_receive(body, retry_gate),
     )
 
     assert sent[0]["status"] == 499
-    records = [json.loads(line) for line in log_stream.getvalue().splitlines() if line.strip()]
-    outcomes = [record for record in records if record["event"] == "chat.retry_outcome"]
-    assert len(outcomes) == 1
-    assert outcomes[0]["reason"] == "truncated_tool_call"
-    assert outcomes[0]["outcome"] == "refailed"
-    assert outcomes[0]["attempt"] == 1
+    outcome = _single_retry_outcome(_warning_records(log_stream))
+    assert outcome["reason"] == "truncated_tool_call"
+    assert outcome["outcome"] == "refailed"
+    assert outcome["attempt"] == 1
 
 
 @pytest.mark.asyncio
@@ -5589,42 +5580,11 @@ async def test_non_streaming_request_answers_499_when_the_client_disconnects(
     runner = BlockingRunner()
     app = _app(tmp_path, runner)
     body = json.dumps(_payload()).encode()
-    delivered = False
 
-    async def receive() -> Any:
-        nonlocal delivered
-        if not delivered:
-            delivered = True
-            return {"type": "http.request", "body": body, "more_body": False}
-        await runner.started.wait()
-        return {"type": "http.disconnect"}
-
-    sent: list[Any] = []
-
-    async def send(message: Any) -> None:
-        sent.append(message)
-
-    await app(
-        {
-            "type": "http",
-            "asgi": {"version": "3.0", "spec_version": "2.4"},
-            "http_version": "1.1",
-            "method": "POST",
-            "scheme": "http",
-            "path": "/v1/chat/completions",
-            "raw_path": b"/v1/chat/completions",
-            "query_string": b"",
-            "root_path": "",
-            "headers": [
-                (b"host", b"test"),
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(body)).encode()),
-            ],
-            "client": ("127.0.0.1", 4242),
-            "server": ("test", 80),
-        },
-        receive,
-        send,
+    sent = await _run_chat_request(
+        app,
+        body=body,
+        receive=_request_then_disconnect_receive(body, runner.started),
     )
 
     assert sent[0]["status"] == 499
