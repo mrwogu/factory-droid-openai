@@ -7,6 +7,7 @@ import re
 import sys
 import textwrap
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
@@ -68,7 +69,6 @@ from factory_droid_openai.runner import (
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
-    from pathlib import Path
     from typing import Any
 
 
@@ -1743,24 +1743,27 @@ def test_runner_maps_invalid_model_id_as_unavailable() -> None:
     assert "not-a-live-model" in str(error)
 
 
+def _recorded_auth_error_events() -> list[ErrorEvent]:
+    path = Path(__file__).parent / "fixtures" / "runner" / "auth-failures.jsonl"
+    records = [
+        cast("dict[str, str]", json.loads(line))
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    return [ErrorEvent(record["message"], record["error_type"]) for record in records]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "message",
-    [
-        "Request failed with status code 401",
-        "Invalid API key",
-        "API key is invalid",
-        "API key has expired",
-        "Expired API key",
-        "403 Forbidden",
-        "Authentication failed",
-    ],
+    "event",
+    _recorded_auth_error_events(),
+    ids=lambda event: event.message,
 )
 async def test_runner_maps_auth_failures_as_auth_errors(
     tmp_path: Path,
-    message: str,
+    event: ErrorEvent,
 ) -> None:
-    client = FakeClient([ErrorEvent(message, "Error")])
+    client = FakeClient([event])
     runner = DroidRunner(
         droid_path="droid",
         workdir=tmp_path,

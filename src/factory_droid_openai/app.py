@@ -191,7 +191,7 @@ CHAT_COMPLETION_RESPONSES: dict[int | str, dict[str, Any]] = {
     },
     503: {
         "model": ErrorResponse,
-        "description": "Droid executable unavailable.",
+        "description": "Droid executable unavailable or Factory authentication failed.",
     },
     504: {
         "model": ErrorResponse,
@@ -1363,6 +1363,12 @@ def create_app(
             priority=priority,
         )
 
+        rejection = _validate_options(payload, resolved_settings)
+        if rejection is not None:
+            request.state.telemetry_error_type = "invalid_request_error"
+            log_warning("chat.rejected", status=rejection.status_code, phase="options")
+            return rejection
+
         if auth_probe is not None and auth_probe.failing:
             # Every doomed request pays for a full Droid spawn before failing,
             # so the probe gate turns an auth outage into one cheap rejection.
@@ -1380,12 +1386,6 @@ def create_app(
                 503,
                 "factory_auth_error",
             )
-
-        rejection = _validate_options(payload, resolved_settings)
-        if rejection is not None:
-            request.state.telemetry_error_type = "invalid_request_error"
-            log_warning("chat.rejected", status=rejection.status_code, phase="options")
-            return rejection
 
         reasoning_effort = _effective_reasoning_effort(payload, resolved_settings)
         try:
@@ -1661,9 +1661,10 @@ def create_app(
 
             def note_stream_failure(model: str, exc: RunnerError) -> None:
                 note_runner_failure(model, exc)
-                if auth_probe is not None and exc.error_type == "factory_auth_error":
-                    auth_probe.suspect()
+                if exc.error_type == "factory_auth_error":
                     request.state.telemetry_error_type = exc.error_type
+                    if auth_probe is not None:
+                        auth_probe.suspect()
 
             event_stream = _stream_completion(
                 request_id=request_id,
@@ -1783,6 +1784,10 @@ def create_app(
                                     status=499,
                                     model=payload.model,
                                     choices=payload.n,
+                                    elapsed_ms=timeline.total_ms,
+                                    queue_ms=timeline.phases.get("queue_ms"),
+                                    warm=attempt_request.warm_session is not None,
+                                    warm_age_ms=attempt_warm_age_ms,
                                 )
                                 return _error_response(
                                     "Client disconnected.",
@@ -2691,7 +2696,16 @@ async def _stream_completion(
                 failure_callback(model, exc)
             yield _sse(_error_body(str(exc), exc.error_type))
         except asyncio.CancelledError:
-            log_warning("chat.cancelled", stream=True, model=model)
+            timeline = current_timeline()
+            log_warning(
+                "chat.cancelled",
+                stream=True,
+                model=model,
+                elapsed_ms=timeline.total_ms if timeline is not None else None,
+                queue_ms=timeline.phases.get("queue_ms") if timeline is not None else None,
+                warm=run_request.warm_session is not None,
+                warm_age_ms=warm_age_ms,
+            )
             if outcome_callback is not None:
                 outcome_callback("cancelled")
             raise

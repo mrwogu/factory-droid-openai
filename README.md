@@ -1503,6 +1503,9 @@ surface.
 | `factory_droid_openai_warm_session_misses_total` | Requests that had to start their own session |
 | `factory_droid_openai_warm_session_failures_total` | Failed warm-up attempts |
 | `factory_droid_openai_pending_reaps` | Droid teardowns still running in the background |
+| `factory_droid_openai_empty_completions_total` | Completions that returned no text or tool calls |
+| `factory_droid_openai_auth_probe_successes_total` | Auth probes that completed with assistant text and a terminal event |
+| `factory_droid_openai_auth_probe_failures_total` | Auth probes that failed, timed out, or returned no complete answer |
 
 `forced_kills_total` counts processes that had to be killed with a signal
 because they did not exit within `FACTORY_DROID_OPENAI_PROCESS_GRACE_SECONDS`.

@@ -1197,7 +1197,7 @@
                 }
               }
             },
-            "description": "Droid executable unavailable."
+            "description": "Droid executable unavailable or Factory authentication failed."
           },
           "504": {
             "content": {
@@ -1312,7 +1312,7 @@
                 }
               }
             },
-            "description": "Droid executable unavailable."
+            "description": "Droid executable unavailable or Factory authentication failed."
           },
           "504": {
             "content": {
@@ -1435,7 +1435,7 @@
                 }
               }
             },
-            "description": "Droid executable unavailable."
+            "description": "Droid executable unavailable or Factory authentication failed."
           },
           "504": {
             "content": {
@@ -1560,7 +1560,7 @@
                 }
               }
             },
-            "description": "Droid executable unavailable."
+            "description": "Droid executable unavailable or Factory authentication failed."
           },
           "504": {
             "content": {
@@ -1675,7 +1675,7 @@
                 }
               }
             },
-            "description": "Droid executable unavailable."
+            "description": "Droid executable unavailable or Factory authentication failed."
           },
           "504": {
             "content": {
@@ -1790,7 +1790,7 @@
                 }
               }
             },
-            "description": "Droid executable unavailable."
+            "description": "Droid executable unavailable or Factory authentication failed."
           },
           "504": {
             "content": {
@@ -1892,7 +1892,7 @@
                 }
               }
             },
-            "description": "Droid executable unavailable."
+            "description": "Droid executable unavailable or Factory authentication failed."
           },
           "504": {
             "content": {
@@ -2015,7 +2015,7 @@
                 }
               }
             },
-            "description": "Droid executable unavailable."
+            "description": "Droid executable unavailable or Factory authentication failed."
           },
           "504": {
             "content": {

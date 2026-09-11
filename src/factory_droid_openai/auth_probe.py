@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Literal
 from factory_droid_openai.logs import debug as log_debug
 from factory_droid_openai.logs import millis
 from factory_droid_openai.logs import warning as log_warning
-from factory_droid_openai.runner import RunnerError, RunRequest, TextDelta
+from factory_droid_openai.runner import RunComplete, RunnerError, RunRequest, TextDelta
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -140,6 +140,7 @@ class AuthProbe:
             timeout_seconds=budget,
         )
         saw_text = False
+        completed = False
         try:
             # The outer bound catches a runner whose own deadline never fires,
             # so one stuck exec cannot stall the probe loop for good.
@@ -147,10 +148,14 @@ class AuthProbe:
                 async for event in runner.run(request):
                     if isinstance(event, TextDelta):
                         saw_text = saw_text or bool(event.text)
+                    elif isinstance(event, RunComplete):
+                        completed = True
         except RunnerError as exc:
             return str(exc)
         except TimeoutError:
             return "Auth probe timed out."
         if not saw_text:
             return "Auth probe completed without any assistant text."
+        if not completed:
+            return "Auth probe ended without a completion event."
         return None

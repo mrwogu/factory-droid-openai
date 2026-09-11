@@ -5675,16 +5675,25 @@ async def test_non_streaming_request_answers_499_when_the_client_disconnects(
     assert cancelled[0]["stream"] is False
     assert cancelled[0]["status"] == 499
     assert cancelled[0]["model"] == "factory-droid"
+    assert cancelled[0]["elapsed_ms"] >= 0
+    assert cancelled[0]["queue_ms"] >= 0
+    assert cancelled[0]["warm"] is False
 
 
 def _probe_app(
     tmp_path: Path,
-    runner: Any,
     *,
+    events_fixture: str | None = "hello--gpt-5-4-mini.jsonl",
+    drop_text: bool = False,
+    error: RunnerError | None = None,
     auth_probe_seconds: float = 60.0,
     auth_failure_threshold: int = 3,
-) -> Any:
-    return create_app(
+) -> tuple[Any, FakeRunner]:
+    events = [] if events_fixture is None else _recorded_events(events_fixture)
+    if drop_text:
+        events = [event for event in events if not isinstance(event, TextDelta)]
+    runner = FakeRunner(events, error=error)
+    app = create_app(
         Settings(
             workdir=tmp_path,
             timeout_seconds=30.0,
@@ -5695,6 +5704,7 @@ def _probe_app(
         ),
         runner_factory=cast("RunnerFactory", lambda: runner),
     )
+    return app, runner
 
 
 def _auth_error() -> RunnerError:
@@ -5707,8 +5717,7 @@ def _auth_error() -> RunnerError:
 
 @pytest.mark.asyncio
 async def test_health_reports_probe_auth_status(tmp_path: Path) -> None:
-    runner = FakeRunner([TextDelta("ok"), RunComplete(Usage())])
-    app = _probe_app(tmp_path, runner, auth_probe_seconds=0.05)
+    app, _runner = _probe_app(tmp_path, auth_probe_seconds=0.05)
     probe = app.state.auth_probe
     assert probe is not None
 
@@ -5728,8 +5737,7 @@ async def test_chat_requests_fail_fast_while_the_auth_gate_is_open(
 ) -> None:
     log_stream = io.StringIO()
     logs.configure_logging(level="warning", log_format="json", stream=log_stream)
-    runner = FakeRunner([TextDelta("ok"), RunComplete(Usage())])
-    app = _probe_app(tmp_path, runner, auth_failure_threshold=3)
+    app, runner = _probe_app(tmp_path, auth_failure_threshold=3)
     probe = app.state.auth_probe
     assert probe is not None
     probe._consecutive_failures = 3
@@ -5755,9 +5763,27 @@ async def test_chat_requests_fail_fast_while_the_auth_gate_is_open(
 
 
 @pytest.mark.asyncio
+async def test_invalid_options_win_over_the_auth_gate(tmp_path: Path) -> None:
+    app, runner = _probe_app(tmp_path, auth_failure_threshold=3)
+    probe = app.state.auth_probe
+    assert probe is not None
+    probe._consecutive_failures = 3
+
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(n=5),
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert runner.requests == []
+    assert probe._trigger.is_set() is False
+
+
+@pytest.mark.asyncio
 async def test_chat_traffic_success_resets_the_probe(tmp_path: Path) -> None:
-    runner = FakeRunner([TextDelta("ok"), RunComplete(Usage())])
-    app = _probe_app(tmp_path, runner)
+    app, runner = _probe_app(tmp_path)
     probe = app.state.auth_probe
     assert probe is not None
     probe._consecutive_failures = 2
@@ -5775,8 +5801,7 @@ async def test_chat_traffic_success_resets_the_probe(tmp_path: Path) -> None:
 async def test_auth_shaped_failure_triggers_an_immediate_probe(
     tmp_path: Path,
 ) -> None:
-    runner = FakeRunner([], error=_auth_error())
-    app = _probe_app(tmp_path, runner)
+    app, runner = _probe_app(tmp_path, events_fixture=None, error=_auth_error())
     probe = app.state.auth_probe
     assert probe is not None
 
@@ -5792,8 +5817,7 @@ async def test_auth_shaped_failure_triggers_an_immediate_probe(
 async def test_streaming_auth_failure_triggers_an_immediate_probe(
     tmp_path: Path,
 ) -> None:
-    runner = FakeRunner([], error=_auth_error())
-    app = _probe_app(tmp_path, runner)
+    app, _runner = _probe_app(tmp_path, events_fixture=None, error=_auth_error())
     probe = app.state.auth_probe
     assert probe is not None
 
@@ -5808,9 +5832,24 @@ async def test_streaming_auth_failure_triggers_an_immediate_probe(
 
 
 @pytest.mark.asyncio
+async def test_streaming_auth_failure_is_categorized_without_a_probe(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner([], error=_auth_error())
+    app = _app(tmp_path, runner)
+
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=_payload(stream=True))
+
+    assert response.status_code == 200
+    assert "factory_auth_error" in response.text
+    features = dict(app.state.metrics.telemetry_snapshot().features)
+    assert features["request_error:chat_completions:factory_auth"] == 1
+
+
+@pytest.mark.asyncio
 async def test_streaming_traffic_success_resets_the_probe(tmp_path: Path) -> None:
-    runner = FakeRunner([TextDelta("hi"), RunComplete(Usage())])
-    app = _probe_app(tmp_path, runner)
+    app, _runner = _probe_app(tmp_path)
     probe = app.state.auth_probe
     assert probe is not None
     probe._consecutive_failures = 2
@@ -5866,7 +5905,13 @@ async def test_empty_completions_are_logged_and_counted(
 ) -> None:
     log_stream = io.StringIO()
     logs.configure_logging(level="warning", log_format="json", stream=log_stream)
-    runner = FakeRunner([RunComplete(Usage())])
+    runner = FakeRunner(
+        [
+            event
+            for event in _recorded_events("hello--gpt-5-4-mini.jsonl")
+            if not isinstance(event, TextDelta)
+        ]
+    )
     app = _app(tmp_path, runner)
 
     async with _client(app) as client:
@@ -5891,8 +5936,7 @@ async def test_empty_completions_suspect_the_probe(
     tmp_path: Path,
     stream: bool,
 ) -> None:
-    runner = FakeRunner([RunComplete(Usage())])
-    app = _probe_app(tmp_path, runner)
+    app, _runner = _probe_app(tmp_path, drop_text=True)
     probe = app.state.auth_probe
     assert probe is not None
 
@@ -5909,15 +5953,17 @@ async def test_stop_sequence_does_not_count_as_an_empty_completion(
     tmp_path: Path,
     stream: bool,
 ) -> None:
-    runner = FakeRunner([TextDelta("STOP"), RunComplete(Usage())])
-    app = _probe_app(tmp_path, runner)
+    app, _runner = _probe_app(
+        tmp_path,
+        events_fixture="stop-sequence--gpt-5-4-mini.jsonl",
+    )
     probe = app.state.auth_probe
     assert probe is not None
 
     async with _client(app) as client:
         response = await client.post(
             "/v1/chat/completions",
-            json=_payload(stream=stream, stop="STOP"),
+            json=_payload(stream=stream, stop="4"),
         )
 
     assert response.status_code == 200
@@ -6027,6 +6073,10 @@ async def test_streaming_structured_output_absorbs_finish_and_held_text() -> Non
 
 @pytest.mark.asyncio
 async def test_streaming_reports_a_cancelled_outcome() -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
+    timeline = logs.bind_request("chatcmpl-test")
+    timeline.mark("queue_ms")
     runner = BlockingRunner()
     outcomes: list[str] = []
     metrics = BridgeMetrics()
@@ -6059,6 +6109,16 @@ async def test_streaming_reports_a_cancelled_outcome() -> None:
 
     assert '"role":"assistant"' in first
     assert outcomes == ["cancelled"]
+    cancelled = [
+        json.loads(line)
+        for line in log_stream.getvalue().splitlines()
+        if json.loads(line)["event"] == "chat.cancelled"
+    ]
+    assert len(cancelled) == 1
+    assert cancelled[0]["request_id"] == "chatcmpl-test"
+    assert cancelled[0]["elapsed_ms"] >= 0
+    assert cancelled[0]["queue_ms"] >= 0
+    assert cancelled[0]["warm"] is False
 
 
 @pytest.mark.asyncio
