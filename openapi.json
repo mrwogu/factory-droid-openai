@@ -641,6 +641,16 @@
       },
       "HealthResponse": {
         "properties": {
+          "auth": {
+            "default": "unknown",
+            "enum": [
+              "ok",
+              "degraded",
+              "unknown"
+            ],
+            "title": "Auth",
+            "type": "string"
+          },
           "status": {
             "const": "ok",
             "title": "Status",
@@ -1159,6 +1169,16 @@
               }
             }
           },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
           "502": {
             "content": {
               "application/json": {
@@ -1177,7 +1197,7 @@
                 }
               }
             },
-            "description": "Droid executable unavailable."
+            "description": "Droid executable unavailable or Factory authentication failed."
           },
           "504": {
             "content": {
@@ -1188,16 +1208,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1274,6 +1284,16 @@
               }
             }
           },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
           "502": {
             "content": {
               "application/json": {
@@ -1292,7 +1312,7 @@
                 }
               }
             },
-            "description": "Droid executable unavailable."
+            "description": "Droid executable unavailable or Factory authentication failed."
           },
           "504": {
             "content": {
@@ -1303,16 +1323,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1397,6 +1407,16 @@
               }
             }
           },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
           "502": {
             "content": {
               "application/json": {
@@ -1415,7 +1435,7 @@
                 }
               }
             },
-            "description": "Droid executable unavailable."
+            "description": "Droid executable unavailable or Factory authentication failed."
           },
           "504": {
             "content": {
@@ -1426,16 +1446,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1522,6 +1532,16 @@
               }
             }
           },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
           "502": {
             "content": {
               "application/json": {
@@ -1540,7 +1560,7 @@
                 }
               }
             },
-            "description": "Droid executable unavailable."
+            "description": "Droid executable unavailable or Factory authentication failed."
           },
           "504": {
             "content": {
@@ -1551,16 +1571,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1637,6 +1647,16 @@
               }
             }
           },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
           "502": {
             "content": {
               "application/json": {
@@ -1655,7 +1675,7 @@
                 }
               }
             },
-            "description": "Droid executable unavailable."
+            "description": "Droid executable unavailable or Factory authentication failed."
           },
           "504": {
             "content": {
@@ -1666,16 +1686,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1752,6 +1762,16 @@
               }
             }
           },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
           "502": {
             "content": {
               "application/json": {
@@ -1770,7 +1790,7 @@
                 }
               }
             },
-            "description": "Droid executable unavailable."
+            "description": "Droid executable unavailable or Factory authentication failed."
           },
           "504": {
             "content": {
@@ -1781,16 +1801,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1854,6 +1864,16 @@
               }
             }
           },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
           "502": {
             "content": {
               "application/json": {
@@ -1872,7 +1892,7 @@
                 }
               }
             },
-            "description": "Droid executable unavailable."
+            "description": "Droid executable unavailable or Factory authentication failed."
           },
           "504": {
             "content": {
@@ -1883,16 +1903,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1977,6 +1987,16 @@
               }
             }
           },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
           "502": {
             "content": {
               "application/json": {
@@ -1995,7 +2015,7 @@
                 }
               }
             },
-            "description": "Droid executable unavailable."
+            "description": "Droid executable unavailable or Factory authentication failed."
           },
           "504": {
             "content": {
@@ -2006,16 +2026,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [

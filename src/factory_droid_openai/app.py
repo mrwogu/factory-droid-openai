@@ -20,6 +20,7 @@ from jsonschema import ValidationError as JsonSchemaValidationError
 from jsonschema.exceptions import SchemaError
 from jsonschema.validators import validator_for
 
+from factory_droid_openai.auth_probe import AuthProbe
 from factory_droid_openai.availability import ModelQuarantine
 from factory_droid_openai.config import DEFAULT_TOOL_CALL_DRAIN_SECONDS, Settings
 from factory_droid_openai.droid_rpc import DroidRpcExtension, ToolCatalogCache
@@ -190,7 +191,7 @@ CHAT_COMPLETION_RESPONSES: dict[int | str, dict[str, Any]] = {
     },
     503: {
         "model": ErrorResponse,
-        "description": "Droid executable unavailable.",
+        "description": "Droid executable unavailable or Factory authentication failed.",
     },
     504: {
         "model": ErrorResponse,
@@ -858,6 +859,16 @@ def create_app(
         endpoint=DEFAULT_TELEMETRY_ENDPOINT,
         enabled=resolved_settings.telemetry,
     )
+    auth_probe: AuthProbe | None = None
+    if resolved_settings.auth_probe_seconds > 0:
+        auth_probe = AuthProbe(
+            runner_factory=resolved_runner_factory,
+            model_alias=resolved_settings.model_alias,
+            timeout_seconds=resolved_settings.timeout_seconds,
+            interval_seconds=resolved_settings.auth_probe_seconds,
+            failure_threshold=resolved_settings.auth_failure_threshold,
+            metrics=metrics,
+        )
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -870,12 +881,18 @@ def create_app(
             ),
         )
         telemetry.start()
+        if auth_probe is not None:
+            auth_probe.start()
         log_info(
             "bridge.started",
             warm_sessions=resolved_settings.warm_session_count(),
             max_concurrency=resolved_settings.max_concurrency,
             detached_cleanup=resolved_settings.detached_cleanup,
             telemetry=telemetry.enabled,
+            auth_probe_seconds=resolved_settings.auth_probe_seconds or None,
+            auth_failure_threshold=(
+                resolved_settings.auth_failure_threshold if auth_probe is not None else None
+            ),
             reasoning_effort=resolved_settings.reasoning_effort,
             trace_payloads=resolved_settings.trace_payloads,
             trace_payload_file=(
@@ -887,6 +904,10 @@ def create_app(
         try:
             yield
         finally:
+            if auth_probe is not None:
+                # Closed before the pool and reaper so a probe mid-run still
+                # finds them alive for its cleanup.
+                await auth_probe.aclose()
             await pool.aclose()
             await reaper.drain()
             await telemetry.close()
@@ -933,6 +954,7 @@ def create_app(
     application.state.reaper = reaper
     application.state.quarantine = quarantine
     application.state.telemetry = telemetry
+    application.state.auth_probe = auth_probe
     application.state.tool_catalog_cache = tool_catalog_cache
     application.state.native_tools = native_tools
     if resolved_settings.native_tool_calls:
@@ -1076,7 +1098,10 @@ def create_app(
         summary="Check bridge health",
     )
     async def health() -> HealthResponse:
-        return HealthResponse(status="ok")
+        return HealthResponse(
+            status="ok",
+            auth="unknown" if auth_probe is None else auth_probe.status,
+        )
 
     @application.get(
         "/version",
@@ -1344,6 +1369,24 @@ def create_app(
             log_warning("chat.rejected", status=rejection.status_code, phase="options")
             return rejection
 
+        if auth_probe is not None and auth_probe.failing:
+            # Every doomed request pays for a full Droid spawn before failing,
+            # so the probe gate turns an auth outage into one cheap rejection.
+            auth_probe.suspect()
+            request.state.telemetry_error_type = "factory_auth_error"
+            log_warning(
+                "chat.rejected",
+                status=503,
+                phase="auth_probe",
+                consecutive=auth_probe.consecutive_failures,
+            )
+            return _error_response(
+                "The bridge's Factory key is failing auth probes. "
+                "Retry after the key is rotated; see the auth field on /health.",
+                503,
+                "factory_auth_error",
+            )
+
         reasoning_effort = _effective_reasoning_effort(payload, resolved_settings)
         try:
             reasoning_effort = normalize_reasoning_effort(reasoning_effort)
@@ -1607,6 +1650,22 @@ def create_app(
                 }:
                     sessions.remember(started_stream_session, requested_key)
 
+            def record_stream_completion(empty: bool) -> None:
+                if empty:
+                    metrics.increment_empty_completions()
+                    log_warning("chat.empty_completion", stream=True, model=payload.model)
+                    if auth_probe is not None:
+                        auth_probe.suspect()
+                elif auth_probe is not None:
+                    auth_probe.record_success()
+
+            def note_stream_failure(model: str, exc: RunnerError) -> None:
+                note_runner_failure(model, exc)
+                if exc.error_type == "factory_auth_error":
+                    request.state.telemetry_error_type = exc.error_type
+                    if auth_probe is not None:
+                        auth_probe.suspect()
+
             event_stream = _stream_completion(
                 request_id=request_id,
                 created=created,
@@ -1618,13 +1677,14 @@ def create_app(
                 metrics=metrics,
                 request_started_at=request_started_at,
                 outcome_callback=record_stream_outcome,
+                completion_callback=record_stream_completion,
                 include_usage=bool(payload.stream_options and payload.stream_options.include_usage),
                 stop_sequences=payload.stop_sequences,
                 emit_status=payload.factory_droid_status,
                 session_callback=record_started_session,
                 expose_session=resolved_settings.session_continuity,
                 structured=structured,
-                failure_callback=note_runner_failure,
+                failure_callback=note_stream_failure,
                 drain_seconds=resolved_settings.tool_call_drain_seconds,
                 trace_event=payload_tracer.trace,
             )
@@ -1652,6 +1712,7 @@ def create_app(
         total_usage = Usage()
         started_session: str | None = None
         retry_reason_in_flight: ModelOutputRetryReason | None = None
+        empty_choices = 0
         try:
             async with lease:
                 # Choices run one after another so n completions never exceed the
@@ -1713,7 +1774,21 @@ def create_app(
                                         "refailed",
                                         attempt=attempt,
                                     )
+                                # Abandoned requests must stay countable: issue
+                                # #125 had a client-abort outage read as a gap
+                                # where no request ever arrived.
                                 request.state.telemetry_error_type = "client_disconnected"
+                                log_warning(
+                                    "chat.cancelled",
+                                    stream=False,
+                                    status=499,
+                                    model=payload.model,
+                                    choices=payload.n,
+                                    elapsed_ms=timeline.total_ms,
+                                    queue_ms=timeline.phases.get("queue_ms"),
+                                    warm=attempt_request.warm_session is not None,
+                                    warm_age_ms=attempt_warm_age_ms,
+                                )
                                 return _error_response(
                                     "Client disconnected.",
                                     499,
@@ -1806,7 +1881,25 @@ def create_app(
                         sessions.remember(completed_result.session_id, requested_key)
                         started_session = completed_result.session_id
                     total_usage = _add_usage(total_usage, completed_result.usage)
-                    choices.append(_choice_dict(completed_result, index))
+                    choice = _choice_dict(completed_result, index)
+                    choices.append(choice)
+                    choice_message = cast("dict[str, Any]", choice["message"])
+                    if (
+                        choice_message["content"] is None
+                        and not choice_message.get("tool_calls")
+                        and not completed_result.stopped
+                    ):
+                        # A dead Factory key answers with empty 200s before it
+                        # answers with errors (issue #122), so an empty body
+                        # has to be its own loud event instead of a silent one.
+                        empty_choices += 1
+                        metrics.increment_empty_completions()
+                        log_warning(
+                            "chat.empty_completion",
+                            stream=False,
+                            model=payload.model,
+                            choice=index,
+                        )
         except ProtocolError as exc:
             request.state.telemetry_error_type = "factory_protocol_error"
             if retry_reason_in_flight is not None:
@@ -1828,8 +1921,11 @@ def create_app(
                 status=exc.status_code,
                 error_type=exc.error_type,
                 model=payload.model,
+                reason=str(exc),
             )
             note_runner_failure(payload.model, exc)
+            if auth_probe is not None and exc.error_type == "factory_auth_error":
+                auth_probe.suspect()
             return _error_response(str(exc), exc.status_code, exc.error_type)
         finally:
             try:
@@ -1840,6 +1936,12 @@ def create_app(
                         session_use.release()
                 finally:
                     release_native_tools()
+
+        if auth_probe is not None:
+            if empty_choices:
+                auth_probe.suspect()
+            else:
+                auth_probe.record_success()
 
         log_info(
             "chat.completed",
@@ -2297,6 +2399,7 @@ async def _stream_completion(
     metrics: BridgeMetrics | None = None,
     request_started_at: float | None = None,
     outcome_callback: Callable[[str], None] | None = None,
+    completion_callback: Callable[[bool], None] | None = None,
     include_usage: bool = False,
     stop_sequences: tuple[str, ...] = (),
     emit_status: bool = False,
@@ -2587,17 +2690,34 @@ async def _stream_completion(
                 stream=True,
                 error_type=exc.error_type,
                 model=model,
+                reason=str(exc),
             )
             if failure_callback is not None:
                 failure_callback(model, exc)
             yield _sse(_error_body(str(exc), exc.error_type))
         except asyncio.CancelledError:
-            log_warning("chat.cancelled", stream=True)
+            timeline = current_timeline()
+            log_warning(
+                "chat.cancelled",
+                stream=True,
+                model=model,
+                elapsed_ms=timeline.total_ms if timeline is not None else None,
+                queue_ms=timeline.phases.get("queue_ms") if timeline is not None else None,
+                warm=run_request.warm_session is not None,
+                warm_age_ms=warm_age_ms,
+            )
             if outcome_callback is not None:
                 outcome_callback("cancelled")
             raise
         if outcome_callback is not None:
             outcome_callback(outcome)
+        if outcome == "success" and completion_callback is not None:
+            completion_callback(
+                not saw_text
+                and not saw_tool_call
+                and structured is None
+                and not stop_buffer.triggered
+            )
         _log_stream_outcome(outcome, model=model, usage=usage, tool_calls=tool_call_index)
         yield "data: [DONE]\n\n"
 
@@ -3173,6 +3293,7 @@ def _telemetry_error_category(
         categories = {
             "authentication_error": "authentication",
             "client_disconnected": "cancelled",
+            "factory_auth_error": "factory_auth",
             "factory_droid_timeout": "timeout",
             "factory_incomplete_response": "incomplete_response",
             "factory_protocol_error": "protocol",

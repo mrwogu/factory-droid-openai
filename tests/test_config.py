@@ -32,6 +32,8 @@ _ENVIRONMENT_KEYS = (
     "FACTORY_DROID_OPENAI_MCP_SETTLE_SECONDS",
     "FACTORY_DROID_OPENAI_MODEL_CACHE_SECONDS",
     "FACTORY_DROID_OPENAI_MODEL_QUARANTINE_SECONDS",
+    "FACTORY_DROID_OPENAI_AUTH_PROBE_SECONDS",
+    "FACTORY_DROID_OPENAI_AUTH_FAILURE_THRESHOLD",
     "FACTORY_DROID_OPENAI_RETRY_AFTER_SECONDS",
     "FACTORY_DROID_OPENAI_PROCESS_GRACE_SECONDS",
     "FACTORY_DROID_OPENAI_CLEANUP_TIMEOUT_SECONDS",
@@ -143,6 +145,19 @@ def test_settings_normalize_reasoning_effort_on_construction() -> None:
 
     with pytest.raises(ValueError, match="reasoning_effort must be one of"):
         Settings(reasoning_effort="extreme")
+
+
+def test_settings_validate_auth_probe_options() -> None:
+    assert Settings().auth_probe_seconds == 0.0
+    assert Settings().auth_failure_threshold == 3
+    assert Settings(auth_probe_seconds=300.0).auth_probe_seconds == 300.0
+
+    with pytest.raises(ValueError, match="auth_probe_seconds must be zero or greater"):
+        Settings(auth_probe_seconds=-1.0)
+    with pytest.raises(ValueError, match="auth_probe_seconds must be zero or greater"):
+        Settings(auth_probe_seconds=float("inf"))
+    with pytest.raises(ValueError, match="auth_failure_threshold must be at least 1"):
+        Settings(auth_failure_threshold=0)
 
 
 @pytest.mark.parametrize(
@@ -338,6 +353,8 @@ def test_settings_from_env_reads_all_overrides(
     monkeypatch.setenv("FACTORY_DROID_OPENAI_MCP_SETTLE_SECONDS", "1.5")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_MODEL_CACHE_SECONDS", "0")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_MODEL_QUARANTINE_SECONDS", "120")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_AUTH_PROBE_SECONDS", "45")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_AUTH_FAILURE_THRESHOLD", "5")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_RETRY_AFTER_SECONDS", "3")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_PROCESS_GRACE_SECONDS", "2.5")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_CLEANUP_TIMEOUT_SECONDS", "6.5")
@@ -369,6 +386,8 @@ def test_settings_from_env_reads_all_overrides(
         mcp_settle_seconds=1.5,
         model_cache_seconds=0.0,
         model_quarantine_seconds=120.0,
+        auth_probe_seconds=45.0,
+        auth_failure_threshold=5,
         retry_after_seconds=3,
         process_grace_seconds=2.5,
         cleanup_timeout_seconds=6.5,
@@ -433,6 +452,10 @@ def test_settings_from_env_reads_all_overrides(
         ("FACTORY_DROID_OPENAI_MCP_SETTLE_SECONDS", "-1", "must be zero or greater"),
         ("FACTORY_DROID_OPENAI_MODEL_CACHE_SECONDS", "inf", "must be zero or greater"),
         ("FACTORY_DROID_OPENAI_MODEL_QUARANTINE_SECONDS", "-1", "must be zero or greater"),
+        ("FACTORY_DROID_OPENAI_AUTH_PROBE_SECONDS", "-1", "must be zero or greater"),
+        ("FACTORY_DROID_OPENAI_AUTH_PROBE_SECONDS", "invalid", "must be a number"),
+        ("FACTORY_DROID_OPENAI_AUTH_FAILURE_THRESHOLD", "0", "must be greater than zero"),
+        ("FACTORY_DROID_OPENAI_AUTH_FAILURE_THRESHOLD", "invalid", "must be an integer"),
         (
             "FACTORY_DROID_OPENAI_RETRY_AFTER_SECONDS",
             "0",

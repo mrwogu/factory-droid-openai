@@ -1,0 +1,7 @@
+{"message":"Request failed with status code 401","error_type":"Error"}
+{"message":"Invalid API key","error_type":"Error"}
+{"message":"API key is invalid","error_type":"Error"}
+{"message":"API key has expired","error_type":"Error"}
+{"message":"Expired API key","error_type":"Error"}
+{"message":"403 Forbidden","error_type":"Error"}
+{"message":"Authentication failed","error_type":"Error"}

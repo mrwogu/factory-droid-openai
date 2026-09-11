@@ -78,6 +78,17 @@ _MODEL_DENIED_PATTERN = re.compile(
 )
 # Droid emits this generic message for a transient upstream connection blip.
 _TRANSIENT_CONNECTION_PATTERN = re.compile(r"connection error\.?", re.IGNORECASE)
+# A rejected or revoked Factory key surfaces in Droid's error text, never as a
+# dedicated code, so the wording is what separates an auth outage from a
+# bridge failure (issue #122: a dead key hid behind three unrelated shapes).
+_AUTH_FAILURE_PATTERN = re.compile(
+    r"(?:unauthorized|forbidden|"
+    r"(?:invalid|revoked|expired|not found) api key|"
+    r"api key (?:is |has )?(?:invalid|revoked|expired|not found)|"
+    r"authentication (?:failed|error)|invalid authentication|"
+    r"status code (?:401|403)\b|\b(?:401|403)\b)",
+    re.IGNORECASE,
+)
 # Droid keeps two of its own meta tools callable whatever a session disables:
 # exit-spec-mode, and the loader that would fetch a deferred tool. Neither
 # touches the machine, and Droid refuses to run them in a session with every
@@ -1108,6 +1119,9 @@ def sdk_error(exc: DroidClientError, *, model: str | None = None) -> RunnerError
     denied = _model_denied_error(message, model=model)
     if denied is not None:
         return denied
+    auth = _auth_failure_error(message)
+    if auth is not None:
+        return auth
     return RunnerError(
         f"Factory Droid SDK failed: {message}",
         error_type="factory_droid_sdk_error",
@@ -1124,6 +1138,9 @@ def _error_event_failure(event: ErrorEvent, *, model: str | None) -> RunnerError
     denied = _model_denied_error(message, model=model)
     if denied is not None:
         return denied
+    auth = _auth_failure_error(message)
+    if auth is not None:
+        return auth
     if _TRANSIENT_CONNECTION_PATTERN.fullmatch(message.strip()):
         return RunnerError(
             message,
@@ -1144,6 +1161,22 @@ def _model_denied_error(message: str, *, model: str | None) -> RunnerError | Non
         f"{subject} is not available for this Factory account: {message}",
         status_code=404,
         error_type="model_not_found",
+    )
+
+
+def _auth_failure_error(message: str) -> RunnerError | None:
+    """Classify auth-shaped Droid failures so a dead key reads as one thing.
+
+    The auth probe and the request gate key off this error type, so the
+    wording check stays conservative: only messages Droid itself attributes
+    to the Factory credential count as auth failures.
+    """
+    if not _AUTH_FAILURE_PATTERN.search(message):
+        return None
+    return RunnerError(
+        f"Factory rejected the bridge's API key: {message}",
+        status_code=503,
+        error_type="factory_auth_error",
     )
 
 

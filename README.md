@@ -1380,6 +1380,8 @@ error types.
 | `FACTORY_DROID_OPENAI_REASONING_EFFORT` | unset | Reasoning effort forced on every request |
 | `FACTORY_DROID_OPENAI_MODEL_CACHE_SECONDS` | `300` | `GET /v1/models` catalog cache lifetime |
 | `FACTORY_DROID_OPENAI_MODEL_QUARANTINE_SECONDS` | `900` | How long a refused model stays withheld |
+| `FACTORY_DROID_OPENAI_AUTH_PROBE_SECONDS` | `0` | How often one minimal Droid exec checks the Factory key; each probe is a real model turn, so set `300` to catch a dead key within minutes instead of hours. `0` disables the probe, its `auth` health field, and the auth gate |
+| `FACTORY_DROID_OPENAI_AUTH_FAILURE_THRESHOLD` | `3` | Consecutive probe failures before chat requests fail fast with `503 factory_auth_error` |
 | `FACTORY_DROID_OPENAI_MCP_SETTLE_SECONDS` | `0` | MCP initialization window before tool discovery |
 | `FACTORY_DROID_OPENAI_LOG_LEVEL` | `info` | Bridge and Uvicorn log level |
 | `FACTORY_DROID_OPENAI_LOG_FORMAT` | `text` | Bridge log rendering: `text` or `json` |
@@ -1501,6 +1503,9 @@ surface.
 | `factory_droid_openai_warm_session_misses_total` | Requests that had to start their own session |
 | `factory_droid_openai_warm_session_failures_total` | Failed warm-up attempts |
 | `factory_droid_openai_pending_reaps` | Droid teardowns still running in the background |
+| `factory_droid_openai_empty_completions_total` | Completions that returned no text or tool calls |
+| `factory_droid_openai_auth_probe_successes_total` | Auth probes that completed with assistant text and a terminal event |
+| `factory_droid_openai_auth_probe_failures_total` | Auth probes that failed, timed out, or returned no complete answer |
 
 `forced_kills_total` counts processes that had to be killed with a signal
 because they did not exit within `FACTORY_DROID_OPENAI_PROCESS_GRACE_SECONDS`.
@@ -1587,9 +1592,9 @@ factory-droid-openai --log-level debug --no-access-log
 
 | Level | Content |
 |---|---|
-| `warning` | Rejections, failures, degraded model discovery, quarantined models, forced process kills |
+| `warning` | Rejections, failures, cancelled requests (`chat.cancelled`), empty completions (`chat.empty_completion`), auth probe failures (`auth.probe_failed`), degraded model discovery, quarantined models, forced process kills |
 | `info` | One `chat.completed` summary per request with phase timings and token usage |
-| `debug` | Per-phase events: prompt built, admission, warm-session hit, retune or miss, Droid startup, session ready, first token, turn complete, cleanup |
+| `debug` | Per-phase events: prompt built, admission, warm-session hit, retune or miss, Droid startup, session ready, first token, turn complete, cleanup, successful auth probes |
 | `trace` | One line per Droid SDK event kind |
 
 ```text
@@ -1806,6 +1811,23 @@ export FACTORY_DROID_PATH="$HOME/.local/bin/droid"
 An HTTP `401` means `FACTORY_DROID_OPENAI_API_KEY` is configured and the
 request token is missing or incorrect. This is separate from Factory account
 authentication used by the Droid CLI.
+
+### Factory key failing auth probes
+
+```text
+503 factory_auth_error
+```
+
+The bridge's Factory key (the one the Droid CLI authenticates with) is being
+rejected server-side, or it answers with empty completions. With
+`FACTORY_DROID_OPENAI_AUTH_PROBE_SECONDS=300` the bridge runs one minimal
+Droid exec with that key every five minutes: a failing probe logs
+`auth.probe_failed` and flips the `auth` field on `/health` to `degraded`,
+and after `FACTORY_DROID_OPENAI_AUTH_FAILURE_THRESHOLD` consecutive failures
+chat requests fail fast with `503` instead of each paying for a Droid spawn
+that cannot answer. Rotate the key; any request that completes with content
+clears the gate immediately. The probe is off until
+`FACTORY_DROID_OPENAI_AUTH_PROBE_SECONDS` is set.
 
 ### Factory-native tool blocked
 

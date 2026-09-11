@@ -7,6 +7,7 @@ import re
 import sys
 import textwrap
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
@@ -68,7 +69,6 @@ from factory_droid_openai.runner import (
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
-    from pathlib import Path
     from typing import Any
 
 
@@ -1741,6 +1741,48 @@ def test_runner_maps_invalid_model_id_as_unavailable() -> None:
     assert error.status_code == 404
     assert error.error_type == "model_not_found"
     assert "not-a-live-model" in str(error)
+
+
+def _recorded_auth_error_events() -> list[ErrorEvent]:
+    path = Path(__file__).parent / "fixtures" / "runner" / "auth-failures.jsonl"
+    records = [
+        cast("dict[str, str]", json.loads(line))
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    return [ErrorEvent(record["message"], record["error_type"]) for record in records]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event",
+    _recorded_auth_error_events(),
+    ids=lambda event: event.message,
+)
+async def test_runner_maps_auth_failures_as_auth_errors(
+    tmp_path: Path,
+    event: ErrorEvent,
+) -> None:
+    client = FakeClient([event])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    with pytest.raises(RunnerError, match="Factory rejected the bridge's API key") as error:
+        _ = [event async for event in runner.run(_request())]
+
+    assert error.value.status_code == 503
+    assert error.value.error_type == "factory_auth_error"
+
+
+def test_sdk_error_classifies_auth_failures() -> None:
+    error = sdk_error(DroidClientError("Unauthorized: API key revoked"))
+
+    assert error.status_code == 503
+    assert error.error_type == "factory_auth_error"
+    assert "API key revoked" in str(error)
 
 
 @pytest.mark.asyncio

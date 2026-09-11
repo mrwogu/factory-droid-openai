@@ -58,6 +58,9 @@ class BridgeMetrics:
         self._warm_misses = 0
         self._warm_failures = 0
         self._pending_reaps = 0
+        self._empty_completions = 0
+        self._auth_probe_successes = 0
+        self._auth_probe_failures = 0
         self._telemetry_requests: Counter[tuple[str, str, str]] = Counter()
         self._telemetry_request_duration_seconds: dict[tuple[str, str, str], float] = {}
         self._telemetry_features: Counter[str] = Counter()
@@ -151,6 +154,18 @@ class BridgeMetrics:
         with self._lock:
             self._pending_reaps = count
 
+    def increment_empty_completions(self) -> None:
+        with self._lock:
+            self._empty_completions += 1
+
+    def increment_auth_probe_successes(self) -> None:
+        with self._lock:
+            self._auth_probe_successes += 1
+
+    def increment_auth_probe_failures(self) -> None:
+        with self._lock:
+            self._auth_probe_failures += 1
+
     def telemetry_snapshot(self) -> MetricsSnapshot:
         with self._lock:
             requests = tuple(
@@ -176,6 +191,8 @@ class BridgeMetrics:
                         "warm_miss": self._warm_misses,
                         "warm_retune": self._warm_retunes.total(),
                         "warm_failure": self._warm_failures,
+                        "empty_completion": self._empty_completions,
+                        "auth_probe_failure": self._auth_probe_failures,
                     }.items()
                 )
             )
@@ -212,6 +229,9 @@ class BridgeMetrics:
                 "warm_misses": self._warm_misses,
                 "warm_failures": self._warm_failures,
                 "pending_reaps": self._pending_reaps,
+                "empty_completions": self._empty_completions,
+                "auth_probe_successes": self._auth_probe_successes,
+                "auth_probe_failures": self._auth_probe_failures,
             }
 
         lines = [
@@ -273,5 +293,11 @@ class BridgeMetrics:
             f"factory_droid_openai_warm_session_failures_total {values['warm_failures']}",
             "# TYPE factory_droid_openai_pending_reaps gauge",
             f"factory_droid_openai_pending_reaps {values['pending_reaps']}",
+            "# TYPE factory_droid_openai_empty_completions_total counter",
+            f"factory_droid_openai_empty_completions_total {values['empty_completions']}",
+            "# TYPE factory_droid_openai_auth_probe_successes_total counter",
+            (f"factory_droid_openai_auth_probe_successes_total {values['auth_probe_successes']}"),
+            "# TYPE factory_droid_openai_auth_probe_failures_total counter",
+            f"factory_droid_openai_auth_probe_failures_total {values['auth_probe_failures']}",
         ]
         return "\n".join(lines) + "\n"
