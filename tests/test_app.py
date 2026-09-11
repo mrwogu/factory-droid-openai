@@ -236,6 +236,42 @@ class RetryRunner(FakeRunner):
             self.closed = True
 
 
+class TruncationRetryRunner(FakeRunner):
+    """Serves one truncated attempt, then a configurable second attempt."""
+
+    def __init__(
+        self,
+        *,
+        retry_events: list[RunEvent] | None = None,
+        retry_error: RunnerError | None = None,
+        retry_gate: asyncio.Event | None = None,
+    ) -> None:
+        super().__init__([])
+        self.first = _recorded_events("retry/truncated-tool.jsonl")
+        self.retry_events = retry_events
+        self.retry_error = retry_error
+        self.retry_gate = retry_gate
+
+    async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
+        self.requests.append(request)
+        if request.warm_session is not None:
+            request.warm_session.consumed = True
+        try:
+            if len(self.requests) == 1:
+                for event in self.first:
+                    yield event
+            elif self.retry_gate is not None:
+                self.retry_gate.set()
+                await asyncio.Event().wait()
+            elif self.retry_error is not None:
+                raise self.retry_error
+            elif self.retry_events is not None:
+                for event in self.retry_events:
+                    yield event
+        finally:
+            self.closed = True
+
+
 class BlockingRunner(FakeRunner):
     def __init__(self) -> None:
         super().__init__([])
@@ -357,6 +393,93 @@ def _client(app: Any) -> httpx.AsyncClient:
         transport=httpx.ASGITransport(app=app),
         base_url="http://test",
     )
+
+
+def _warning_records(log_stream: io.StringIO) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in log_stream.getvalue().splitlines() if line.strip()]
+
+
+def _weather_payload(**overrides: object) -> dict[str, object]:
+    return _payload(
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "description": "Read the weather.",
+                    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+                },
+            }
+        ],
+        **overrides,
+    )
+
+
+def _integer_answer_payload() -> dict[str, object]:
+    return _payload(
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "answer",
+                "schema": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "integer"}},
+                    "required": ["answer"],
+                },
+            },
+        }
+    )
+
+
+def _single_retry_outcome(records: list[dict[str, Any]]) -> dict[str, Any]:
+    outcomes = [record for record in records if record["event"] == "chat.retry_outcome"]
+    assert len(outcomes) == 1
+    return outcomes[0]
+
+
+def _chat_scope(body: bytes) -> dict[str, Any]:
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/chat/completions",
+        "raw_path": b"/v1/chat/completions",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"host", b"test"),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode()),
+        ],
+        "client": ("127.0.0.1", 4242),
+        "server": ("test", 80),
+    }
+
+
+def _request_then_disconnect_receive(body: bytes, gate: asyncio.Event) -> Any:
+    delivered = False
+
+    async def receive() -> Any:
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        await gate.wait()
+        return {"type": "http.disconnect"}
+
+    return receive
+
+
+async def _run_chat_request(app: Any, *, body: bytes, receive: Any) -> list[Any]:
+    sent: list[Any] = []
+
+    async def send(message: Any) -> None:
+        sent.append(message)
+
+    await app(_chat_scope(body), receive, send)
+    return sent
 
 
 @pytest.mark.asyncio
@@ -1222,7 +1345,9 @@ async def test_truncated_payload_after_a_tool_call_keeps_tool_calls_finish(
     assert len(attempts) == 1
     assert attempts[0]["stream"] is stream
     assert attempts[0]["will_retry"] is False
+    assert attempts[0]["has_tool_calls"] is True
     assert not any(record["event"] == "chat.truncated" for record in records)
+    assert not any(record["event"] == "chat.retry_outcome" for record in records)
     request_metrics = app.state.metrics.telemetry_snapshot().requests
     assert len(request_metrics) == 1
     assert request_metrics[0].outcome == "success"
@@ -2154,6 +2279,8 @@ async def test_metrics_cover_latency_ttft_overload_and_payload_rejections(
 
 @pytest.mark.asyncio
 async def test_streaming_runner_error_uses_sse_error_shape(tmp_path: Path) -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
     runner = FakeRunner(
         [],
         error=RunnerError(
@@ -2164,7 +2291,7 @@ async def test_streaming_runner_error_uses_sse_error_shape(tmp_path: Path) -> No
     async with _client(_app(tmp_path, runner)) as client:
         response = await client.post(
             "/v1/chat/completions",
-            json=_payload(stream=True),
+            json=_payload(model="gpt-test", stream=True),
         )
         metrics = await client.get("/metrics")
 
@@ -2176,10 +2303,16 @@ async def test_streaming_runner_error_uses_sse_error_shape(tmp_path: Path) -> No
     assert events[-1] == "[DONE]"
     assert json.loads(events[-2])["error"]["type"] == "factory_droid_sdk_error"
     assert 'outcome="error",status="200"} 1' in metrics.text
+    failed = next(
+        record for record in _warning_records(log_stream) if record["event"] == "chat.failed"
+    )
+    assert failed["model"] == "gpt-test"
 
 
 @pytest.mark.asyncio
 async def test_streaming_protocol_error_uses_sse_error_shape(tmp_path: Path) -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
     runner = FakeRunner(
         [
             TextDelta(
@@ -2189,6 +2322,7 @@ async def test_streaming_protocol_error_uses_sse_error_shape(tmp_path: Path) -> 
         ]
     )
     payload = _payload(
+        model="gpt-test",
         stream=True,
         tools=[
             {
@@ -2206,6 +2340,10 @@ async def test_streaming_protocol_error_uses_sse_error_shape(tmp_path: Path) -> 
         if line.startswith('data: {"error"')
     )
     assert error_event["error"]["type"] == "factory_protocol_error"
+    failed = next(
+        record for record in _warning_records(log_stream) if record["event"] == "chat.failed"
+    )
+    assert failed["model"] == "gpt-test"
 
 
 @pytest.mark.asyncio
@@ -2476,6 +2614,103 @@ async def test_non_streaming_malformed_tool_call_retries_same_session(tmp_path: 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fixture", "payload", "reason", "expected_status"),
+    [
+        ("retry/malformed-tool.jsonl", _weather_payload(), "malformed_tool_call", 200),
+        ("retry/valid-tool.jsonl", _payload(), "tool_without_catalog", 502),
+        (
+            "retry/invalid-structured-output.jsonl",
+            _integer_answer_payload(),
+            "structured_output",
+            502,
+        ),
+    ],
+)
+async def test_non_streaming_retry_without_session_logs_not_attempted(
+    tmp_path: Path,
+    fixture: str,
+    payload: dict[str, object],
+    reason: str,
+    expected_status: int,
+) -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
+    runner = RetryRunner(
+        [fixture],
+        omit_session_started_attempts=frozenset({0}),
+    )
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == expected_status
+    assert len(runner.requests) == 1
+    records = _warning_records(log_stream)
+    outcome = _single_retry_outcome(records)
+    assert outcome["reason"] == reason
+    assert outcome["outcome"] == "not_attempted"
+    assert outcome["attempt"] == 0
+    assert not any(record["event"] == "chat.retry" for record in records)
+
+
+@pytest.mark.asyncio
+async def test_retry_refailed_when_protocol_error_on_retry(tmp_path: Path) -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
+    runner = TruncationRetryRunner(retry_events=[TextDelta("\ud800"), RunComplete(Usage())])
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=_weather_payload())
+
+    assert response.status_code == 502
+    outcome = _single_retry_outcome(_warning_records(log_stream))
+    assert outcome["reason"] == "truncated_tool_call"
+    assert outcome["outcome"] == "refailed"
+    assert outcome["attempt"] == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_refailed_when_runner_error_on_retry(tmp_path: Path) -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
+    runner = TruncationRetryRunner(
+        retry_error=RunnerError("boom", status_code=503, error_type="factory_droid_sdk_error")
+    )
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=_weather_payload())
+
+    assert response.status_code == 503
+    outcome = _single_retry_outcome(_warning_records(log_stream))
+    assert outcome["reason"] == "truncated_tool_call"
+    assert outcome["outcome"] == "refailed"
+    assert outcome["attempt"] == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_refailed_when_client_disconnects_on_retry(tmp_path: Path) -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
+    retry_gate = asyncio.Event()
+    runner = TruncationRetryRunner(retry_gate=retry_gate)
+    app = _app(tmp_path, runner)
+    body = json.dumps(_weather_payload()).encode()
+
+    sent = await _run_chat_request(
+        app,
+        body=body,
+        receive=_request_then_disconnect_receive(body, retry_gate),
+    )
+
+    assert sent[0]["status"] == 499
+    outcome = _single_retry_outcome(_warning_records(log_stream))
+    assert outcome["reason"] == "truncated_tool_call"
+    assert outcome["outcome"] == "refailed"
+    assert outcome["attempt"] == 1
+
+
+@pytest.mark.asyncio
 async def test_non_streaming_truncated_tool_call_retries_fresh_session(tmp_path: Path) -> None:
     log_stream = io.StringIO()
     logs.configure_logging(level="warning", log_format="json", stream=log_stream)
@@ -2543,6 +2778,13 @@ async def test_non_streaming_truncated_tool_call_retries_fresh_session(tmp_path:
     retries = [record for record in records if record["event"] == "chat.retry"]
     assert len(retries) == 1
     assert retries[0]["reason"] == "truncated_tool_call"
+    assert retries[0]["model"] == "factory-droid"
+    assert retries[0]["warm"] is True
+    outcomes = [record for record in records if record["event"] == "chat.retry_outcome"]
+    assert len(outcomes) == 1
+    assert outcomes[0]["reason"] == "truncated_tool_call"
+    assert outcomes[0]["outcome"] == "recovered"
+    assert outcomes[0]["attempt"] == 1
     assert not any(record["event"] == "chat.truncated" for record in records)
 
 
@@ -2579,6 +2821,11 @@ async def test_repeated_truncated_tool_call_logs_final_outcome(tmp_path: Path) -
     assert final[0]["warm"] is False
     assert final[0]["output_tokens"] == 0
     assert final[0]["will_retry"] is False
+    outcomes = [record for record in records if record["event"] == "chat.retry_outcome"]
+    assert len(outcomes) == 1
+    assert outcomes[0]["reason"] == "truncated_tool_call"
+    assert outcomes[0]["outcome"] == "refailed"
+    assert outcomes[0]["attempt"] == 1
 
 
 @pytest.mark.asyncio
@@ -2662,20 +2909,42 @@ async def test_truncated_phantom_tool_keeps_no_tool_retry_for_structured_output(
 
 @pytest.mark.asyncio
 async def test_non_streaming_tool_without_catalog_retries_same_session(tmp_path: Path) -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
     runner = RetryRunner(
         [
             "retry/valid-tool.jsonl",
             "retry/plain-answer.jsonl",
         ]
     )
-    async with _client(_app(tmp_path, runner)) as client:
+    app = _app(tmp_path, runner)
+    key = SessionKey(model_id=None, reasoning_effort=None)
+    warm = WarmSession(
+        key=key,
+        client=cast("Any", object()),
+        transport=None,
+        session_id="warm-session",
+        created_at=asyncio.get_running_loop().time() - 1.0,
+    )
+    app.state.pool.note(key)
+    app.state.pool.offer(warm)
+
+    async with _client(app) as client:
         response = await client.post("/v1/chat/completions", json=_payload())
 
     assert response.status_code == 200
     assert response.json()["choices"][0]["message"]["content"] == "Direct answer"
     assert len(runner.requests) == 2
+    assert runner.requests[0].warm_session is warm
     assert runner.requests[1].session_id == "replay-session"
     assert "no tools are available" in runner.requests[1].prompt
+    records = _warning_records(log_stream)
+    retry = next(record for record in records if record["event"] == "chat.retry")
+    assert retry["warm"] is True
+    assert retry["warm_age_ms"] >= 1000.0
+    outcome = _single_retry_outcome(records)
+    assert outcome["reason"] == "tool_without_catalog"
+    assert outcome["outcome"] == "recovered"
 
 
 @pytest.mark.asyncio
@@ -5386,42 +5655,11 @@ async def test_non_streaming_request_answers_499_when_the_client_disconnects(
     runner = BlockingRunner()
     app = _app(tmp_path, runner)
     body = json.dumps(_payload()).encode()
-    delivered = False
 
-    async def receive() -> Any:
-        nonlocal delivered
-        if not delivered:
-            delivered = True
-            return {"type": "http.request", "body": body, "more_body": False}
-        await runner.started.wait()
-        return {"type": "http.disconnect"}
-
-    sent: list[Any] = []
-
-    async def send(message: Any) -> None:
-        sent.append(message)
-
-    await app(
-        {
-            "type": "http",
-            "asgi": {"version": "3.0", "spec_version": "2.4"},
-            "http_version": "1.1",
-            "method": "POST",
-            "scheme": "http",
-            "path": "/v1/chat/completions",
-            "raw_path": b"/v1/chat/completions",
-            "query_string": b"",
-            "root_path": "",
-            "headers": [
-                (b"host", b"test"),
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(body)).encode()),
-            ],
-            "client": ("127.0.0.1", 4242),
-            "server": ("test", 80),
-        },
-        receive,
-        send,
+    sent = await _run_chat_request(
+        app,
+        body=body,
+        receive=_request_then_disconnect_receive(body, runner.started),
     )
 
     assert sent[0]["status"] == 499
@@ -5599,22 +5837,6 @@ def _native_settings(tmp_path: Path) -> Settings:
         workdir=tmp_path,
         timeout_seconds=30.0,
         native_tool_calls=True,
-    )
-
-
-def _weather_payload(**overrides: object) -> dict[str, object]:
-    return _payload(
-        tools=[
-            {
-                "type": "function",
-                "function": {
-                    "name": "weather",
-                    "description": "Read the weather.",
-                    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
-                },
-            }
-        ],
-        **overrides,
     )
 
 
