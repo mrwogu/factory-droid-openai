@@ -105,6 +105,7 @@ ModelOutputRetryReason = Literal[
     "tool_without_catalog",
     "truncated_tool_call",
 ]
+RetryOutcome = Literal["recovered", "refailed", "not_attempted"]
 BearerCredentials = Annotated[
     HTTPAuthorizationCredentials | None,
     Security(HTTPBearer(auto_error=False)),
@@ -1650,6 +1651,7 @@ def create_app(
         choices: list[dict[str, Any]] = []
         total_usage = Usage()
         started_session: str | None = None
+        retry_reason_in_flight: ModelOutputRetryReason | None = None
         try:
             async with lease:
                 # Choices run one after another so n completions never exceed the
@@ -1664,6 +1666,8 @@ def create_app(
                     attempt_request = choice_request
                     result: CollectedCompletion | None = None
                     attempt = 0
+                    retry_in_flight = False
+                    retry_reason_in_flight = None
                     while True:
                         attempt_session_id: str | None = None
 
@@ -1699,6 +1703,12 @@ def create_app(
                                 raise
                         else:
                             if result is None:
+                                if retry_in_flight and retry_reason_in_flight is not None:
+                                    _log_retry_outcome(
+                                        retry_reason_in_flight,
+                                        "refailed",
+                                        attempt=attempt,
+                                    )
                                 request.state.telemetry_error_type = "client_disconnected"
                                 return _error_response(
                                     "Client disconnected.",
@@ -1744,12 +1754,28 @@ def create_app(
                                 has_tool_calls=bool(result.tool_calls),
                             )
                         if retry_request is None:
+                            if retry_in_flight and retry_reason_in_flight is not None:
+                                outcome: RetryOutcome = (
+                                    "refailed" if retry_reason is not None else "recovered"
+                                )
+                                _log_retry_outcome(
+                                    retry_reason_in_flight,
+                                    outcome,
+                                    attempt=attempt,
+                                )
+                            elif not retry_in_flight and retry_reason is not None:
+                                _log_retry_outcome(retry_reason, "not_attempted", attempt=attempt)
                             break
                         retry_reason = cast("ModelOutputRetryReason", retry_reason)
+                        retry_in_flight = True
+                        retry_reason_in_flight = retry_reason
                         log_warning(
                             "chat.retry",
                             stream=False,
                             reason=retry_reason,
+                            model=payload.model,
+                            warm=attempt_request.warm_session is not None,
+                            warm_age_ms=result.warm_age_ms if result is not None else None,
                         )
                         metrics.record_features((f"model_output_retry:{retry_reason}",))
                         if retry_request.session_id is not None:
@@ -1774,16 +1800,26 @@ def create_app(
                     choices.append(_choice_dict(completed_result, index))
         except ProtocolError as exc:
             request.state.telemetry_error_type = "factory_protocol_error"
+            if retry_reason_in_flight is not None:
+                _log_retry_outcome(retry_reason_in_flight, "refailed", attempt=1)
             log_warning(
                 "chat.failed",
                 status=502,
                 error_type="factory_protocol_error",
                 reason=str(exc),
+                model=payload.model,
             )
             return _error_response(str(exc), 502, "factory_protocol_error")
         except RunnerError as exc:
             request.state.telemetry_error_type = exc.error_type
-            log_warning("chat.failed", status=exc.status_code, error_type=exc.error_type)
+            if retry_reason_in_flight is not None:
+                _log_retry_outcome(retry_reason_in_flight, "refailed", attempt=1)
+            log_warning(
+                "chat.failed",
+                status=exc.status_code,
+                error_type=exc.error_type,
+                model=payload.model,
+            )
             note_runner_failure(payload.model, exc)
             return _error_response(str(exc), exc.status_code, exc.error_type)
         finally:
@@ -1902,6 +1938,20 @@ def _retryable_structured_output_error(exc: ProtocolError) -> bool:
             "Factory Droid returned invalid structured JSON output",
             "Factory Droid structured output violated the requested schema",
         )
+    )
+
+
+def _log_retry_outcome(
+    reason: ModelOutputRetryReason,
+    outcome: RetryOutcome,
+    *,
+    attempt: int,
+) -> None:
+    log_warning(
+        "chat.retry_outcome",
+        reason=reason,
+        outcome=outcome,
+        attempt=attempt,
     )
 
 
