@@ -1676,6 +1676,7 @@ def create_app(
                             attempt_session_id = started_id
 
                         retry_reason: ModelOutputRetryReason | None = None
+                        attempt_warm_age_ms = _warm_session_age_ms(attempt_request)
                         try:
                             result = await _collect_completion_or_disconnect(
                                 request=request,
@@ -1693,12 +1694,15 @@ def create_app(
                                 trace_choice=index,
                             )
                         except ProtocolError as exc:
-                            if (
-                                attempt == 0
-                                and attempt_session_id is not None
-                                and str(exc) == _TOOL_WITHOUT_CATALOG_ERROR
-                            ):
+                            if attempt == 0 and str(exc) == _TOOL_WITHOUT_CATALOG_ERROR:
                                 retry_reason = "tool_without_catalog"
+                                if attempt_session_id is None:
+                                    _log_retry_outcome(
+                                        retry_reason,
+                                        "not_attempted",
+                                        attempt=attempt,
+                                    )
+                                    raise
                             else:
                                 raise
                         else:
@@ -1723,12 +1727,15 @@ def create_app(
                                 try:
                                     _validate_structured_output(result.text, structured)
                                 except ProtocolError as exc:
-                                    if (
-                                        attempt == 0
-                                        and attempt_session_id is not None
-                                        and _retryable_structured_output_error(exc)
-                                    ):
+                                    if attempt == 0 and _retryable_structured_output_error(exc):
                                         retry_reason = "structured_output"
+                                        if attempt_session_id is None:
+                                            _log_retry_outcome(
+                                                retry_reason,
+                                                "not_attempted",
+                                                attempt=attempt,
+                                            )
+                                            raise
                                     else:
                                         raise
 
@@ -1775,7 +1782,9 @@ def create_app(
                             reason=retry_reason,
                             model=payload.model,
                             warm=attempt_request.warm_session is not None,
-                            warm_age_ms=result.warm_age_ms if result is not None else None,
+                            warm_age_ms=(
+                                result.warm_age_ms if result is not None else attempt_warm_age_ms
+                            ),
                         )
                         metrics.record_features((f"model_output_retry:{retry_reason}",))
                         if retry_request.session_id is not None:
@@ -2017,6 +2026,7 @@ def _log_truncated_tool_call(
         warm_age_ms=warm_age_ms,
         output_tokens=usage.output_tokens,
         will_retry=will_retry,
+        has_tool_calls=has_tool_calls,
     )
 
 
@@ -2567,11 +2577,17 @@ async def _stream_completion(
                 stream=True,
                 error_type="factory_protocol_error",
                 reason=str(exc),
+                model=model,
             )
             yield _sse(_error_body(str(exc), "factory_protocol_error"))
         except RunnerError as exc:
             outcome = "timeout" if exc.error_type == "factory_droid_timeout" else "error"
-            log_warning("chat.failed", stream=True, error_type=exc.error_type)
+            log_warning(
+                "chat.failed",
+                stream=True,
+                error_type=exc.error_type,
+                model=model,
+            )
             if failure_callback is not None:
                 failure_callback(model, exc)
             yield _sse(_error_body(str(exc), exc.error_type))
