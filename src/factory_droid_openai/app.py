@@ -104,6 +104,7 @@ ModelOutputRetryReason = Literal[
     "malformed_tool_call",
     "structured_output",
     "tool_without_catalog",
+    "trailing_output",
     "truncated_tool_call",
 ]
 RetryOutcome = Literal["recovered", "refailed", "not_attempted"]
@@ -141,12 +142,17 @@ _MODEL_OUTPUT_RETRY_PROMPTS: dict[ModelOutputRetryReason, str] = {
         "Your previous response attempted a tool call, but no tools are available. Answer "
         "the original request directly without any tool call or explanation about this correction."
     ),
+    "trailing_output": (
+        "Your previous response contained text after the tool call. Return the required "
+        "tool call again as one complete valid tool call. Output no explanation."
+    ),
     "truncated_tool_call": (
         "A previous tool call attempt was incomplete. Return the required tool call as one "
         "complete valid tool call. Output no explanation."
     ),
 }
 _TOOL_WITHOUT_CATALOG_ERROR = "the model requested a tool when none are available"
+_TRAILING_OUTPUT_ERROR_PREFIX = "unexpected text after tool call"
 
 CHAT_COMPLETION_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {
@@ -1755,16 +1761,20 @@ def create_app(
                                 trace_choice=index,
                             )
                         except ProtocolError as exc:
-                            if attempt == 0 and str(exc) == _TOOL_WITHOUT_CATALOG_ERROR:
-                                retry_reason = "tool_without_catalog"
-                                if attempt_session_id is None:
-                                    _log_retry_outcome(
-                                        retry_reason,
-                                        "not_attempted",
-                                        attempt=attempt,
-                                    )
-                                    raise
-                            else:
+                            # A tool call on a tool-less request and prose after
+                            # a tool call are transient model behavior, so they
+                            # retry once instead of failing the turn with a
+                            # hard 502 (issues #124 and #128).
+                            shape = _retryable_protocol_error(exc)
+                            retry_reason = _protocol_error_retry_reason(
+                                shape,
+                                attempt=attempt,
+                                request_session_id=choice_request.session_id,
+                                attempt_session_id=attempt_session_id,
+                            )
+                            if retry_reason is None:
+                                if shape is not None and attempt == 0:
+                                    _log_retry_outcome(shape, "not_attempted", attempt=attempt)
                                 raise
                         else:
                             if result is None:
@@ -2052,6 +2062,44 @@ def _retryable_structured_output_error(exc: ProtocolError) -> bool:
     )
 
 
+def _retryable_protocol_error(exc: ProtocolError) -> ModelOutputRetryReason | None:
+    """The transient protocol-error shapes one bounded retry can recover.
+
+    A tool call on a tool-less request and prose after a completed tool call
+    are model misbehavior that one clean retry usually answers (issues #124
+    and #128); everything else keeps failing the turn.
+    """
+    message = str(exc)
+    if message == _TOOL_WITHOUT_CATALOG_ERROR:
+        return "tool_without_catalog"
+    if message.startswith(_TRAILING_OUTPUT_ERROR_PREFIX):
+        return "trailing_output"
+    return None
+
+
+def _protocol_error_retry_reason(
+    shape: ModelOutputRetryReason | None,
+    *,
+    attempt: int,
+    request_session_id: str | None,
+    attempt_session_id: str | None,
+) -> ModelOutputRetryReason | None:
+    """One bounded retry for the retryable protocol-error shapes.
+
+    A tool call on a tool-less request retries in a fresh session, which an
+    isolated request can always start. Prose after a tool call keeps the same
+    session, so that session id has to be known. A repeated shape fails the
+    turn as before.
+    """
+    if shape is None or attempt != 0:
+        return None
+    if shape == "tool_without_catalog" and request_session_id is None:
+        return shape
+    if attempt_session_id is None:
+        return None
+    return shape
+
+
 def _log_retry_outcome(
     reason: ModelOutputRetryReason,
     outcome: RetryOutcome,
@@ -2074,6 +2122,20 @@ def _model_output_retry_request(
 ) -> RunRequest | None:
     if reason == "truncated_tool_call" and request.session_id is None:
         # Sonar cannot infer that dataclasses.replace preserves the input type.
+        return cast(  # type: ignore[redundant-cast]
+            "RunRequest",
+            replace(
+                request,
+                prompt=f"{request.prompt}\n\n{_MODEL_OUTPUT_RETRY_PROMPTS[reason]}",
+                session_id=None,
+                warm_session=None,
+            ),
+        )
+    if reason == "tool_without_catalog" and request.session_id is None:
+        # A phantom tool call poisons the session it arrived in, so an
+        # isolated request retries fresh with the full original prompt
+        # (issue #128). Continuations keep their session, like malformed
+        # output, because the bridge no longer holds their earlier history.
         return cast(  # type: ignore[redundant-cast]
             "RunRequest",
             replace(
