@@ -301,8 +301,9 @@ do not resend the prompt or attachments. Every retry keeps the original request
 deadline. A repeated malformed call still returns the notice, while a repeated
 truncated call returns `finish_reason="length"` without it. Streaming requests
 are not retried because response bytes may already have reached the client.
-Intermediate truncations log as `chat.attempt_truncated`; `chat.truncated` is
-reserved for the final request outcome.
+Non-final truncations log as `chat.attempt_truncated`. Its `will_retry` field
+distinguishes an actual retry from a dropped trailing partial call after a
+valid call. `chat.truncated` is reserved for the final request outcome.
 When an earlier call in the same turn did complete, the turn keeps
 `finish_reason="tool_calls"` so the client runs the call it already received.
 Close markers inside JSON strings are argument data, not framing. Ambiguous

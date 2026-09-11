@@ -1722,44 +1722,49 @@ def create_app(
                                     else:
                                         raise
 
-                        if attempt != 0 or attempt_session_id is None or retry_reason is None:
+                        retry_request = (
+                            _model_output_retry_request(
+                                choice_request,
+                                session_id=attempt_session_id,
+                                reason=retry_reason,
+                            )
+                            if attempt == 0 and retry_reason is not None
+                            else None
+                        )
+                        if result is not None and result.truncation is not None:
+                            _log_truncated_tool_call(
+                                result.truncation,
+                                stream=False,
+                                run_request=attempt_request,
+                                usage=result.usage,
+                                attempt=attempt,
+                                choice=index,
+                                warm_age_ms=result.warm_age_ms,
+                                will_retry=retry_request is not None,
+                                has_tool_calls=bool(result.tool_calls),
+                            )
+                        if retry_request is None:
                             break
+                        retry_reason = cast("ModelOutputRetryReason", retry_reason)
                         log_warning(
                             "chat.retry",
                             stream=False,
                             reason=retry_reason,
                         )
                         metrics.record_features((f"model_output_retry:{retry_reason}",))
-                        if (
-                            retry_reason != "truncated_tool_call"
-                            or choice_request.session_id is not None
-                        ):
+                        if retry_request.session_id is not None:
                             await _wait_for_retry_cleanup(
                                 reaper,
-                                session_id=attempt_session_id,
+                                session_id=retry_request.session_id,
                                 deadline=deadline,
                                 timeout_seconds=timeout_seconds,
                             )
-                        attempt_request = _model_output_retry_request(
-                            choice_request,
-                            session_id=attempt_session_id,
-                            reason=retry_reason,
-                        )
+                        attempt_request = retry_request
                         attempt = 1
 
                     completed_result = cast("CollectedCompletion", result)
-                    if completed_result.truncation is not None:
+                    if completed_result.truncation is not None and not completed_result.tool_calls:
                         request.state.stream_outcome = "truncated"
-                        _log_truncated_tool_call(
-                            "chat.truncated",
-                            completed_result.truncation,
-                            stream=False,
-                            run_request=attempt_request,
-                            usage=completed_result.usage,
-                            attempt=attempt,
-                            choice=index,
-                            warm_age_ms=completed_result.warm_age_ms,
-                        )
                     elif completed_result.malformed_note is not None:
                         request.state.stream_outcome = "malformed"
                     if completed_result.session_id is not None:
@@ -1903,9 +1908,9 @@ def _retryable_structured_output_error(exc: ProtocolError) -> bool:
 def _model_output_retry_request(
     request: RunRequest,
     *,
-    session_id: str,
+    session_id: str | None,
     reason: ModelOutputRetryReason,
-) -> RunRequest:
+) -> RunRequest | None:
     if reason == "truncated_tool_call" and request.session_id is None:
         # Sonar cannot infer that dataclasses.replace preserves the input type.
         return cast(  # type: ignore[redundant-cast]
@@ -1917,6 +1922,8 @@ def _model_output_retry_request(
                 warm_session=None,
             ),
         )
+    if session_id is None:
+        return None
     return replace(
         request,
         prompt=_MODEL_OUTPUT_RETRY_PROMPTS[reason],
@@ -1936,7 +1943,6 @@ def _warm_session_age_ms(request: RunRequest) -> float | None:
 
 
 def _log_truncated_tool_call(
-    event: str,
     truncation: _TruncatedToolCall,
     *,
     stream: bool,
@@ -1945,9 +1951,11 @@ def _log_truncated_tool_call(
     attempt: int,
     choice: int,
     warm_age_ms: float | None,
+    will_retry: bool,
+    has_tool_calls: bool,
 ) -> None:
     log_warning(
-        event,
+        "chat.attempt_truncated" if will_retry or has_tool_calls else "chat.truncated",
         stream=stream,
         error_type="factory_protocol_error",
         reason=truncation.reason,
@@ -1958,6 +1966,7 @@ def _log_truncated_tool_call(
         warm=run_request.warm_session is not None,
         warm_age_ms=warm_age_ms,
         output_tokens=usage.output_tokens,
+        will_retry=will_retry,
     )
 
 
@@ -2154,16 +2163,6 @@ async def _collect_completion(
                 # finish_reason="length" instead of a 502. The partial call is
                 # dropped, never executed.
                 result.truncation = _TruncatedToolCall.from_error(exc)
-                _log_truncated_tool_call(
-                    "chat.attempt_truncated",
-                    result.truncation,
-                    stream=False,
-                    run_request=run_request,
-                    usage=result.usage,
-                    attempt=trace_attempt,
-                    choice=trace_choice,
-                    warm_age_ms=result.warm_age_ms,
-                )
         held = stop_buffer.flush()
         if held:
             result.text_parts.append(held)
@@ -2443,9 +2442,8 @@ async def _stream_completion(
             # finish_reason="length" - so clients continue instead of
             # blind-retrying an unrecoverable request. The partial call is
             # dropped, never executed.
-            outcome = "truncated"
+            outcome = "success" if saw_tool_call else "truncated"
             _log_truncated_tool_call(
-                "chat.truncated",
                 _TruncatedToolCall.from_error(exc),
                 stream=True,
                 run_request=run_request,
@@ -2453,6 +2451,8 @@ async def _stream_completion(
                 attempt=0,
                 choice=0,
                 warm_age_ms=warm_age_ms,
+                will_retry=False,
+                has_tool_calls=saw_tool_call,
             )
             held = stop_buffer.flush()
             if held:

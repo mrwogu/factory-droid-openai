@@ -210,16 +210,27 @@ class FakeRunner:
 
 
 class RetryRunner(FakeRunner):
-    def __init__(self, attempts: list[str]) -> None:
+    def __init__(
+        self,
+        attempts: list[str],
+        *,
+        omit_session_started_attempts: frozenset[int] = frozenset(),
+    ) -> None:
         super().__init__([])
         self.attempts = attempts
+        self.omit_session_started_attempts = omit_session_started_attempts
 
     async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
         self.requests.append(request)
+        attempt = len(self.requests) - 1
         if request.warm_session is not None:
             request.warm_session.consumed = True
         try:
-            for event in _recorded_events(self.attempts[len(self.requests) - 1]):
+            for event in _recorded_events(self.attempts[attempt]):
+                if attempt in self.omit_session_started_attempts and isinstance(
+                    event, SessionStarted
+                ):
+                    continue
                 yield event
         finally:
             self.closed = True
@@ -1162,6 +1173,8 @@ async def test_truncated_payload_after_a_tool_call_keeps_tool_calls_finish(
 ) -> None:
     # "length" would make the client ask the model to continue instead of
     # running the call it already received.
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
     runner = FakeRunner(
         [
             TextDelta(
@@ -1182,7 +1195,8 @@ async def test_truncated_payload_after_a_tool_call_keeps_tool_calls_finish(
         ],
     )
 
-    async with _client(_app(tmp_path, runner)) as client:
+    app = _app(tmp_path, runner)
+    async with _client(app) as client:
         response = await client.post("/v1/chat/completions", json=payload)
 
     assert response.status_code == 200
@@ -1203,6 +1217,16 @@ async def test_truncated_payload_after_a_tool_call_keeps_tool_calls_finish(
         choice = response.json()["choices"][0]
         assert choice["finish_reason"] == "tool_calls"
         assert len(choice["message"]["tool_calls"]) == 1
+    records = [json.loads(line) for line in log_stream.getvalue().splitlines() if line.strip()]
+    attempts = [record for record in records if record["event"] == "chat.attempt_truncated"]
+    assert len(attempts) == 1
+    assert attempts[0]["stream"] is stream
+    assert attempts[0]["will_retry"] is False
+    assert not any(record["event"] == "chat.truncated" for record in records)
+    request_metrics = app.state.metrics.telemetry_snapshot().requests
+    assert len(request_metrics) == 1
+    assert request_metrics[0].outcome == "success"
+    assert request_metrics[0].mode == ("stream" if stream else "non_stream")
 
 
 @pytest.mark.asyncio
@@ -2459,7 +2483,8 @@ async def test_non_streaming_truncated_tool_call_retries_fresh_session(tmp_path:
         [
             "retry/truncated-tool.jsonl",
             "retry/plain-answer.jsonl",
-        ]
+        ],
+        omit_session_started_attempts=frozenset({0}),
     )
     payload = _payload(
         tools=[
@@ -2505,6 +2530,7 @@ async def test_non_streaming_truncated_tool_call_retries_fresh_session(tmp_path:
     assert runner.requests[0].prompt in runner.requests[1].prompt
     assert runner.requests[1].images == runner.requests[0].images
     assert "incomplete" in runner.requests[1].prompt
+    assert app.state.sessions.key("replay-session") == key
     records = [json.loads(line) for line in log_stream.getvalue().splitlines() if line.strip()]
     attempts = [record for record in records if record["event"] == "chat.attempt_truncated"]
     assert len(attempts) == 1
@@ -2513,6 +2539,10 @@ async def test_non_streaming_truncated_tool_call_retries_fresh_session(tmp_path:
     assert attempts[0]["warm"] is True
     assert attempts[0]["warm_age_ms"] >= 1000.0
     assert attempts[0]["output_tokens"] == 0
+    assert attempts[0]["will_retry"] is True
+    retries = [record for record in records if record["event"] == "chat.retry"]
+    assert len(retries) == 1
+    assert retries[0]["reason"] == "truncated_tool_call"
     assert not any(record["event"] == "chat.truncated" for record in records)
 
 
@@ -2542,11 +2572,13 @@ async def test_repeated_truncated_tool_call_logs_final_outcome(tmp_path: Path) -
     records = [json.loads(line) for line in log_stream.getvalue().splitlines() if line.strip()]
     attempts = [record for record in records if record["event"] == "chat.attempt_truncated"]
     final = [record for record in records if record["event"] == "chat.truncated"]
-    assert [record["attempt"] for record in attempts] == [0, 1]
+    assert [record["attempt"] for record in attempts] == [0]
+    assert attempts[0]["will_retry"] is True
     assert len(final) == 1
     assert final[0]["attempt"] == 1
     assert final[0]["warm"] is False
     assert final[0]["output_tokens"] == 0
+    assert final[0]["will_retry"] is False
 
 
 @pytest.mark.asyncio
