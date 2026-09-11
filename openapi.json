@@ -1038,7 +1038,7 @@
     },
     "summary": "OpenAI-compatible access to Factory Droid.",
     "title": "Factory Droid OpenAI Bridge",
-    "version": "1.9.0"
+    "version": "1.9.1"
   },
   "openapi": "3.1.0",
   "paths": {
