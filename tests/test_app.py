@@ -437,6 +437,52 @@ def _single_retry_outcome(records: list[dict[str, Any]]) -> dict[str, Any]:
     return outcomes[0]
 
 
+def _retry_log_stream() -> io.StringIO:
+    stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=stream)
+    return stream
+
+
+async def _post_completion(
+    app: Any,
+    payload: dict[str, object],
+) -> httpx.Response:
+    async with _client(app) as client:
+        return await client.post("/v1/chat/completions", json=payload)
+
+
+def _continuation_app(tmp_path: Path, runner: FakeRunner) -> Any:
+    settings = Settings(
+        droid_path="droid",
+        workdir=tmp_path,
+        timeout_seconds=30.0,
+        session_continuity=True,
+    )
+    app = create_app(settings, runner_factory=cast("RunnerFactory", lambda: runner))
+    app.state.sessions.remember("session-9", SessionKey(model_id=None, reasoning_effort=None))
+    return app
+
+
+def _assert_retry_refailed(log_stream: io.StringIO, reason: str) -> None:
+    outcome = _single_retry_outcome(_warning_records(log_stream))
+    assert outcome["reason"] == reason
+    assert outcome["outcome"] == "refailed"
+    assert outcome["attempt"] == 1
+
+
+def _assert_same_session_retry_recovered(
+    response: httpx.Response,
+    runner: RetryRunner,
+) -> None:
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "Direct answer"
+    assert len(runner.requests) == 2
+    assert runner.requests[0].session_id == "session-9"
+    assert runner.requests[1].session_id == "replay-session"
+    assert runner.requests[1].prompt != runner.requests[0].prompt
+    assert "no tools are available" in runner.requests[1].prompt
+
+
 def _chat_scope(body: bytes) -> dict[str, Any]:
     return {
         "type": "http",
@@ -2908,14 +2954,8 @@ async def test_truncated_phantom_tool_keeps_no_tool_retry_for_structured_output(
 
 @pytest.mark.asyncio
 async def test_non_streaming_tool_without_catalog_retries_fresh_session(tmp_path: Path) -> None:
-    log_stream = io.StringIO()
-    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
-    runner = RetryRunner(
-        [
-            "retry/valid-tool.jsonl",
-            "retry/plain-answer.jsonl",
-        ]
-    )
+    log_stream = _retry_log_stream()
+    runner = RetryRunner(["retry/valid-tool.jsonl", "retry/plain-answer.jsonl"])
     app = _app(tmp_path, runner)
     key = SessionKey(model_id=None, reasoning_effort=None)
     warm = WarmSession(
@@ -2928,8 +2968,7 @@ async def test_non_streaming_tool_without_catalog_retries_fresh_session(tmp_path
     app.state.pool.note(key)
     app.state.pool.offer(warm)
 
-    async with _client(app) as client:
-        response = await client.post("/v1/chat/completions", json=_payload())
+    response = await _post_completion(app, _payload())
 
     assert response.status_code == 200
     assert response.json()["choices"][0]["message"]["content"] == "Direct answer"
@@ -2951,80 +2990,42 @@ async def test_non_streaming_tool_without_catalog_retries_fresh_session(tmp_path
 
 @pytest.mark.asyncio
 async def test_non_streaming_tool_without_catalog_retry_is_bounded(tmp_path: Path) -> None:
-    log_stream = io.StringIO()
-    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
-    runner = RetryRunner(
-        [
-            "retry/valid-tool.jsonl",
-            "retry/valid-tool.jsonl",
-        ]
-    )
+    log_stream = _retry_log_stream()
+    runner = RetryRunner(["retry/valid-tool.jsonl", "retry/valid-tool.jsonl"])
 
-    async with _client(_app(tmp_path, runner)) as client:
-        response = await client.post("/v1/chat/completions", json=_payload())
+    response = await _post_completion(_app(tmp_path, runner), _payload())
 
     assert response.status_code == 502
     assert len(runner.requests) == 2
     assert runner.requests[1].session_id is None
     assert "no tools are available" in runner.requests[1].prompt
-    outcome = _single_retry_outcome(_warning_records(log_stream))
-    assert outcome["reason"] == "tool_without_catalog"
-    assert outcome["outcome"] == "refailed"
-    assert outcome["attempt"] == 1
+    _assert_retry_refailed(log_stream, "tool_without_catalog")
 
 
 @pytest.mark.asyncio
 async def test_continuation_tool_without_catalog_retries_same_session(tmp_path: Path) -> None:
-    runner = RetryRunner(
-        [
-            "retry/valid-tool.jsonl",
-            "retry/plain-answer.jsonl",
-        ]
-    )
-    settings = Settings(
-        droid_path="droid",
-        workdir=tmp_path,
-        timeout_seconds=30.0,
-        session_continuity=True,
-    )
-    app = create_app(settings, runner_factory=cast("RunnerFactory", lambda: runner))
-    app.state.sessions.remember("session-9", SessionKey(model_id=None, reasoning_effort=None))
+    runner = RetryRunner(["retry/valid-tool.jsonl", "retry/plain-answer.jsonl"])
+    app = _continuation_app(tmp_path, runner)
     payload = _payload(factory_droid_session_id="session-9")
 
-    async with _client(app) as client:
-        response = await client.post("/v1/chat/completions", json=payload)
+    response = await _post_completion(app, payload)
 
-    assert response.status_code == 200
-    assert response.json()["choices"][0]["message"]["content"] == "Direct answer"
-    assert len(runner.requests) == 2
-    assert runner.requests[0].session_id == "session-9"
-    assert runner.requests[1].session_id == "replay-session"
-    assert runner.requests[1].prompt != runner.requests[0].prompt
-    assert "no tools are available" in runner.requests[1].prompt
+    _assert_same_session_retry_recovered(response, runner)
 
 
 @pytest.mark.asyncio
 async def test_continuation_tool_without_catalog_without_session_logs_not_attempted(
     tmp_path: Path,
 ) -> None:
-    log_stream = io.StringIO()
-    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
+    log_stream = _retry_log_stream()
     runner = RetryRunner(
         ["retry/valid-tool.jsonl"],
         omit_session_started_attempts=frozenset({0}),
     )
-    settings = Settings(
-        droid_path="droid",
-        workdir=tmp_path,
-        timeout_seconds=30.0,
-        session_continuity=True,
-    )
-    app = create_app(settings, runner_factory=cast("RunnerFactory", lambda: runner))
-    app.state.sessions.remember("session-9", SessionKey(model_id=None, reasoning_effort=None))
+    app = _continuation_app(tmp_path, runner)
     payload = _payload(factory_droid_session_id="session-9")
 
-    async with _client(app) as client:
-        response = await client.post("/v1/chat/completions", json=payload)
+    response = await _post_completion(app, payload)
 
     assert response.status_code == 502
     assert len(runner.requests) == 1
@@ -3040,17 +3041,10 @@ async def test_continuation_tool_without_catalog_without_session_logs_not_attemp
 async def test_non_streaming_message_shaped_phantom_retries_fresh_session(
     tmp_path: Path,
 ) -> None:
-    log_stream = io.StringIO()
-    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
-    runner = RetryRunner(
-        [
-            "retry/message-shaped-tool.jsonl",
-            "retry/plain-answer.jsonl",
-        ]
-    )
+    log_stream = _retry_log_stream()
+    runner = RetryRunner(["retry/message-shaped-tool.jsonl", "retry/plain-answer.jsonl"])
 
-    async with _client(_app(tmp_path, runner)) as client:
-        response = await client.post("/v1/chat/completions", json=_payload())
+    response = await _post_completion(_app(tmp_path, runner), _payload())
 
     assert response.status_code == 200
     assert response.json()["choices"][0]["message"]["content"] == "Direct answer"
@@ -3070,78 +3064,42 @@ async def test_non_streaming_message_shaped_phantom_retries_fresh_session(
 async def test_non_streaming_message_shaped_phantom_retry_is_bounded(
     tmp_path: Path,
 ) -> None:
-    log_stream = io.StringIO()
-    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
-    runner = RetryRunner(
-        [
-            "retry/message-shaped-tool.jsonl",
-            "retry/message-shaped-tool.jsonl",
-        ]
-    )
+    log_stream = _retry_log_stream()
+    runner = RetryRunner(["retry/message-shaped-tool.jsonl", "retry/message-shaped-tool.jsonl"])
 
-    async with _client(_app(tmp_path, runner)) as client:
-        response = await client.post("/v1/chat/completions", json=_payload())
+    response = await _post_completion(_app(tmp_path, runner), _payload())
 
     assert response.status_code == 502
     assert len(runner.requests) == 2
     assert runner.requests[1].session_id is None
     assert "no tools are available" in runner.requests[1].prompt
-    outcome = _single_retry_outcome(_warning_records(log_stream))
-    assert outcome["reason"] == "tool_without_catalog"
-    assert outcome["outcome"] == "refailed"
-    assert outcome["attempt"] == 1
+    _assert_retry_refailed(log_stream, "tool_without_catalog")
 
 
 @pytest.mark.asyncio
 async def test_continuation_message_shaped_phantom_retries_same_session(
     tmp_path: Path,
 ) -> None:
-    runner = RetryRunner(
-        [
-            "retry/message-shaped-tool.jsonl",
-            "retry/plain-answer.jsonl",
-        ]
-    )
-    settings = Settings(
-        droid_path="droid",
-        workdir=tmp_path,
-        timeout_seconds=30.0,
-        session_continuity=True,
-    )
-    app = create_app(settings, runner_factory=cast("RunnerFactory", lambda: runner))
-    app.state.sessions.remember("session-9", SessionKey(model_id=None, reasoning_effort=None))
+    runner = RetryRunner(["retry/message-shaped-tool.jsonl", "retry/plain-answer.jsonl"])
+    app = _continuation_app(tmp_path, runner)
     payload = _payload(factory_droid_session_id="session-9")
 
-    async with _client(app) as client:
-        response = await client.post("/v1/chat/completions", json=payload)
+    response = await _post_completion(app, payload)
 
-    assert response.status_code == 200
-    assert response.json()["choices"][0]["message"]["content"] == "Direct answer"
-    assert len(runner.requests) == 2
-    assert runner.requests[0].session_id == "session-9"
-    assert runner.requests[1].session_id == "replay-session"
-    assert runner.requests[1].prompt != runner.requests[0].prompt
-    assert "no tools are available" in runner.requests[1].prompt
+    _assert_same_session_retry_recovered(response, runner)
 
 
 @pytest.mark.asyncio
 async def test_non_streaming_sequential_over_limit_keeps_single_call_failure(
     tmp_path: Path,
 ) -> None:
-    log_stream = io.StringIO()
-    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
-    runner = RetryRunner(
-        [
-            "retry/double-tool.jsonl",
-            "retry/valid-tool.jsonl",
-        ]
-    )
+    log_stream = _retry_log_stream()
+    runner = RetryRunner(["retry/double-tool.jsonl", "retry/valid-tool.jsonl"])
 
-    async with _client(_app(tmp_path, runner)) as client:
-        response = await client.post(
-            "/v1/chat/completions",
-            json=_weather_payload(parallel_tool_calls=False),
-        )
+    response = await _post_completion(
+        _app(tmp_path, runner),
+        _weather_payload(parallel_tool_calls=False),
+    )
 
     assert response.status_code == 200
     choice = response.json()["choices"][0]
@@ -3158,17 +3116,10 @@ async def test_non_streaming_sequential_over_limit_keeps_single_call_failure(
 
 @pytest.mark.asyncio
 async def test_non_streaming_trailing_output_retries_same_session(tmp_path: Path) -> None:
-    log_stream = io.StringIO()
-    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
-    runner = RetryRunner(
-        [
-            "retry/trailing-tool.jsonl",
-            "retry/valid-tool.jsonl",
-        ]
-    )
+    log_stream = _retry_log_stream()
+    runner = RetryRunner(["retry/trailing-tool.jsonl", "retry/valid-tool.jsonl"])
 
-    async with _client(_app(tmp_path, runner)) as client:
-        response = await client.post("/v1/chat/completions", json=_weather_payload())
+    response = await _post_completion(_app(tmp_path, runner), _weather_payload())
 
     assert response.status_code == 200
     tool_calls = response.json()["choices"][0]["message"]["tool_calls"]
@@ -3190,40 +3141,28 @@ async def test_non_streaming_trailing_output_retries_same_session(tmp_path: Path
 
 @pytest.mark.asyncio
 async def test_non_streaming_trailing_output_retry_is_bounded(tmp_path: Path) -> None:
-    log_stream = io.StringIO()
-    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
-    runner = RetryRunner(
-        [
-            "retry/trailing-tool.jsonl",
-            "retry/trailing-tool.jsonl",
-        ]
-    )
+    log_stream = _retry_log_stream()
+    runner = RetryRunner(["retry/trailing-tool.jsonl", "retry/trailing-tool.jsonl"])
 
-    async with _client(_app(tmp_path, runner)) as client:
-        response = await client.post("/v1/chat/completions", json=_weather_payload())
+    response = await _post_completion(_app(tmp_path, runner), _weather_payload())
 
     assert response.status_code == 502
     assert len(runner.requests) == 2
     assert runner.requests[1].session_id == "replay-session"
-    outcome = _single_retry_outcome(_warning_records(log_stream))
-    assert outcome["reason"] == "trailing_output"
-    assert outcome["outcome"] == "refailed"
-    assert outcome["attempt"] == 1
+    _assert_retry_refailed(log_stream, "trailing_output")
 
 
 @pytest.mark.asyncio
 async def test_non_streaming_trailing_output_without_session_logs_not_attempted(
     tmp_path: Path,
 ) -> None:
-    log_stream = io.StringIO()
-    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
+    log_stream = _retry_log_stream()
     runner = RetryRunner(
         ["retry/trailing-tool.jsonl"],
         omit_session_started_attempts=frozenset({0}),
     )
 
-    async with _client(_app(tmp_path, runner)) as client:
-        response = await client.post("/v1/chat/completions", json=_weather_payload())
+    response = await _post_completion(_app(tmp_path, runner), _weather_payload())
 
     assert response.status_code == 502
     assert len(runner.requests) == 1
