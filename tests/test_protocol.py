@@ -940,6 +940,24 @@ def test_stream_parser_ignores_transcript_tail_after_message_json() -> None:
     assert parser.feed('{"role":"tool","content":"copied"}') == []
 
 
+def test_stream_parser_rejects_message_json_tool_call_without_catalog() -> None:
+    parser = ToolCallStreamParser(frozenset())
+    message = '{"role":"assistant","tool_calls":[{"function":{"name":"weather","arguments":"{}"}}]}'
+
+    with pytest.raises(ProtocolError) as excinfo:
+        parser.feed(message)
+
+    assert str(excinfo.value) == protocol.TOOL_WITHOUT_CATALOG_MESSAGE
+
+
+def test_stream_parser_keeps_an_unknown_message_json_tool_failing() -> None:
+    parser = ToolCallStreamParser(frozenset({"other"}))
+    message = '{"role":"assistant","tool_calls":[{"function":{"name":"weather","arguments":"{}"}}]}'
+
+    with pytest.raises(ProtocolError, match="tool 'weather' is not available"):
+        parser.feed(message)
+
+
 def test_stream_parser_rejects_incomplete_transcript_message() -> None:
     parser = ToolCallStreamParser(frozenset({"weather"}))
 
@@ -2202,9 +2220,11 @@ def test_stream_parser_reports_a_same_feed_trailing_call_over_limit() -> None:
         record_repair=record,
     )
 
-    with pytest.raises(ProtocolError, match="unexpected text after tool call"):
+    with pytest.raises(MalformedToolCallError) as excinfo:
         parser.feed(_tool_call("weather", "{}") + _tool_call("weather", "{}"))
 
+    assert str(excinfo.value) == "more tool calls than the configured maximum"
+    assert excinfo.value.tool_name == "weather"
     assert reported == [("tool_call.over_limit", "native", None)]
 
 
@@ -2220,12 +2240,10 @@ def test_stream_parser_reports_the_trailing_call_dialect_over_limit(
     )
     parser.feed(_tool_call("weather", "{}"))
 
-    with pytest.raises(
-        ProtocolError,
-        match=rf"unexpected text after tool call \({dialect.name} dialect\)",
-    ):
+    with pytest.raises(MalformedToolCallError) as excinfo:
         parser.feed(dialect.open_marker)
 
+    assert str(excinfo.value) == "more tool calls than the configured maximum"
     assert reported == [("tool_call.over_limit", dialect.name, None)]
 
 
@@ -2241,9 +2259,10 @@ def test_stream_parser_reports_a_split_trailing_call_over_limit() -> None:
         )
         parser.feed(_tool_call("weather", "{}"))
 
-        with pytest.raises(ProtocolError, match="unexpected text after tool call"):
+        with pytest.raises(MalformedToolCallError) as excinfo:
             _feed_parts(parser, second[:split], second[split:])
 
+        assert str(excinfo.value) == "more tool calls than the configured maximum"
         assert reported == [("tool_call.over_limit", "native", None)]
 
 
@@ -3857,10 +3876,12 @@ def test_parser_accepts_several_tool_calls_when_allowed() -> None:
 def test_parser_stops_accepting_calls_past_the_configured_cap() -> None:
     parser = ToolCallStreamParser(frozenset({"weather"}), max_tool_calls=1)
 
-    with pytest.raises(ProtocolError, match="unexpected text after tool call"):
+    with pytest.raises(MalformedToolCallError) as excinfo:
         parser.feed(
             _tool_call("weather", '{"city":"Gdansk"}') + _tool_call("weather", '{"city":"Sopot"}')
         )
+
+    assert str(excinfo.value) == "more tool calls than the configured maximum"
 
 
 def test_parser_rejects_prose_between_tool_calls() -> None:
