@@ -2975,6 +2975,294 @@ async def test_non_streaming_retry_stays_bounded_when_tool_call_is_still_malform
     assert len(runner.requests) == 2
 
 
+def _output_cap_runaway_argument() -> TextDelta:
+    # Stays under the 4-chars-per-token text fallback so only the usage
+    # snapshots decide the cap.
+    head = '{"name":"weather","arguments":{"city":"'
+    return TextDelta(f"{TOOL_CALL_OPEN}{head}{'x' * 60}")
+
+
+@pytest.mark.asyncio
+async def test_output_limit_caps_a_runaway_tool_argument(tmp_path: Path) -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
+    runner = FakeRunner(
+        [
+            _output_cap_runaway_argument(),
+            UsageUpdate(Usage(output_tokens=10)),
+            UsageUpdate(Usage(output_tokens=45)),
+        ]
+    )
+    payload = _weather_payload(max_tokens=32)
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "length"
+    assert "tool_calls" not in choice["message"]
+    # The limit, not model misbehavior, ended the turn, so no retry burns a
+    # second capped attempt.
+    assert len(runner.requests) == 1
+    records = _warning_records(log_stream)
+    truncated = next(record for record in records if record["event"] == "chat.truncated")
+    assert truncated["reason"] == "output token limit reached"
+    assert truncated["will_retry"] is False
+    assert truncated["has_tool_calls"] is False
+    assert not any(record["event"] == "chat.retry" for record in records)
+    assert not any(record["event"] == "chat.attempt_truncated" for record in records)
+
+
+@pytest.mark.asyncio
+async def test_output_limit_text_fallback_caps_without_usage_events(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner([TextDelta("x" * 200)])
+    payload = _weather_payload(max_tokens=32)
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "length"
+    assert choice["message"]["content"] == "x" * 200
+    assert len(runner.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_output_limit_caps_reasoning_output(tmp_path: Path) -> None:
+    runner = FakeRunner([ReasoningDelta("r" * 200)])
+    payload = _payload(max_tokens=32)
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "length"
+    assert choice["message"]["reasoning"] == "r" * 200
+
+
+@pytest.mark.asyncio
+async def test_output_limit_marks_a_turn_completed_past_the_limit(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner(
+        [
+            TextDelta("Short answer"),
+            UsageUpdate(Usage(output_tokens=10)),
+            RunComplete(Usage(output_tokens=45)),
+        ]
+    )
+    payload = _payload(max_tokens=32)
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "length"
+    assert choice["message"]["content"] == "Short answer"
+
+
+@pytest.mark.asyncio
+async def test_output_limit_counts_turn_tokens_not_session_totals(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner(
+        [
+            UsageUpdate(Usage(output_tokens=5000)),
+            UsageUpdate(Usage(output_tokens=5008)),
+            TextDelta("Direct answer"),
+            RunComplete(Usage(output_tokens=5008)),
+        ]
+    )
+    payload = _payload(max_tokens=32)
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "stop"
+    assert choice["message"]["content"] == "Direct answer"
+
+
+@pytest.mark.asyncio
+async def test_output_limit_honors_max_completion_tokens(tmp_path: Path) -> None:
+    runner = FakeRunner([TextDelta("y" * 200)])
+    payload = _payload(max_completion_tokens=32)
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "length"
+    assert choice["message"]["content"] == "y" * 200
+
+
+@pytest.mark.asyncio
+async def test_output_limit_after_a_complete_call_keeps_the_call(
+    tmp_path: Path,
+) -> None:
+    call = f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{}}}}{TOOL_CALL_CLOSE}'
+    runner = FakeRunner(
+        [
+            TextDelta(call),
+            UsageUpdate(Usage(output_tokens=10)),
+            UsageUpdate(Usage(output_tokens=50)),
+        ]
+    )
+    payload = _weather_payload(max_tokens=32)
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    tool_calls = choice["message"]["tool_calls"]
+    assert tool_calls is not None
+    assert tool_calls[0]["function"]["name"] == "weather"
+
+
+@pytest.mark.asyncio
+async def test_output_limit_required_tool_call_finishes_length(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner([TextDelta("x" * 200)])
+    payload = _weather_payload(max_tokens=32, tool_choice="required")
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "length"
+
+
+@pytest.mark.asyncio
+async def test_streaming_output_limit_caps_a_runaway_tool_argument(
+    tmp_path: Path,
+) -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
+    runner = FakeRunner(
+        [
+            _output_cap_runaway_argument(),
+            UsageUpdate(Usage(output_tokens=10)),
+            UsageUpdate(Usage(output_tokens=45)),
+        ]
+    )
+    payload = _weather_payload(stream=True, max_tokens=32)
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert '"finish_reason":"length"' in response.text
+    assert "factory_protocol_error" not in response.text
+    # A capped stream is a truncated outcome, not an empty completion.
+    records = _warning_records(log_stream)
+    assert not any(record["event"] == "chat.empty_completion" for record in records)
+    truncated = next(record for record in records if record["event"] == "chat.truncated")
+    assert truncated["reason"] == "output token limit reached"
+
+
+@pytest.mark.asyncio
+async def test_streaming_output_limit_text_fallback_finishes_length(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner([TextDelta("z" * 200)])
+    payload = _weather_payload(stream=True, max_tokens=32)
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert "z" * 200 in response.text
+    assert '"finish_reason":"length"' in response.text
+    assert "factory_protocol_error" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_streaming_output_limit_marks_a_turn_completed_past_the_limit(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner(
+        [
+            TextDelta("Short answer"),
+            UsageUpdate(Usage(output_tokens=10)),
+            RunComplete(Usage(output_tokens=45)),
+        ]
+    )
+    payload = _weather_payload(stream=True, max_tokens=32)
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert '"finish_reason":"length"' in response.text
+    assert "factory_protocol_error" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_streaming_output_limit_caps_reasoning_output(tmp_path: Path) -> None:
+    runner = FakeRunner([ReasoningDelta("r" * 200)])
+    payload = _payload(stream=True, max_tokens=32)
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert "r" * 200 in response.text
+    assert '"finish_reason":"length"' in response.text
+    assert "factory_protocol_error" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_streaming_output_limit_after_a_complete_call_keeps_the_call(
+    tmp_path: Path,
+) -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
+    call = f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{}}}}{TOOL_CALL_CLOSE}'
+    runner = FakeRunner(
+        [
+            TextDelta(call),
+            UsageUpdate(Usage(output_tokens=10)),
+            UsageUpdate(Usage(output_tokens=50)),
+        ]
+    )
+    payload = _weather_payload(stream=True, max_tokens=32)
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert '"finish_reason":"tool_calls"' in response.text
+    assert "factory_protocol_error" not in response.text
+    records = _warning_records(log_stream)
+    truncated = next(record for record in records if record["event"] == "chat.attempt_truncated")
+    assert truncated["reason"] == "output token limit reached"
+    assert truncated["has_tool_calls"] is True
+
+
+@pytest.mark.asyncio
+async def test_required_tool_call_missing_at_finish_fails_closed(tmp_path: Path) -> None:
+    runner = FakeRunner([TextDelta("no call here"), RunComplete(Usage())])
+    payload = _weather_payload(tool_choice="required")
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "factory_protocol_error"
+
+
 @pytest.mark.asyncio
 async def test_retry_cleanup_wait_respects_expired_deadline() -> None:
     reaper = BackgroundReaper()
