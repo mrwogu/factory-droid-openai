@@ -57,6 +57,8 @@ from factory_droid_openai.models import (
 from factory_droid_openai.payloadlog import configure_payload_tracing
 from factory_droid_openai.pool import BackgroundReaper, WarmSessionPool
 from factory_droid_openai.protocol import (
+    TOOL_CALL_LIMIT_MESSAGE,
+    TOOL_WITHOUT_CATALOG_MESSAGE,
     IncompleteToolCallError,
     MalformedToolCallError,
     ProtocolEmission,
@@ -151,7 +153,6 @@ _MODEL_OUTPUT_RETRY_PROMPTS: dict[ModelOutputRetryReason, str] = {
         "complete valid tool call. Output no explanation."
     ),
 }
-_TOOL_WITHOUT_CATALOG_ERROR = "the model requested a tool when none are available"
 _TRAILING_OUTPUT_ERROR_PREFIX = "unexpected text after tool call"
 # The bridge ships no tokenizer, so the text-length fallback in OutputTokenCap
 # counts roughly 4 characters per output token; Droid's own usage snapshots
@@ -2084,6 +2085,7 @@ class CollectedCompletion:
         self.truncation: _TruncatedToolCall | None = None
         self.warm_age_ms: float | None = None
         self.malformed_note: str | None = None
+        self.malformed_reason: str | None = None
         self.output_capped = False
 
     @property
@@ -2111,6 +2113,11 @@ def _completion_retry_reason(
         # retry would regenerate the same capped output (issue #130).
         return None
     if result.malformed_note is not None:
+        if result.malformed_reason == TOOL_CALL_LIMIT_MESSAGE:
+            # An over-limit turn broke a cap the prompt stated up front, so a
+            # clean retry could not make the original violation valid; it
+            # fails with the stop notice instead.
+            return None
         return "malformed_tool_call" if tools_available else "tool_without_catalog"
     if result.truncated:
         return "truncated_tool_call" if tools_available else "tool_without_catalog"
@@ -2137,7 +2144,7 @@ def _retryable_protocol_error(exc: ProtocolError) -> ModelOutputRetryReason | No
     and #128); everything else keeps failing the turn.
     """
     message = str(exc)
-    if message == _TOOL_WITHOUT_CATALOG_ERROR:
+    if message == TOOL_WITHOUT_CATALOG_MESSAGE:
         return "tool_without_catalog"
     if message.startswith(_TRAILING_OUTPUT_ERROR_PREFIX):
         return "trailing_output"
@@ -2372,6 +2379,7 @@ async def _collect_completion(
 
     def record_malformed(exc: MalformedToolCallError) -> None:
         result.malformed_note = _malformed_tool_call_note(exc)
+        result.malformed_reason = str(exc)
         result.completed = True
         log_warning(
             "chat.malformed",

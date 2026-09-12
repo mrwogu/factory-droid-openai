@@ -291,7 +291,9 @@ and a plain-text bridge notice. The malformed JSON and the call are dropped,
 never executed or returned to the client. The notice names no tool-call
 format, because anything it named would itself be tool-call-shaped text in
 assistant content. Before returning that notice, a non-streaming request retries
-one malformed or incomplete call when no valid call was already produced. For
+one malformed or incomplete call when no valid call was already produced. An
+over-limit turn is never retried, because the cap was stated in the prompt and
+one more attempt cannot make the original violation valid. For
 an isolated request, a truncated tool call starts a fresh Droid session with
 the full original prompt, attachments, and a fixed correction instruction, so
 the partial output cannot consume the retry's context. A tool call on a request
@@ -300,7 +302,9 @@ fresh Droid session with the full original prompt plus a correction, because
 the hallucinated turn poisons its own session, while an explicit continuation
 retries inside the same session. Prose after a tool call (`unexpected text
 after tool call`) retries once inside the same session like a malformed call,
-and the already-collected call is dropped in favor of a clean retry. Explicit
+and the already-collected call is dropped in favor of a clean retry. A further
+bare tool call after a completed call is over-limit rather than prose, so it
+ends the turn with the stop notice instead of retrying. Explicit
 continuations and other invalid outputs retry inside the same Droid session
 because their earlier history is not available in the current request.
 Same-session retries do not resend the prompt or attachments. Every retry
