@@ -75,10 +75,16 @@ _MANGLED_TOOL_CALLS_PATTERN = re.compile(
 )
 _MANGLED_TOOL_CALLS_START = '"tool'
 _MANGLED_TOOL_CALLS_TAILS = ((":", '"id"', ":", '"call_'), (":", '"call_'))
+# Shared error wording so the app-side retry classifier matches the exact
+# reason the parser raised, instead of a second copy of the same sentence.
+TOOL_WITHOUT_CATALOG_MESSAGE = "the model requested a tool when none are available"
+TOOL_CALL_LIMIT_MESSAGE = "more tool calls than the configured maximum"
 
 __all__ = [
     "TOOL_CALL_CLOSE",
+    "TOOL_CALL_LIMIT_MESSAGE",
     "TOOL_CALL_OPEN",
+    "TOOL_WITHOUT_CATALOG_MESSAGE",
     "AttachmentSet",
     "IncompleteToolCallError",
     "MalformedToolCallError",
@@ -800,8 +806,12 @@ class ToolCallStreamParser:
         if found is not None:
             marker_index, dialect = found
             if not self._residual(value[:marker_index]).strip():
+                # A bare further call past the limit is an over-limit
+                # violation, not trailing prose: it fails the turn instead
+                # of retrying into a single-call answer that hides the
+                # violation.
                 self._dialect = dialect
-                self._report_repair("tool_call.over_limit")
+                raise self._tool_call_limit_error(value, self._tool_call_count + 1)
             raise self._trailing_output_error()
 
         held = max(
@@ -874,7 +884,7 @@ class ToolCallStreamParser:
         self._trace_payload("tool_call.over_limit", payload)
         self._report_repair("tool_call.over_limit")
         return MalformedToolCallError(
-            "more tool calls than the configured maximum",
+            TOOL_CALL_LIMIT_MESSAGE,
             tool_name=tool_name,
             payload_bytes=payload_bytes,
         )
@@ -912,7 +922,7 @@ class ToolCallStreamParser:
         :meth:`_tool_call_from_object`.
         """
         if not self._allowed_tool_names:
-            raise ProtocolError("the model requested a tool when none are available")
+            raise ProtocolError(TOOL_WITHOUT_CATALOG_MESSAGE)
         body = strip_code_fence(payload.strip())
         object_limit = (
             min(self._max_tool_calls, MAX_PACKED_CALLS) if enforce_call_limit else MAX_PACKED_CALLS
@@ -1014,6 +1024,11 @@ class ToolCallStreamParser:
         argument_keys = [key for key in _ARGUMENT_KEYS if key in parsed]
         if not isinstance(name, str) or not name:
             raise ProtocolError("tool-call name must be a non-empty string")
+        if not self._allowed_tool_names:
+            # A message-shaped call is the one path that reaches name checking
+            # without passing the catalog check first, so a phantom call must
+            # raise the tool-less wording here to stay retry-classified.
+            raise ProtocolError(TOOL_WITHOUT_CATALOG_MESSAGE)
         if name not in self._allowed_tool_names:
             raise ProtocolError(f"tool '{name}' is not available")
         if not argument_keys:

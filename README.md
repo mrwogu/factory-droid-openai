@@ -291,16 +291,28 @@ and a plain-text bridge notice. The malformed JSON and the call are dropped,
 never executed or returned to the client. The notice names no tool-call
 format, because anything it named would itself be tool-call-shaped text in
 assistant content. Before returning that notice, a non-streaming request retries
-one malformed or incomplete call when no valid call was already produced. For
+one malformed or incomplete call when no valid call was already produced. An
+over-limit turn is never retried, because the cap was stated in the prompt and
+one more attempt cannot make the original violation valid. For
 an isolated request, a truncated tool call starts a fresh Droid session with
 the full original prompt, attachments, and a fixed correction instruction, so
-the partial output cannot consume the retry's context. Explicit continuations
-and other invalid outputs retry inside the same Droid session because their
-earlier history is not available in the current request. Same-session retries
-do not resend the prompt or attachments. Every retry keeps the original request
-deadline. A repeated malformed call still returns the notice, while a repeated
-truncated call returns `finish_reason="length"` without it. Streaming requests
-are not retried because response bytes may already have reached the client.
+the partial output cannot consume the retry's context. A tool call on a request
+that declares no tools behaves the same way: an isolated request retries in a
+fresh Droid session with the full original prompt plus a correction, because
+the hallucinated turn poisons its own session, while an explicit continuation
+retries inside the same session. Prose after a tool call (`unexpected text
+after tool call`) retries once inside the same session like a malformed call,
+and the already-collected call is dropped in favor of a clean retry. A further
+bare tool call after a completed call is over-limit rather than prose, so it
+ends the turn with the stop notice instead of retrying. Explicit
+continuations and other invalid outputs retry inside the same Droid session
+because their earlier history is not available in the current request.
+Same-session retries do not resend the prompt or attachments. Every retry
+keeps the original request deadline. A repeated malformed call still returns
+the notice, while a repeated truncated call returns `finish_reason="length"`
+without it, and a repeated tool call on a tool-less request or repeated prose
+after a tool call fails the turn. Streaming requests are not retried because
+response bytes may already have reached the client.
 Non-final truncations log as `chat.attempt_truncated`. Its `will_retry` field
 distinguishes an actual retry from a dropped trailing partial call after a
 valid call, and `has_tool_calls` makes clear why that partial call cannot be
