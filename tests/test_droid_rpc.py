@@ -824,8 +824,10 @@ async def test_disable_native_tools_still_fails_closed_in_a_toolless_session() -
             return {"result": {}}
         raise AssertionError(method)
 
+    extension = DroidRpcExtension()
+    client = _client(FakeProtocol(handler))
     with pytest.raises(DroidClientError, match="execute-cli"):
-        await DroidRpcExtension().disable_native_tools(_client(FakeProtocol(handler)))
+        await extension.disable_native_tools(client)
 
 
 @pytest.mark.asyncio
