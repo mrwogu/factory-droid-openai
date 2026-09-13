@@ -282,66 +282,93 @@ text. Every accepted form lives in one table in
 | the same fused form with the escaping lost inside a value, so `"command":"echo "x""}` carries bare quotes and raw newlines | GLM 5.2 |
 | strict JSON with dropped member keys leaving dangling `,"` fragments | gpt-5.6-luna, up to `FACTORY_DROID_OPENAI_MAX_DANGLING_MEMBER_REPAIRS` repairs |
 
-Translation never widens validation. An unknown tool name, a duplicate
-argument key, or prose after a call still fails the turn. A payload truncated
-before its close marker ends with `finish_reason="length"`. A closed malformed
-call, a mangled OpenAI `tool_calls` fragment, or a turn packing more calls than
-`FACTORY_DROID_OPENAI_MAX_TOOL_CALLS` allows ends with `finish_reason="stop"`
-and a plain-text bridge notice. The malformed JSON and the call are dropped,
-never executed or returned to the client. The notice names no tool-call
-format, because anything it named would itself be tool-call-shaped text in
-assistant content. Before returning that notice, a non-streaming request retries
-one malformed or incomplete call when no valid call was already produced. An
-over-limit turn is never retried, because the cap was stated in the prompt and
-one more attempt cannot make the original violation valid. For
-an isolated request, a truncated tool call starts a fresh Droid session with
-the full original prompt, attachments, and a fixed correction instruction, so
-the partial output cannot consume the retry's context. A tool call on a request
-that declares no tools behaves the same way: an isolated request retries in a
-fresh Droid session with the full original prompt plus a correction, because
-the hallucinated turn poisons its own session, while an explicit continuation
-retries inside the same session. Prose after a tool call (`unexpected text
-after tool call`) retries once inside the same session like a malformed call,
-and the already-collected call is dropped in favor of a clean retry. A further
-bare tool call after a completed call is over-limit rather than prose, so it
-ends the turn with the stop notice instead of retrying. Explicit
-continuations and other invalid outputs retry inside the same Droid session
-because their earlier history is not available in the current request.
-Same-session retries do not resend the prompt or attachments. Every retry
-keeps the original request deadline. A repeated malformed call still returns
-the notice, while a repeated truncated call returns `finish_reason="length"`
-without it, and a repeated tool call on a tool-less request or repeated prose
-after a tool call fails the turn. Streaming requests are not retried because
-response bytes may already have reached the client.
-`max_tokens` and `max_completion_tokens` stop the Droid turn once the limit is
-reached, and the completion ends with `finish_reason="length"` whether the cap
-fell on text or inside a tool-call argument; a partial call is dropped, never
-executed. A complete call emitted before the cap keeps
-`finish_reason="tool_calls"` so the client can run it. The cap compares Droid's
-session-cumulative output tokens with the counter captured before the turn, so
-a pooled or continued session cannot fire it on earlier output. Once Droid
-reports usage, its counter is authoritative. Until then, a coarse text-length
-fallback of roughly four characters per token prevents unbounded output. A
-capped completion is never retried server-side: the limit ended the turn, so a
-second attempt would regenerate the same capped output, and the client can
-retry or split the request itself.
-Non-final truncations log as `chat.attempt_truncated`. Its `will_retry` field
-distinguishes an actual retry from a dropped trailing partial call after a
-valid call, and `has_tool_calls` makes clear why that partial call cannot be
-retried regardless of its size. `chat.truncated` is reserved for the final
-request outcome. `chat.retry` names the reason, model, warm state, and warm age
-of the attempt that will be retried. `chat.retry_outcome` closes the loop with
-`recovered`, `refailed`, or `not_attempted` plus the retry's attempt number on
-the same `request_id`. `not_attempted` marks a same-session retry reason that
-had no session id. `chat.failed` names the model for streaming and non-streaming
-failures.
-When an earlier call in the same turn did complete, the turn keeps
-`finish_reason="tool_calls"` so the client runs the call it already received.
-Close markers inside JSON strings are argument data, not framing. Ambiguous
-repairs fail closed, including multiple argument aliases, trailing data after
-a code fence, missing Qwen parameter close tags, and pipe-tag values that do
-not match their declared type. Model-generated JSON uses the same configured
-nesting limit as request JSON.
+Translation never widens validation. Each broken form maps to one outcome:
+
+- An unknown tool name, a duplicate argument key, or prose after a call
+  still fails the turn.
+- A payload truncated before its close marker ends with
+  `finish_reason="length"`.
+- A closed malformed call, a mangled OpenAI `tool_calls` fragment, or a
+  turn packing more calls than `FACTORY_DROID_OPENAI_MAX_TOOL_CALLS` allows
+  ends with `finish_reason="stop"` and a plain-text bridge notice.
+- When an earlier call in the same turn did complete, the turn keeps
+  `finish_reason="tool_calls"` so the client runs the call it already
+  received.
+
+The malformed JSON and the call are dropped, never executed or returned to
+the client. The notice names no tool-call format, because anything it named
+would itself be tool-call-shaped text in assistant content.
+
+**Retries.** Streaming requests are never retried, because response bytes
+may already have reached the client. Every retry below runs once, on a
+non-streaming request, and keeps the original request deadline.
+
+- Before returning the stop notice, the bridge retries one malformed or
+  incomplete call when no valid call was already produced. Explicit
+  continuations and other invalid outputs retry inside the same Droid
+  session, because their earlier history is not available in the current
+  request. Same-session retries do not resend the prompt or attachments.
+- A truncated tool call on an isolated request starts a fresh Droid session
+  with the full original prompt, attachments, and a fixed correction
+  instruction, so the partial output cannot consume the retry's context.
+- A tool call on a request that declares no tools behaves the same way: an
+  isolated request retries in a fresh Droid session with the full original
+  prompt plus a correction, because the hallucinated turn poisons its own
+  session, while an explicit continuation retries inside the same session.
+- Prose after a tool call (`unexpected text after tool call`) retries once
+  inside the same session like a malformed call, and the already-collected
+  call is dropped in favor of a clean retry.
+
+Never retried:
+
+- An over-limit turn. The cap was stated in the prompt, and one more attempt
+  cannot make the original violation valid. A further bare tool call after
+  a completed call is over-limit rather than prose, so it ends the turn
+  with the stop notice instead of retrying.
+- A capped completion; see token caps below.
+
+When the retry hits the same problem again, a repeated malformed call
+still returns the notice, a repeated truncated call returns
+`finish_reason="length"` without it, and a repeated tool call on a
+tool-less request or repeated prose after a tool call fails the turn.
+
+**Token caps.** `max_tokens` and `max_completion_tokens` stop the Droid
+turn once the limit is reached, and the completion ends with
+`finish_reason="length"` whether the cap fell on text or inside a
+tool-call argument. A partial call is dropped, never executed. A complete
+call emitted before the cap keeps `finish_reason="tool_calls"` so the
+client can run it.
+
+The cap compares Droid's session-cumulative output tokens with the counter
+captured before the turn, so a pooled or continued session cannot fire it
+on earlier output. Once Droid reports usage, its counter is authoritative.
+Until then, a coarse text-length fallback of roughly four characters per
+token prevents unbounded output.
+
+A capped completion is never retried server-side. The limit ended the
+turn, so a second attempt would regenerate the same capped output, and the
+client can retry or split the request itself.
+
+**Truncation and retry events.**
+
+- `chat.attempt_truncated` logs a non-final truncation. Its `will_retry`
+  field distinguishes an actual retry from a dropped trailing partial call
+  after a valid call, and `has_tool_calls` makes clear why that partial
+  call cannot be retried regardless of its size.
+- `chat.truncated` is reserved for the final request outcome.
+- `chat.retry` names the reason, model, warm state, and warm age of the
+  attempt that will be retried.
+- `chat.retry_outcome` closes the loop with `recovered`, `refailed`, or
+  `not_attempted` plus the retry's attempt number on the same
+  `request_id`. `not_attempted` marks a same-session retry reason that had
+  no session id.
+- `chat.failed` names the model for streaming and non-streaming failures.
+
+**Fail-closed parsing.** Close markers inside JSON strings are argument
+data, not framing. Ambiguous repairs fail closed, including multiple
+argument aliases, trailing data after a code fence, missing Qwen parameter
+close tags, and pipe-tag values that do not match their declared type.
+Model-generated JSON uses the same configured nesting limit as request JSON.
 Qwen3's XML form declares no argument types, so a scalar value stays the
 string the model wrote unless it wrote a JSON object or array.
 
