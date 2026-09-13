@@ -147,6 +147,11 @@ _MODEL_OUTPUT_RETRY_PROMPTS: dict[ModelOutputRetryReason, str] = {
     ),
 }
 _TOOL_WITHOUT_CATALOG_ERROR = "the model requested a tool when none are available"
+# The bridge ships no tokenizer, so the text-length fallback in OutputTokenCap
+# counts roughly 4 characters per output token; Droid's own usage snapshots
+# stay authoritative whenever they arrive mid-turn.
+_CHARS_PER_TOKEN_ESTIMATE = 4
+_OUTPUT_LIMIT_TRUNCATION = "output token limit reached"
 
 CHAT_COMPLETION_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {
@@ -1633,6 +1638,14 @@ def create_app(
                 record_repair=record_repair,
             )
 
+        # max_completion_tokens wins when both are set, matching the OpenAI
+        # field that supersedes the deprecated max_tokens.
+        output_token_limit = (
+            payload.max_completion_tokens
+            if payload.max_completion_tokens is not None
+            else payload.max_tokens
+        )
+
         if payload.stream:
             request.state.stream_outcome = "pending"
             started_stream_session: str | None = None
@@ -1687,6 +1700,7 @@ def create_app(
                 failure_callback=note_stream_failure,
                 drain_seconds=resolved_settings.tool_call_drain_seconds,
                 trace_event=payload_tracer.trace,
+                output_token_limit=output_token_limit,
             )
             return FinalizingStreamingResponse(
                 event_stream,
@@ -1753,6 +1767,7 @@ def create_app(
                                 observe_ttft=attempt == 0,
                                 trace_attempt=attempt,
                                 trace_choice=index,
+                                output_token_limit=output_token_limit,
                             )
                         except ProtocolError as exc:
                             if attempt == 0 and str(exc) == _TOOL_WITHOUT_CATALOG_ERROR:
@@ -1798,7 +1813,11 @@ def create_app(
                                 result,
                                 tools_available=bool(plan.allowed_tool_names),
                             )
-                            if retry_reason is None and structured is not None:
+                            if (
+                                retry_reason is None
+                                and structured is not None
+                                and not result.output_capped
+                            ):
                                 try:
                                     _validate_structured_output(result.text, structured)
                                 except ProtocolError as exc:
@@ -1888,6 +1907,7 @@ def create_app(
                         choice_message["content"] is None
                         and not choice_message.get("tool_calls")
                         and not completed_result.stopped
+                        and not completed_result.output_capped
                     ):
                         # A dead Factory key answers with empty 200s before it
                         # answers with errors (issue #122), so an empty body
@@ -1996,8 +2016,50 @@ class _TruncatedToolCall:
     payload_bytes: int
 
     @classmethod
-    def from_error(cls, exc: IncompleteToolCallError) -> _TruncatedToolCall:
-        return cls(str(exc), exc.tool_name, exc.payload_bytes)
+    def from_error(
+        cls,
+        exc: IncompleteToolCallError,
+        *,
+        reason: str | None = None,
+    ) -> _TruncatedToolCall:
+        return cls(reason if reason is not None else str(exc), exc.tool_name, exc.payload_bytes)
+
+
+class OutputTokenCap:
+    """Turn-local max_tokens enforcement built from Droid usage snapshots.
+
+    Droid reports session-cumulative counters, so SessionStarted carries the
+    pre-turn baseline and the cap watches the delta; a continued session
+    cannot fire the cap on tokens its earlier turns produced. Models that
+    report no usage mid-turn get a coarse text-length fallback instead of
+    running free (issue #130).
+    """
+
+    def __init__(self, limit: int | None) -> None:
+        self._limit = limit
+        self._baseline: int | None = None
+        self._emitted_chars = 0
+        self._usage_seen = False
+
+    def start_turn(self, output_tokens: int | None) -> None:
+        self._baseline = output_tokens
+
+    def record_usage(self, usage: Usage) -> bool:
+        """Returns True when reported output tokens reached the limit."""
+        if self._limit is None:
+            return False
+        if self._baseline is None:
+            self._baseline = usage.output_tokens
+            return False
+        self._usage_seen = True
+        return usage.output_tokens - self._baseline >= self._limit
+
+    def record_text(self, text: str) -> bool:
+        """Returns True when emitted text plausibly reached the limit."""
+        if self._limit is None or self._usage_seen:
+            return False
+        self._emitted_chars += len(text)
+        return self._emitted_chars >= self._limit * _CHARS_PER_TOKEN_ESTIMATE
 
 
 class CollectedCompletion:
@@ -2012,6 +2074,7 @@ class CollectedCompletion:
         self.truncation: _TruncatedToolCall | None = None
         self.warm_age_ms: float | None = None
         self.malformed_note: str | None = None
+        self.output_capped = False
 
     @property
     def text(self) -> str:
@@ -2032,6 +2095,10 @@ def _completion_retry_reason(
     tools_available: bool,
 ) -> ModelOutputRetryReason | None:
     if result.tool_calls:
+        return None
+    if result.output_capped:
+        # The requested limit, not model misbehavior, ended the turn, so a
+        # retry would regenerate the same capped output (issue #130).
         return None
     if result.malformed_note is not None:
         return "malformed_tool_call" if tools_available else "tool_without_catalog"
@@ -2163,8 +2230,8 @@ def _event_record(event: RunEvent) -> dict[str, Any]:
     if isinstance(event, StatusUpdate):
         return {"kind": "status", "state": event.state}
     # The session id identifies a Factory account session and replay never
-    # needs it, so SessionStarted is recorded without its payload.
-    return {"kind": "session_started"}
+    # needs it, but the pre-turn counter is required to reproduce cap behavior.
+    return {"kind": "session_started", "output_tokens": event.output_tokens}
 
 
 async def _run_events(
@@ -2233,10 +2300,12 @@ async def _collect_completion(
     observe_ttft: bool = True,
     trace_attempt: int = 0,
     trace_choice: int = 0,
+    output_token_limit: int | None = None,
 ) -> CollectedCompletion:
     result = CollectedCompletion()
     result.warm_age_ms = _warm_session_age_ms(run_request)
     stop_buffer = StopSequenceBuffer(stop_sequences)
+    token_cap = OutputTokenCap(output_token_limit)
     observed_ttft = not observe_ttft
 
     def record_malformed(exc: MalformedToolCallError) -> None:
@@ -2285,6 +2354,13 @@ async def _collect_completion(
                     result.stopped = True
                     result.completed = True
                     break
+                if token_cap.record_text(event.text):
+                    # Same interruption as a stop sequence: reading past the
+                    # requested output limit only burns tokens nobody asked
+                    # for (issue #130).
+                    result.output_capped = True
+                    result.completed = True
+                    break
             elif isinstance(event, ReasoningDelta):
                 observed_ttft = _observe_ttft(
                     observed_ttft,
@@ -2292,14 +2368,27 @@ async def _collect_completion(
                     request_started_at,
                 )
                 result.reasoning_parts.append(event.text)
+                if token_cap.record_text(event.text):
+                    result.output_capped = True
+                    result.completed = True
+                    break
             elif isinstance(event, SessionStarted):
                 result.session_id = event.session_id
+                token_cap.start_turn(event.output_tokens)
                 if session_callback is not None:
                     session_callback(event.session_id)
             elif isinstance(event, UsageUpdate):
                 result.usage = event.usage
+                if token_cap.record_usage(event.usage):
+                    result.output_capped = True
+                    result.completed = True
+                    break
             elif isinstance(event, RunComplete):
                 result.usage = event.usage
+                if token_cap.record_usage(event.usage):
+                    # The turn ended on its own past the limit; the completion
+                    # still reports length so the client can see the cap hit.
+                    result.output_capped = True
                 result.completed = True
                 break
     if result.tool_calls:
@@ -2316,6 +2405,8 @@ async def _collect_completion(
             # A failed parse already settled the turn; asking the parser to
             # finish would re-raise on the same garbage.
             try:
+                if result.output_capped:
+                    parser.discard_partial_call()
                 _apply_emissions(result, parser.finish(), stop_buffer)
             except MalformedToolCallError as exc:
                 record_malformed(exc)
@@ -2324,7 +2415,23 @@ async def _collect_completion(
                 # a tool-call payload returns completed output with
                 # finish_reason="length" instead of a 502. The partial call is
                 # dropped, never executed.
-                result.truncation = _TruncatedToolCall.from_error(exc)
+                result.truncation = _TruncatedToolCall.from_error(
+                    exc,
+                    reason=_OUTPUT_LIMIT_TRUNCATION if result.output_capped else None,
+                )
+            except ProtocolError:
+                # A capped turn already ends with finish_reason="length"; a
+                # required-call or trailing-prose complaint would turn a
+                # limit-cut completion into a 502 even though the limit, not
+                # the model, ended it.
+                if not result.output_capped:
+                    raise
+            if result.output_capped and result.truncation is None:
+                result.truncation = _TruncatedToolCall(
+                    reason=_OUTPUT_LIMIT_TRUNCATION,
+                    tool_name=None,
+                    payload_bytes=0,
+                )
         held = stop_buffer.flush()
         if held:
             result.text_parts.append(held)
@@ -2346,6 +2453,7 @@ async def _collect_completion_or_disconnect(
     observe_ttft: bool = True,
     trace_attempt: int = 0,
     trace_choice: int = 0,
+    output_token_limit: int | None = None,
 ) -> CollectedCompletion | None:
     completion_task = asyncio.create_task(
         _collect_completion(
@@ -2361,6 +2469,7 @@ async def _collect_completion_or_disconnect(
             observe_ttft=observe_ttft,
             trace_attempt=trace_attempt,
             trace_choice=trace_choice,
+            output_token_limit=output_token_limit,
         )
     )
     disconnect_task = asyncio.create_task(_wait_for_disconnect(request))
@@ -2409,15 +2518,19 @@ async def _stream_completion(
     failure_callback: Callable[[str, RunnerError], None] | None = None,
     drain_seconds: float = DEFAULT_TOOL_CALL_DRAIN_SECONDS,
     trace_event: Callable[..., None] | None = None,
+    output_token_limit: int | None = None,
 ) -> AsyncIterator[str]:
     usage = Usage()
     warm_age_ms = _warm_session_age_ms(run_request)
     completed = False
+    capped = False
     saw_tool_call = False
     saw_text = False
+    saw_output = False
     observed_ttft = False
     outcome = "success"
     stop_buffer = StopSequenceBuffer(stop_sequences)
+    token_cap = OutputTokenCap(output_token_limit)
     tool_call_index = 0
     structured_buffer = (
         StructuredOutputBuffer(structured.max_bytes) if structured is not None else None
@@ -2483,13 +2596,22 @@ async def _stream_completion(
                                 chunk_payload = text_chunk(text)
                                 if chunk_payload is not None:
                                     saw_text = True
+                                    saw_output = True
                                     yield chunk_payload
                         if stop_buffer.triggered:
                             # Closing the runner generator interrupts the Droid
                             # turn instead of draining output nobody will read.
                             completed = True
                             break
+                        if token_cap.record_text(event.text):
+                            # Same interruption as a stop sequence: reading
+                            # past the requested output limit only burns
+                            # tokens nobody asked for (issue #130).
+                            capped = True
+                            completed = True
+                            break
                     elif isinstance(event, SessionStarted):
+                        token_cap.start_turn(event.output_tokens)
                         if session_callback is not None:
                             session_callback(event.session_id)
                         if expose_session:
@@ -2531,10 +2653,24 @@ async def _stream_completion(
                                 include_usage=include_usage,
                             )
                         )
+                        saw_output = saw_output or bool(event.text)
+                        if token_cap.record_text(event.text):
+                            capped = True
+                            completed = True
+                            break
                     elif isinstance(event, UsageUpdate):
                         usage = event.usage
+                        if token_cap.record_usage(event.usage):
+                            capped = True
+                            completed = True
+                            break
                     elif isinstance(event, RunComplete):
                         usage = event.usage
+                        if token_cap.record_usage(event.usage):
+                            # The turn ended on its own past the limit; the
+                            # stream still finishes with length so the client
+                            # can see the cap hit.
+                            capped = True
                         completed = True
                         break
 
@@ -2548,36 +2684,49 @@ async def _stream_completion(
                     error_type="factory_incomplete_response",
                 )
             if not stop_buffer.triggered:
-                for emission in parser.finish():
-                    if isinstance(emission, ToolCallEmission):
-                        saw_tool_call = True
-                        yield _sse(
-                            _chunk_for_emission(
-                                request_id,
-                                created,
-                                model,
-                                emission,
-                                include_usage=include_usage,
-                                tool_call_index=tool_call_index,
+                try:
+                    if capped:
+                        parser.discard_partial_call()
+                    for emission in parser.finish():
+                        if isinstance(emission, ToolCallEmission):
+                            saw_tool_call = True
+                            yield _sse(
+                                _chunk_for_emission(
+                                    request_id,
+                                    created,
+                                    model,
+                                    emission,
+                                    include_usage=include_usage,
+                                    tool_call_index=tool_call_index,
+                                )
                             )
-                        )
-                        tool_call_index += 1
-                        continue
-                    text = stop_buffer.feed(emission.text)
-                    if text:
-                        chunk_payload = text_chunk(text)
-                        if chunk_payload is not None:
-                            saw_text = True
-                            yield chunk_payload
+                            tool_call_index += 1
+                            continue
+                        text = stop_buffer.feed(emission.text)
+                        if text:
+                            chunk_payload = text_chunk(text)
+                            if chunk_payload is not None:
+                                saw_text = True
+                                saw_output = True
+                                yield chunk_payload
+                except ProtocolError:
+                    # A capped turn already ends with finish_reason="length";
+                    # a required-call complaint would turn a limit-cut stream
+                    # into an error event. An uncapped turn keeps its existing
+                    # truncation or error handling.
+                    if not capped:
+                        raise
                 held = stop_buffer.flush()
                 if held:
                     chunk_payload = text_chunk(held)
                     if chunk_payload is not None:
                         saw_text = True
+                        saw_output = True
                         yield chunk_payload
             if structured is not None and structured_buffer is not None:
                 structured_text = structured_buffer.text()
-                _validate_structured_output(structured_text, structured)
+                if not capped:
+                    _validate_structured_output(structured_text, structured)
                 yield _sse(
                     _chunk_for_emission(
                         request_id,
@@ -2587,13 +2736,34 @@ async def _stream_completion(
                         include_usage=include_usage,
                     )
                 )
+                saw_output = saw_output or bool(structured_text)
+            if capped:
+                if not saw_tool_call:
+                    outcome = "truncated"
+                _log_truncated_tool_call(
+                    _TruncatedToolCall(
+                        reason=_OUTPUT_LIMIT_TRUNCATION,
+                        tool_name=None,
+                        payload_bytes=0,
+                    ),
+                    stream=True,
+                    run_request=run_request,
+                    usage=usage,
+                    attempt=0,
+                    choice=0,
+                    warm_age_ms=warm_age_ms,
+                    will_retry=False,
+                    has_tool_calls=saw_tool_call,
+                )
             yield _sse(
                 _chunk(
                     request_id,
                     created,
                     model,
                     delta={},
-                    finish_reason="tool_calls" if saw_tool_call else "stop",
+                    finish_reason=(
+                        "tool_calls" if saw_tool_call else "length" if capped else "stop"
+                    ),
                     include_usage=include_usage,
                 )
             )
@@ -2711,13 +2881,16 @@ async def _stream_completion(
             raise
         if outcome_callback is not None:
             outcome_callback(outcome)
-        if outcome == "success" and completion_callback is not None:
-            completion_callback(
-                not saw_text
-                and not saw_tool_call
-                and structured is None
-                and not stop_buffer.triggered
-            )
+        if completion_callback is not None:
+            if outcome == "success":
+                completion_callback(
+                    not saw_text
+                    and not saw_tool_call
+                    and structured is None
+                    and not stop_buffer.triggered
+                )
+            elif capped and saw_output:
+                completion_callback(False)
         _log_stream_outcome(outcome, model=model, usage=usage, tool_calls=tool_call_index)
         yield "data: [DONE]\n\n"
 

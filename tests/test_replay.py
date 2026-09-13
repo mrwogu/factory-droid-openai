@@ -92,7 +92,11 @@ def _event(record: dict[str, Any]) -> RunEvent:
     if kind == "status":
         return StatusUpdate(record["state"])
     if kind == "session_started":
-        return SessionStarted("replay-session")
+        output_tokens = record.get("output_tokens", 0)
+        return SessionStarted(
+            "replay-session",
+            None if output_tokens is None else int(output_tokens),
+        )
     raise AssertionError(f"unknown recorded event kind: {kind}")
 
 

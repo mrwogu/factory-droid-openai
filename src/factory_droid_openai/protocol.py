@@ -475,6 +475,14 @@ class ToolCallStreamParser:
             raise ProtocolError("the model did not produce the required tool call")
         return emissions
 
+    def discard_partial_call(self) -> None:
+        """Drop a call whose framing was incomplete when the turn was stopped."""
+        self._pending_transcript_error = None
+        if self._capturing:
+            self._reset_tool_payload()
+        if self._capturing_message_json:
+            self._reset_message_json()
+
     def _consume_text(
         self,
         chunk: str,

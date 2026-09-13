@@ -82,6 +82,7 @@ class FakeClient:
         self.session_id = session_id
         self.loaded_session_id: str | None = None
         self.loaded_mcp_servers: list[dict[str, Any]] | None = None
+        self.loaded_token_usage: Any = None
         self.images: Any = None
         self.files: Any = None
         self.init_kwargs: dict[str, Any] = {}
@@ -109,10 +110,11 @@ class FakeClient:
         *,
         session_id: str,
         mcp_servers: list[dict[str, Any]] | None = None,
-    ) -> None:
+    ) -> Any:
         self.loaded_mcp_servers = mcp_servers
         self.loaded_session_id = session_id
         self.session_id = session_id
+        return SimpleNamespace(token_usage=self.loaded_token_usage)
 
     async def add_user_message(
         self,
@@ -927,6 +929,7 @@ async def test_runner_loads_existing_session_instead_of_initializing(
         cache_write_tokens=0,
     )
     client = FakeClient([TurnComplete(usage)])
+    client.loaded_token_usage = SimpleNamespace(output_tokens=41)
     runner = DroidRunner(
         droid_path="droid",
         workdir=tmp_path,
@@ -937,7 +940,7 @@ async def test_runner_loads_existing_session_instead_of_initializing(
 
     assert client.loaded_session_id == "session-42"
     assert client.init_kwargs == {}
-    assert events[0] == SessionStarted("session-42")
+    assert events[0] == SessionStarted("session-42", output_tokens=41)
 
 
 @pytest.mark.asyncio

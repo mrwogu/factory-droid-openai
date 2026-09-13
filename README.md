@@ -167,7 +167,7 @@ factory-droid-openai
 | Sampling controls | ❌ | `temperature`, `top_p`, penalties, and `seed` are ignored |
 | Multiple choices | ✅ | `n` runs that many Droid turns sequentially and returns `n` choices |
 | Log probabilities | ❌ | `logprobs` and `top_logprobs` are ignored |
-| Output token limits | ❌ | `max_tokens` and `max_completion_tokens` are ignored |
+| Output token limits | ✅ | `max_tokens` and `max_completion_tokens` stop the turn at the limit; incomplete output ends with `finish_reason="length"` |
 | Stored completions | ❌ | `store`, `metadata`, listing, retrieval, and deletion are unavailable |
 | Prompt cache controls | ❌ | OpenAI cache keys and retention settings are ignored |
 | Built-in web search | ❌ | `web_search_options` is ignored |
@@ -301,6 +301,18 @@ do not resend the prompt or attachments. Every retry keeps the original request
 deadline. A repeated malformed call still returns the notice, while a repeated
 truncated call returns `finish_reason="length"` without it. Streaming requests
 are not retried because response bytes may already have reached the client.
+`max_tokens` and `max_completion_tokens` stop the Droid turn once the limit is
+reached, and the completion ends with `finish_reason="length"` whether the cap
+fell on text or inside a tool-call argument; a partial call is dropped, never
+executed. A complete call emitted before the cap keeps
+`finish_reason="tool_calls"` so the client can run it. The cap compares Droid's
+session-cumulative output tokens with the counter captured before the turn, so
+a pooled or continued session cannot fire it on earlier output. Once Droid
+reports usage, its counter is authoritative. Until then, a coarse text-length
+fallback of roughly four characters per token prevents unbounded output. A
+capped completion is never retried server-side: the limit ended the turn, so a
+second attempt would regenerate the same capped output, and the client can
+retry or split the request itself.
 Non-final truncations log as `chat.attempt_truncated`. Its `will_retry` field
 distinguishes an actual retry from a dropped trailing partial call after a
 valid call, and `has_tool_calls` makes clear why that partial call cannot be
@@ -995,8 +1007,8 @@ What VS Code BYOK does not cover, regardless of the bridge:
 - Any feature that requires a Copilot plan or GitHub sign-in
 
 What the bridge accepts but ignores when VS Code sends it:
-`temperature`, `top_p`, `seed`, `max_tokens`, `max_completion_tokens`,
-`logprobs`, and `top_logprobs`. These are documented in the
+`temperature`, `top_p`, `seed`, `logprobs`, and `top_logprobs`. These are
+documented in the
 [API compatibility](#api-compatibility) table. Remote `http(s)` image URLs are
 rejected with `400`; send vision inputs as base64 `data:` URIs instead.
 VSCode does not auto-discover models from a Custom Endpoint, so every Droid
@@ -1089,7 +1101,7 @@ tool calls through the official `openai` Python client.
 | `factory_droid_reasoning_effort` | Yes | Bridge-specific override, wins over `reasoning_effort` |
 | `timeout` | Yes | Per-request value capped by server timeout |
 | `temperature`, `top_p`, penalties, `seed` | No | Accepted but ignored |
-| `max_tokens`, `max_completion_tokens` | No | Accepted but ignored; Droid owns the output budget |
+| `max_tokens`, `max_completion_tokens` | Yes | Stop incomplete output at the limit; a completed call still returns `tool_calls`; `max_completion_tokens` wins when both are set |
 | `response_format` | Yes | `json_schema` and `json_object`; validated again before completion |
 | `functions`, `function_call` | No | Legacy function-calling fields are ignored |
 | `modalities`, `audio` | No | Accepted but ignored |
