@@ -75,10 +75,17 @@ _MANGLED_TOOL_CALLS_PATTERN = re.compile(
 )
 _MANGLED_TOOL_CALLS_START = '"tool'
 _MANGLED_TOOL_CALLS_TAILS = ((":", '"id"', ":", '"call_'), (":", '"call_'))
+# Shared error wording so the app-side retry classifier matches the exact
+# reason the parser raised, instead of a second copy of the same sentence.
+TOOL_WITHOUT_CATALOG_MESSAGE = "the model requested a tool when none are available"
+TOOL_CALL_LIMIT_MESSAGE = "more tool calls than the configured maximum"
+_TOOL_CALL_OVER_LIMIT_EVENT = "tool_call.over_limit"
 
 __all__ = [
     "TOOL_CALL_CLOSE",
+    "TOOL_CALL_LIMIT_MESSAGE",
     "TOOL_CALL_OPEN",
+    "TOOL_WITHOUT_CATALOG_MESSAGE",
     "AttachmentSet",
     "IncompleteToolCallError",
     "MalformedToolCallError",
@@ -417,14 +424,14 @@ class ToolCallStreamParser:
         self._saw_tool_call = False
         self._tool_call_count = 0
         self._dialect = NATIVE_DIALECT
-        self._pending_transcript_error: MalformedToolCallError | None = None
+        self._pending_error: ProtocolError | None = None
 
     def feed(self, chunk: str) -> list[ProtocolEmission]:
         if not chunk:
             return []
-        if self._pending_transcript_error is not None:
-            error = self._pending_transcript_error
-            self._pending_transcript_error = None
+        if self._pending_error is not None:
+            error = self._pending_error
+            self._pending_error = None
             raise error
         try:
             chunk.encode("utf-8")
@@ -444,9 +451,9 @@ class ToolCallStreamParser:
     def finish(self) -> list[ProtocolEmission]:
         """Flushes buffered text and any tool call left without a close marker."""
         emissions: list[ProtocolEmission] = []
-        if self._pending_transcript_error is not None:
-            error = self._pending_transcript_error
-            self._pending_transcript_error = None
+        if self._pending_error is not None:
+            error = self._pending_error
+            self._pending_error = None
             raise error
         if self._capturing:
             # Snapshot before recovering: a successful repair clears the chunks.
@@ -477,11 +484,24 @@ class ToolCallStreamParser:
 
     def discard_partial_call(self) -> None:
         """Drop a call whose framing was incomplete when the turn was stopped."""
-        self._pending_transcript_error = None
+        self._pending_error = None
+        self._text_tail = ""
         if self._capturing:
             self._reset_tool_payload()
         if self._capturing_message_json:
             self._reset_message_json()
+
+    def _defer_error_after_calls(
+        self,
+        emissions: list[ProtocolEmission],
+        error: ProtocolError,
+    ) -> bool:
+        if isinstance(error, MalformedToolCallError) and str(error) == TOOL_CALL_LIMIT_MESSAGE:
+            return False
+        if not any(isinstance(emission, ToolCallEmission) for emission in emissions):
+            return False
+        self._pending_error = error
+        return True
 
     def _consume_text(
         self,
@@ -526,7 +546,7 @@ class ToolCallStreamParser:
             payload = value[mangled_match.start() :]
             # Return already verified prose first. The next chunk or finish()
             # raises before any transcript-shaped tail reaches the client.
-            self._pending_transcript_error = self._transcript_error(payload)
+            self._pending_error = self._transcript_error(payload)
             return emissions
 
         if found is not None:
@@ -635,39 +655,51 @@ class ToolCallStreamParser:
         calls = message["tool_calls"]
         if not isinstance(calls, list):
             raise self._transcript_error(raw)
+        if not self._allowed_tool_names:
+            raise ProtocolError(TOOL_WITHOUT_CATALOG_MESSAGE)
         content = message.get("content")
         emissions: list[ProtocolEmission] = (
             [TextEmission(content)] if isinstance(content, str) and content else []
         )
         for call in calls:
-            if not isinstance(call, dict):
-                raise self._transcript_error(raw)
-            function = call.get("function")
-            if not isinstance(function, dict):
-                raise self._transcript_error(raw)
-            name = function.get("name")
-            arguments = function.get("arguments", "{}")
-            if not isinstance(name, str) or not isinstance(arguments, (str, dict)):
-                raise self._transcript_error(raw)
-            if isinstance(arguments, str):
-                if not arguments.strip():
-                    arguments = {}
-                else:
-                    try:
-                        arguments = parse_strict_json(arguments)
-                    except (json.JSONDecodeError, ValueError) as exc:
-                        raise self._transcript_error(raw) from exc
-            if not isinstance(arguments, dict):
-                raise self._transcript_error(raw)
-            if json_depth_exceeds(arguments, self._max_json_depth):
-                raise self._transcript_error(raw)
-            emissions.extend(
-                self._emit_tool_calls(
-                    [{"name": name, "arguments": arguments}],
-                    raw,
-                )
-            )
+            try:
+                emissions.extend(self._assistant_message_tool_call(call, raw))
+            except ProtocolError as exc:
+                if not self._defer_error_after_calls(emissions, exc):
+                    raise
+                break
         return emissions
+
+    def _assistant_message_tool_call(
+        self,
+        call: Any,
+        raw: str,
+    ) -> list[ToolCallEmission]:
+        if not isinstance(call, dict):
+            raise self._transcript_error(raw)
+        function = call.get("function")
+        if not isinstance(function, dict):
+            raise self._transcript_error(raw)
+        name = function.get("name")
+        arguments = function.get("arguments", "{}")
+        if not isinstance(name, str) or not isinstance(arguments, (str, dict)):
+            raise self._transcript_error(raw)
+        if isinstance(arguments, str):
+            if not arguments.strip():
+                arguments = {}
+            else:
+                try:
+                    arguments = parse_strict_json(arguments)
+                except (json.JSONDecodeError, ValueError) as exc:
+                    raise self._transcript_error(raw) from exc
+        if not isinstance(arguments, dict):
+            raise self._transcript_error(raw)
+        if json_depth_exceeds(arguments, self._max_json_depth):
+            raise self._transcript_error(raw)
+        return self._emit_tool_calls(
+            [{"name": name, "arguments": arguments}],
+            raw,
+        )
 
     def _transcript_error(
         self,
@@ -793,12 +825,15 @@ class ToolCallStreamParser:
         emissions: list[ProtocolEmission] = list(
             self._emit_tool_calls(payload_objects, complete_payload)
         )
-        if self._tool_call_count >= self._max_tool_calls:
-            self._done = True
-            self._consume_post_limit_trailing(trailing)
-            return emissions
-        if trailing:
-            emissions.extend(self._consume_text(trailing))
+        try:
+            if self._tool_call_count >= self._max_tool_calls:
+                self._done = True
+                self._consume_post_limit_trailing(trailing)
+            elif trailing:
+                emissions.extend(self._consume_text(trailing))
+        except ProtocolError as exc:
+            if not self._defer_error_after_calls(emissions, exc):
+                raise
         return emissions
 
     def _consume_post_limit_trailing(self, chunk: str) -> None:
@@ -808,8 +843,12 @@ class ToolCallStreamParser:
         if found is not None:
             marker_index, dialect = found
             if not self._residual(value[:marker_index]).strip():
+                # A bare further call past the limit is an over-limit
+                # violation, not trailing prose: it fails the turn instead
+                # of retrying into a single-call answer that hides the
+                # violation.
                 self._dialect = dialect
-                self._report_repair("tool_call.over_limit")
+                raise self._tool_call_limit_error(value, self._tool_call_count + 1)
             raise self._trailing_output_error()
 
         held = max(
@@ -872,17 +911,17 @@ class ToolCallStreamParser:
         tool_name = _guess_tool_name(payload, self._allowed_tool_names)
         payload_bytes = len(payload.encode("utf-8"))
         log_trace(
-            "tool_call.over_limit",
+            _TOOL_CALL_OVER_LIMIT_EVENT,
             tool_name=tool_name,
             requested=requested,
             maximum=self._max_tool_calls,
             dialect=self._dialect.name,
             payload_bytes=payload_bytes,
         )
-        self._trace_payload("tool_call.over_limit", payload)
-        self._report_repair("tool_call.over_limit")
+        self._trace_payload(_TOOL_CALL_OVER_LIMIT_EVENT, payload)
+        self._report_repair(_TOOL_CALL_OVER_LIMIT_EVENT)
         return MalformedToolCallError(
-            "more tool calls than the configured maximum",
+            TOOL_CALL_LIMIT_MESSAGE,
             tool_name=tool_name,
             payload_bytes=payload_bytes,
         )
@@ -920,7 +959,7 @@ class ToolCallStreamParser:
         :meth:`_tool_call_from_object`.
         """
         if not self._allowed_tool_names:
-            raise ProtocolError("the model requested a tool when none are available")
+            raise ProtocolError(TOOL_WITHOUT_CATALOG_MESSAGE)
         body = strip_code_fence(payload.strip())
         object_limit = (
             min(self._max_tool_calls, MAX_PACKED_CALLS) if enforce_call_limit else MAX_PACKED_CALLS

@@ -8,7 +8,7 @@ import secrets
 import time
 import uuid
 from collections import OrderedDict, deque
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeVar, cast
 
@@ -57,6 +57,8 @@ from factory_droid_openai.models import (
 from factory_droid_openai.payloadlog import configure_payload_tracing
 from factory_droid_openai.pool import BackgroundReaper, WarmSessionPool
 from factory_droid_openai.protocol import (
+    TOOL_CALL_LIMIT_MESSAGE,
+    TOOL_WITHOUT_CATALOG_MESSAGE,
     IncompleteToolCallError,
     MalformedToolCallError,
     ProtocolEmission,
@@ -104,6 +106,7 @@ ModelOutputRetryReason = Literal[
     "malformed_tool_call",
     "structured_output",
     "tool_without_catalog",
+    "trailing_output",
     "truncated_tool_call",
 ]
 RetryOutcome = Literal["recovered", "refailed", "not_attempted"]
@@ -141,12 +144,16 @@ _MODEL_OUTPUT_RETRY_PROMPTS: dict[ModelOutputRetryReason, str] = {
         "Your previous response attempted a tool call, but no tools are available. Answer "
         "the original request directly without any tool call or explanation about this correction."
     ),
+    "trailing_output": (
+        "Your previous response contained text after the tool call. Return the required "
+        "tool call again as one complete valid tool call. Output no explanation."
+    ),
     "truncated_tool_call": (
         "A previous tool call attempt was incomplete. Return the required tool call as one "
         "complete valid tool call. Output no explanation."
     ),
 }
-_TOOL_WITHOUT_CATALOG_ERROR = "the model requested a tool when none are available"
+_TRAILING_OUTPUT_ERROR_PREFIX = "unexpected text after tool call"
 # The bridge ships no tokenizer, so the text-length fallback in OutputTokenCap
 # counts roughly 4 characters per output token; Droid's own usage snapshots
 # stay authoritative whenever they arrive mid-turn.
@@ -1770,16 +1777,20 @@ def create_app(
                                 output_token_limit=output_token_limit,
                             )
                         except ProtocolError as exc:
-                            if attempt == 0 and str(exc) == _TOOL_WITHOUT_CATALOG_ERROR:
-                                retry_reason = "tool_without_catalog"
-                                if attempt_session_id is None:
-                                    _log_retry_outcome(
-                                        retry_reason,
-                                        "not_attempted",
-                                        attempt=attempt,
-                                    )
-                                    raise
-                            else:
+                            # A tool call on a tool-less request and prose after
+                            # a tool call are transient model behavior, so they
+                            # retry once instead of failing the turn with a
+                            # hard 502 (issues #124 and #128).
+                            shape = _retryable_protocol_error(exc)
+                            retry_reason = _protocol_error_retry_reason(
+                                shape,
+                                attempt=attempt,
+                                request_session_id=choice_request.session_id,
+                                attempt_session_id=attempt_session_id,
+                            )
+                            if retry_reason is None:
+                                if shape is not None and attempt == 0:
+                                    _log_retry_outcome(shape, "not_attempted", attempt=attempt)
                                 raise
                         else:
                             if result is None:
@@ -1856,8 +1867,15 @@ def create_app(
                             )
                         if retry_request is None:
                             if retry_in_flight and retry_reason_in_flight is not None:
+                                terminal_malformed = (
+                                    result is not None
+                                    and result.malformed_note is not None
+                                    and not result.tool_calls
+                                )
                                 outcome: RetryOutcome = (
-                                    "refailed" if retry_reason is not None else "recovered"
+                                    "refailed"
+                                    if retry_reason is not None or terminal_malformed
+                                    else "recovered"
                                 )
                                 _log_retry_outcome(
                                     retry_reason_in_flight,
@@ -2074,6 +2092,7 @@ class CollectedCompletion:
         self.truncation: _TruncatedToolCall | None = None
         self.warm_age_ms: float | None = None
         self.malformed_note: str | None = None
+        self.malformed_reason: str | None = None
         self.output_capped = False
 
     @property
@@ -2101,6 +2120,11 @@ def _completion_retry_reason(
         # retry would regenerate the same capped output (issue #130).
         return None
     if result.malformed_note is not None:
+        if result.malformed_reason == TOOL_CALL_LIMIT_MESSAGE:
+            # An over-limit turn broke a cap the prompt stated up front, so a
+            # clean retry could not make the original violation valid; it
+            # fails with the stop notice instead.
+            return None
         return "malformed_tool_call" if tools_available else "tool_without_catalog"
     if result.truncated:
         return "truncated_tool_call" if tools_available else "tool_without_catalog"
@@ -2117,6 +2141,44 @@ def _retryable_structured_output_error(exc: ProtocolError) -> bool:
             "Factory Droid structured output violated the requested schema",
         )
     )
+
+
+def _retryable_protocol_error(exc: ProtocolError) -> ModelOutputRetryReason | None:
+    """The transient protocol-error shapes one bounded retry can recover.
+
+    A tool call on a tool-less request and prose after a completed tool call
+    are model misbehavior that one clean retry usually answers (issues #124
+    and #128); everything else keeps failing the turn.
+    """
+    message = str(exc)
+    if message == TOOL_WITHOUT_CATALOG_MESSAGE:
+        return "tool_without_catalog"
+    if message.startswith(_TRAILING_OUTPUT_ERROR_PREFIX):
+        return "trailing_output"
+    return None
+
+
+def _protocol_error_retry_reason(
+    shape: ModelOutputRetryReason | None,
+    *,
+    attempt: int,
+    request_session_id: str | None,
+    attempt_session_id: str | None,
+) -> ModelOutputRetryReason | None:
+    """One bounded retry for the retryable protocol-error shapes.
+
+    A tool call on a tool-less request retries in a fresh session, which an
+    isolated request can always start. Prose after a tool call keeps the same
+    session, so that session id has to be known. A repeated shape fails the
+    turn as before.
+    """
+    if shape is None or attempt != 0:
+        return None
+    if shape == "tool_without_catalog" and request_session_id is None:
+        return shape
+    if attempt_session_id is None:
+        return None
+    return shape
 
 
 def _log_retry_outcome(
@@ -2141,6 +2203,20 @@ def _model_output_retry_request(
 ) -> RunRequest | None:
     if reason == "truncated_tool_call" and request.session_id is None:
         # Sonar cannot infer that dataclasses.replace preserves the input type.
+        return cast(  # type: ignore[redundant-cast]
+            "RunRequest",
+            replace(
+                request,
+                prompt=f"{request.prompt}\n\n{_MODEL_OUTPUT_RETRY_PROMPTS[reason]}",
+                session_id=None,
+                warm_session=None,
+            ),
+        )
+    if reason == "tool_without_catalog" and request.session_id is None:
+        # A phantom tool call poisons the session it arrived in, so an
+        # isolated request retries fresh with the full original prompt
+        # (issue #128). Continuations keep their session, like malformed
+        # output, because the bridge no longer holds their earlier history.
         return cast(  # type: ignore[redundant-cast]
             "RunRequest",
             replace(
@@ -2309,7 +2385,12 @@ async def _collect_completion(
     observed_ttft = not observe_ttft
 
     def record_malformed(exc: MalformedToolCallError) -> None:
+        if str(exc) == TOOL_CALL_LIMIT_MESSAGE:
+            # A limit violation invalidates the whole turn, independent of
+            # which SDK event carried each call.
+            result.tool_calls.clear()
         result.malformed_note = _malformed_tool_call_note(exc)
+        result.malformed_reason = str(exc)
         result.completed = True
         log_warning(
             "chat.malformed",
@@ -2338,6 +2419,7 @@ async def _collect_completion(
                     metrics,
                     request_started_at,
                 )
+                first_event_call = len(result.tool_calls)
                 try:
                     emissions = parser.feed(event.text)
                     _apply_emissions(result, emissions, stop_buffer)
@@ -2358,6 +2440,7 @@ async def _collect_completion(
                     # Same interruption as a stop sequence: reading past the
                     # requested output limit only burns tokens nobody asked
                     # for (issue #130).
+                    del result.tool_calls[first_event_call:]
                     result.output_capped = True
                     result.completed = True
                     break
@@ -2532,9 +2615,26 @@ async def _stream_completion(
     stop_buffer = StopSequenceBuffer(stop_sequences)
     token_cap = OutputTokenCap(output_token_limit)
     tool_call_index = 0
+    pending_tool_calls: list[ToolCallEmission] = []
     structured_buffer = (
         StructuredOutputBuffer(structured.max_bytes) if structured is not None else None
     )
+
+    def pending_tool_call_chunks() -> Iterator[str]:
+        nonlocal tool_call_index
+        while pending_tool_calls:
+            emission = pending_tool_calls.pop(0)
+            yield _sse(
+                _chunk_for_emission(
+                    request_id,
+                    created,
+                    model,
+                    emission,
+                    include_usage=include_usage,
+                    tool_call_index=tool_call_index,
+                )
+            )
+            tool_call_index += 1
 
     def text_chunk(text: str) -> str | None:
         if structured_buffer is not None:
@@ -2577,19 +2677,11 @@ async def _stream_completion(
                             metrics,
                             request_started_at,
                         )
+                        first_event_call = len(pending_tool_calls)
                         for emission in parser.feed(event.text):
                             if isinstance(emission, ToolCallEmission):
                                 saw_tool_call = True
-                                chunk = _chunk_for_emission(
-                                    request_id,
-                                    created,
-                                    model,
-                                    emission,
-                                    include_usage=include_usage,
-                                    tool_call_index=tool_call_index,
-                                )
-                                tool_call_index += 1
-                                yield _sse(chunk)
+                                pending_tool_calls.append(emission)
                                 continue
                             text = stop_buffer.feed(emission.text)
                             if text:
@@ -2598,6 +2690,8 @@ async def _stream_completion(
                                     saw_text = True
                                     saw_output = True
                                     yield chunk_payload
+                            if stop_buffer.triggered:
+                                break
                         if stop_buffer.triggered:
                             # Closing the runner generator interrupts the Droid
                             # turn instead of draining output nobody will read.
@@ -2607,6 +2701,8 @@ async def _stream_completion(
                             # Same interruption as a stop sequence: reading
                             # past the requested output limit only burns
                             # tokens nobody asked for (issue #130).
+                            del pending_tool_calls[first_event_call:]
+                            saw_tool_call = bool(pending_tool_calls)
                             capped = True
                             completed = True
                             break
@@ -2690,17 +2786,7 @@ async def _stream_completion(
                     for emission in parser.finish():
                         if isinstance(emission, ToolCallEmission):
                             saw_tool_call = True
-                            yield _sse(
-                                _chunk_for_emission(
-                                    request_id,
-                                    created,
-                                    model,
-                                    emission,
-                                    include_usage=include_usage,
-                                    tool_call_index=tool_call_index,
-                                )
-                            )
-                            tool_call_index += 1
+                            pending_tool_calls.append(emission)
                             continue
                         text = stop_buffer.feed(emission.text)
                         if text:
@@ -2723,6 +2809,8 @@ async def _stream_completion(
                         saw_text = True
                         saw_output = True
                         yield chunk_payload
+            for chunk in pending_tool_call_chunks():
+                yield chunk
             if structured is not None and structured_buffer is not None:
                 structured_text = structured_buffer.text()
                 if not capped:
@@ -2776,6 +2864,8 @@ async def _stream_completion(
             # blind-retrying an unrecoverable request. The partial call is
             # dropped, never executed.
             outcome = "success" if saw_tool_call else "truncated"
+            for chunk in pending_tool_call_chunks():
+                yield chunk
             _log_truncated_tool_call(
                 _TruncatedToolCall.from_error(exc),
                 stream=True,
@@ -2813,6 +2903,12 @@ async def _stream_completion(
             # exposing or repeating garbage. Return a plain-text note with
             # finish_reason="stop"; the call is dropped, never executed.
             outcome = "malformed"
+            if str(exc) == TOOL_CALL_LIMIT_MESSAGE:
+                pending_tool_calls.clear()
+                saw_tool_call = False
+            else:
+                for chunk in pending_tool_call_chunks():
+                    yield chunk
             log_warning(
                 "chat.malformed",
                 stream=True,
@@ -2845,6 +2941,8 @@ async def _stream_completion(
                 yield _sse(_usage_chunk(request_id, created, model, usage))
         except ProtocolError as exc:
             outcome = "error"
+            for chunk in pending_tool_call_chunks():
+                yield chunk
             log_warning(
                 "chat.failed",
                 stream=True,
@@ -2855,6 +2953,8 @@ async def _stream_completion(
             yield _sse(_error_body(str(exc), "factory_protocol_error"))
         except RunnerError as exc:
             outcome = "timeout" if exc.error_type == "factory_droid_timeout" else "error"
+            for chunk in pending_tool_call_chunks():
+                yield chunk
             log_warning(
                 "chat.failed",
                 stream=True,
@@ -2963,6 +3063,8 @@ def _apply_emissions(
             text = emission.text if stop_buffer is None else stop_buffer.feed(emission.text)
             if text:
                 result.text_parts.append(text)
+            if stop_buffer is not None and stop_buffer.triggered:
+                break
         else:
             result.tool_calls.append(_tool_call_dict(emission))
 
