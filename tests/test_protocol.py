@@ -949,6 +949,15 @@ def test_stream_parser_rejects_incomplete_transcript_message() -> None:
         parser.finish()
 
 
+def test_stream_parser_can_discard_an_incomplete_transcript_message() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    parser.feed('{"role":"assistant","tool_calls":')
+    parser.discard_partial_call()
+
+    assert parser.finish() == []
+
+
 def test_stream_parser_rejects_an_oversized_transcript_message() -> None:
     parser = ToolCallStreamParser(frozenset({"weather"}))
 
@@ -3309,6 +3318,15 @@ def test_stream_parser_recovers_tool_call_without_close_marker() -> None:
     assert len(emissions) == 1
     assert isinstance(emissions[0], ToolCallEmission)
     assert json.loads(emissions[0].arguments) == {"city": "Hel"}
+
+
+def test_stream_parser_can_discard_an_unclosed_call() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    parser.feed(f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Hel"}}}}')
+    parser.discard_partial_call()
+
+    assert parser.finish() == []
 
 
 def test_stream_parser_recovers_tool_call_with_partial_close_marker() -> None:

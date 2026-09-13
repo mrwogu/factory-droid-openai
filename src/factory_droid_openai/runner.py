@@ -283,6 +283,7 @@ class RunComplete:
 @dataclass(frozen=True, slots=True)
 class SessionStarted:
     session_id: str
+    output_tokens: int | None = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -573,13 +574,14 @@ class DroidRunner:
         native_tool_calls = 0
         unmapped_event_kind: str | None = None
         usage = Usage()
+        output_token_baseline: int | None = 0
 
         try:
             async with asyncio.timeout_at(deadline) as request_timeout:
                 if warm is None:
 
                     async def initialize() -> None:
-                        nonlocal initialized
+                        nonlocal initialized, output_token_baseline
                         startup_started = time.perf_counter()
                         try:
                             await client.connect()
@@ -601,9 +603,13 @@ class DroidRunner:
                         if request.session_id is not None:
                             # Continuation: reuse the stored Droid session so only
                             # the new turn is sent instead of the full transcript.
-                            await client.load_session(
+                            loaded = await client.load_session(
                                 session_id=request.session_id,
                                 mcp_servers=mcp_servers,
+                            )
+                            loaded_usage = getattr(loaded, "token_usage", None)
+                            output_token_baseline = (
+                                None if loaded_usage is None else max(0, loaded_usage.output_tokens)
                             )
                         else:
                             await client.initialize_session(
@@ -652,7 +658,7 @@ class DroidRunner:
                     ),
                 )
                 if client.session_id is not None:
-                    yield SessionStarted(client.session_id)
+                    yield SessionStarted(client.session_id, output_token_baseline)
                 if request.output_format is None:
                     await client.add_user_message(
                         text=request.prompt,

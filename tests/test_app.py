@@ -105,7 +105,11 @@ def _recorded_event(record: dict[str, Any]) -> RunEvent:
     if kind == "status":
         return StatusUpdate(record["state"])
     if kind == "session_started":
-        return SessionStarted("replay-session")
+        output_tokens = record.get("output_tokens", 0)
+        return SessionStarted(
+            "replay-session",
+            None if output_tokens is None else int(output_tokens),
+        )
     raise AssertionError(f"unknown recorded event kind: {kind}")
 
 
@@ -558,6 +562,7 @@ async def test_payload_tracing_records_sdk_events_for_replay(tmp_path: Path) -> 
         "usage",
         "run_complete",
     ]
+    assert events[0]["output_tokens"] == 0
     assert events[3]["text"] == "hello"
     assert events[5]["usage"]["completion_tokens"] == 2
     assert "session-secret" not in trace_path.read_text(encoding="utf-8")
@@ -2047,12 +2052,10 @@ async def test_invalid_tool_name_is_rejected_before_runner(tmp_path: Path) -> No
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("field", ["max_tokens", "max_completion_tokens"])
-async def test_token_limit_fields_are_accepted_and_ignored(
+async def test_token_limit_fields_accept_short_completions(
     tmp_path: Path,
     field: str,
 ) -> None:
-    # Copilot, litellm and LangChain send these by default; rejecting them
-    # would break every one of those clients.
     runner = FakeRunner([TextDelta("Hi"), RunComplete(Usage())])
     payload = _payload(**{field: 5})
 
@@ -2982,16 +2985,20 @@ def _output_cap_runaway_argument() -> TextDelta:
     return TextDelta(f"{TOOL_CALL_OPEN}{head}{'x' * 60}")
 
 
+def _output_cap_events(*events: RunEvent, baseline: int | None = 0) -> list[RunEvent]:
+    return [SessionStarted("replay-session", baseline), *events]
+
+
 @pytest.mark.asyncio
 async def test_output_limit_caps_a_runaway_tool_argument(tmp_path: Path) -> None:
     log_stream = io.StringIO()
     logs.configure_logging(level="warning", log_format="json", stream=log_stream)
     runner = FakeRunner(
-        [
+        _output_cap_events(
             _output_cap_runaway_argument(),
             UsageUpdate(Usage(output_tokens=10)),
             UsageUpdate(Usage(output_tokens=45)),
-        ]
+        )
     )
     payload = _weather_payload(max_tokens=32)
 
@@ -3010,6 +3017,7 @@ async def test_output_limit_caps_a_runaway_tool_argument(tmp_path: Path) -> None
     assert truncated["reason"] == "output token limit reached"
     assert truncated["will_retry"] is False
     assert truncated["has_tool_calls"] is False
+    assert not any(record["event"] == "chat.empty_completion" for record in records)
     assert not any(record["event"] == "chat.retry" for record in records)
     assert not any(record["event"] == "chat.attempt_truncated" for record in records)
 
@@ -3032,6 +3040,28 @@ async def test_output_limit_text_fallback_caps_without_usage_events(
 
 
 @pytest.mark.asyncio
+async def test_output_limit_keeps_fallback_until_the_baseline_is_known(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner(
+        _output_cap_events(
+            UsageUpdate(Usage(output_tokens=5000)),
+            TextDelta("x" * 200),
+            baseline=None,
+        )
+    )
+    payload = _payload(max_tokens=32)
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "length"
+    assert choice["message"]["content"] == "x" * 200
+
+
+@pytest.mark.asyncio
 async def test_output_limit_caps_reasoning_output(tmp_path: Path) -> None:
     runner = FakeRunner([ReasoningDelta("r" * 200)])
     payload = _payload(max_tokens=32)
@@ -3049,13 +3079,7 @@ async def test_output_limit_caps_reasoning_output(tmp_path: Path) -> None:
 async def test_output_limit_marks_a_turn_completed_past_the_limit(
     tmp_path: Path,
 ) -> None:
-    runner = FakeRunner(
-        [
-            TextDelta("Short answer"),
-            UsageUpdate(Usage(output_tokens=10)),
-            RunComplete(Usage(output_tokens=45)),
-        ]
-    )
+    runner = FakeRunner(_recorded_events("hello--gpt-5-4-mini.jsonl"))
     payload = _payload(max_tokens=32)
 
     async with _client(_app(tmp_path, runner)) as client:
@@ -3064,7 +3088,7 @@ async def test_output_limit_marks_a_turn_completed_past_the_limit(
     assert response.status_code == 200
     choice = response.json()["choices"][0]
     assert choice["finish_reason"] == "length"
-    assert choice["message"]["content"] == "Short answer"
+    assert choice["message"]["content"] == "OK"
 
 
 @pytest.mark.asyncio
@@ -3072,12 +3096,12 @@ async def test_output_limit_counts_turn_tokens_not_session_totals(
     tmp_path: Path,
 ) -> None:
     runner = FakeRunner(
-        [
-            UsageUpdate(Usage(output_tokens=5000)),
+        _output_cap_events(
             UsageUpdate(Usage(output_tokens=5008)),
             TextDelta("Direct answer"),
             RunComplete(Usage(output_tokens=5008)),
-        ]
+            baseline=5000,
+        )
     )
     payload = _payload(max_tokens=32)
 
@@ -3105,16 +3129,130 @@ async def test_output_limit_honors_max_completion_tokens(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_output_limit_prefers_max_completion_tokens(tmp_path: Path) -> None:
+    runner = FakeRunner([TextDelta("y" * 40), RunComplete(Usage())])
+    payload = _payload(max_tokens=8, max_completion_tokens=32)
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "stop"
+    assert choice["message"]["content"] == "y" * 40
+
+
+@pytest.mark.asyncio
+async def test_output_limit_real_usage_disables_text_fallback(tmp_path: Path) -> None:
+    runner = FakeRunner(_recorded_events("tool-result-followup--gpt-5-2.jsonl"))
+    payload = _payload(max_tokens=32)
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "stop"
+    assert len(choice["message"]["content"]) == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_output_limit_uses_recorded_final_usage_without_updates(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    events: list[RunEvent] = [
+        event
+        for event in _recorded_events("hello--gpt-5-4-mini.jsonl")
+        if not isinstance(event, UsageUpdate)
+    ]
+    runner = FakeRunner(events)
+    payload = _payload(stream=stream, max_tokens=32)
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    if stream:
+        assert '"finish_reason":"length"' in response.text
+        assert "factory_protocol_error" not in response.text
+    else:
+        choice = response.json()["choices"][0]
+        assert choice["finish_reason"] == "length"
+        assert choice["message"]["content"] == "OK"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_output_limit_drops_an_unclosed_complete_payload(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    partial = f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{}}}}'
+    runner = FakeRunner([TextDelta(partial)])
+    payload = _weather_payload(stream=stream, max_tokens=8)
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    if stream:
+        assert '"tool_calls"' not in response.text
+        assert '"finish_reason":"length"' in response.text
+    else:
+        choice = response.json()["choices"][0]
+        assert "tool_calls" not in choice["message"]
+        assert choice["finish_reason"] == "length"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_output_limit_skips_partial_structured_output_validation(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    partial = '{"answer":"' + ("x" * 40)
+    runner = FakeRunner([TextDelta(partial)])
+    payload = _payload(
+        stream=stream,
+        max_tokens=8,
+        response_format={"type": "json_object"},
+    )
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    if stream:
+        chunks = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: {")
+        ]
+        content = "".join(
+            choice["delta"].get("content", "") for chunk in chunks for choice in chunk["choices"]
+        )
+        assert content == partial
+        assert '"finish_reason":"length"' in response.text
+        assert "factory_protocol_error" not in response.text
+    else:
+        choice = response.json()["choices"][0]
+        assert choice["message"]["content"] == partial
+        assert choice["finish_reason"] == "length"
+
+
+@pytest.mark.asyncio
 async def test_output_limit_after_a_complete_call_keeps_the_call(
     tmp_path: Path,
 ) -> None:
     call = f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{}}}}{TOOL_CALL_CLOSE}'
     runner = FakeRunner(
-        [
+        _output_cap_events(
             TextDelta(call),
             UsageUpdate(Usage(output_tokens=10)),
             UsageUpdate(Usage(output_tokens=50)),
-        ]
+        )
     )
     payload = _weather_payload(max_tokens=32)
 
@@ -3130,18 +3268,24 @@ async def test_output_limit_after_a_complete_call_keeps_the_call(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
 async def test_output_limit_required_tool_call_finishes_length(
     tmp_path: Path,
+    stream: bool,
 ) -> None:
     runner = FakeRunner([TextDelta("x" * 200)])
-    payload = _weather_payload(max_tokens=32, tool_choice="required")
+    payload = _weather_payload(stream=stream, max_tokens=32, tool_choice="required")
 
     async with _client(_app(tmp_path, runner)) as client:
         response = await client.post("/v1/chat/completions", json=payload)
 
     assert response.status_code == 200
-    choice = response.json()["choices"][0]
-    assert choice["finish_reason"] == "length"
+    if stream:
+        assert '"finish_reason":"length"' in response.text
+        assert "factory_protocol_error" not in response.text
+    else:
+        choice = response.json()["choices"][0]
+        assert choice["finish_reason"] == "length"
 
 
 @pytest.mark.asyncio
@@ -3151,11 +3295,11 @@ async def test_streaming_output_limit_caps_a_runaway_tool_argument(
     log_stream = io.StringIO()
     logs.configure_logging(level="warning", log_format="json", stream=log_stream)
     runner = FakeRunner(
-        [
+        _output_cap_events(
             _output_cap_runaway_argument(),
             UsageUpdate(Usage(output_tokens=10)),
             UsageUpdate(Usage(output_tokens=45)),
-        ]
+        )
     )
     payload = _weather_payload(stream=True, max_tokens=32)
 
@@ -3192,13 +3336,7 @@ async def test_streaming_output_limit_text_fallback_finishes_length(
 async def test_streaming_output_limit_marks_a_turn_completed_past_the_limit(
     tmp_path: Path,
 ) -> None:
-    runner = FakeRunner(
-        [
-            TextDelta("Short answer"),
-            UsageUpdate(Usage(output_tokens=10)),
-            RunComplete(Usage(output_tokens=45)),
-        ]
-    )
+    runner = FakeRunner(_recorded_events("hello--gpt-5-4-mini.jsonl"))
     payload = _weather_payload(stream=True, max_tokens=32)
 
     async with _client(_app(tmp_path, runner)) as client:
@@ -3231,11 +3369,11 @@ async def test_streaming_output_limit_after_a_complete_call_keeps_the_call(
     logs.configure_logging(level="warning", log_format="json", stream=log_stream)
     call = f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{}}}}{TOOL_CALL_CLOSE}'
     runner = FakeRunner(
-        [
+        _output_cap_events(
             TextDelta(call),
             UsageUpdate(Usage(output_tokens=10)),
             UsageUpdate(Usage(output_tokens=50)),
-        ]
+        )
     )
     payload = _weather_payload(stream=True, max_tokens=32)
 
@@ -6146,6 +6284,28 @@ async def test_streaming_traffic_success_resets_the_probe(tmp_path: Path) -> Non
         response = await client.post("/v1/chat/completions", json=_payload(stream=True))
 
     assert response.status_code == 200
+    assert probe._consecutive_failures == 0
+    assert probe.status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_streaming_capped_content_resets_the_probe(tmp_path: Path) -> None:
+    app, _runner = _probe_app(
+        tmp_path,
+        events_fixture="hello--gpt-5-4-mini.jsonl",
+    )
+    probe = app.state.auth_probe
+    assert probe is not None
+    probe._consecutive_failures = 2
+
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(stream=True, max_tokens=32),
+        )
+
+    assert response.status_code == 200
+    assert '"finish_reason":"length"' in response.text
     assert probe._consecutive_failures == 0
     assert probe.status == "ok"
 

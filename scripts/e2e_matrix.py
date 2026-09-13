@@ -176,11 +176,13 @@ def _baseline_scenarios() -> list[Scenario]:
             },
         ),
         Scenario(
-            name="ignored_token_limit",
+            name="output_token_limit",
             body={
                 "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
                 "max_tokens": 5,
             },
+            expect_finish=("stop", "length"),
+            expect_content=False,
         ),
     ]
 

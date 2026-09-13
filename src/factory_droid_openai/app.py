@@ -1813,7 +1813,11 @@ def create_app(
                                 result,
                                 tools_available=bool(plan.allowed_tool_names),
                             )
-                            if retry_reason is None and structured is not None:
+                            if (
+                                retry_reason is None
+                                and structured is not None
+                                and not result.output_capped
+                            ):
                                 try:
                                     _validate_structured_output(result.text, structured)
                                 except ProtocolError as exc:
@@ -1903,6 +1907,7 @@ def create_app(
                         choice_message["content"] is None
                         and not choice_message.get("tool_calls")
                         and not completed_result.stopped
+                        and not completed_result.output_capped
                     ):
                         # A dead Factory key answers with empty 200s before it
                         # answers with errors (issue #122), so an empty body
@@ -2023,17 +2028,21 @@ class _TruncatedToolCall:
 class OutputTokenCap:
     """Turn-local max_tokens enforcement built from Droid usage snapshots.
 
-    Droid reports session-cumulative counters, so the first snapshot of a
-    turn sets the baseline and the cap watches the delta; a pooled or retuned
-    session cannot fire the cap on tokens its earlier turns produced. Models
-    that report no usage mid-turn get a coarse text-length fallback instead
-    of running free (issue #130).
+    Droid reports session-cumulative counters, so SessionStarted carries the
+    pre-turn baseline and the cap watches the delta; a continued session
+    cannot fire the cap on tokens its earlier turns produced. Models that
+    report no usage mid-turn get a coarse text-length fallback instead of
+    running free (issue #130).
     """
 
     def __init__(self, limit: int | None) -> None:
         self._limit = limit
         self._baseline: int | None = None
         self._emitted_chars = 0
+        self._usage_seen = False
+
+    def start_turn(self, output_tokens: int | None) -> None:
+        self._baseline = output_tokens
 
     def record_usage(self, usage: Usage) -> bool:
         """Returns True when reported output tokens reached the limit."""
@@ -2041,11 +2050,13 @@ class OutputTokenCap:
             return False
         if self._baseline is None:
             self._baseline = usage.output_tokens
+            return False
+        self._usage_seen = True
         return usage.output_tokens - self._baseline >= self._limit
 
     def record_text(self, text: str) -> bool:
         """Returns True when emitted text plausibly reached the limit."""
-        if self._limit is None:
+        if self._limit is None or self._usage_seen:
             return False
         self._emitted_chars += len(text)
         return self._emitted_chars >= self._limit * _CHARS_PER_TOKEN_ESTIMATE
@@ -2219,8 +2230,8 @@ def _event_record(event: RunEvent) -> dict[str, Any]:
     if isinstance(event, StatusUpdate):
         return {"kind": "status", "state": event.state}
     # The session id identifies a Factory account session and replay never
-    # needs it, so SessionStarted is recorded without its payload.
-    return {"kind": "session_started"}
+    # needs it, but the pre-turn counter is required to reproduce cap behavior.
+    return {"kind": "session_started", "output_tokens": event.output_tokens}
 
 
 async def _run_events(
@@ -2363,6 +2374,7 @@ async def _collect_completion(
                     break
             elif isinstance(event, SessionStarted):
                 result.session_id = event.session_id
+                token_cap.start_turn(event.output_tokens)
                 if session_callback is not None:
                     session_callback(event.session_id)
             elif isinstance(event, UsageUpdate):
@@ -2393,6 +2405,8 @@ async def _collect_completion(
             # A failed parse already settled the turn; asking the parser to
             # finish would re-raise on the same garbage.
             try:
+                if result.output_capped:
+                    parser.discard_partial_call()
                 _apply_emissions(result, parser.finish(), stop_buffer)
             except MalformedToolCallError as exc:
                 record_malformed(exc)
@@ -2512,6 +2526,7 @@ async def _stream_completion(
     capped = False
     saw_tool_call = False
     saw_text = False
+    saw_output = False
     observed_ttft = False
     outcome = "success"
     stop_buffer = StopSequenceBuffer(stop_sequences)
@@ -2581,6 +2596,7 @@ async def _stream_completion(
                                 chunk_payload = text_chunk(text)
                                 if chunk_payload is not None:
                                     saw_text = True
+                                    saw_output = True
                                     yield chunk_payload
                         if stop_buffer.triggered:
                             # Closing the runner generator interrupts the Droid
@@ -2595,6 +2611,7 @@ async def _stream_completion(
                             completed = True
                             break
                     elif isinstance(event, SessionStarted):
+                        token_cap.start_turn(event.output_tokens)
                         if session_callback is not None:
                             session_callback(event.session_id)
                         if expose_session:
@@ -2636,6 +2653,7 @@ async def _stream_completion(
                                 include_usage=include_usage,
                             )
                         )
+                        saw_output = saw_output or bool(event.text)
                         if token_cap.record_text(event.text):
                             capped = True
                             completed = True
@@ -2667,6 +2685,8 @@ async def _stream_completion(
                 )
             if not stop_buffer.triggered:
                 try:
+                    if capped:
+                        parser.discard_partial_call()
                     for emission in parser.finish():
                         if isinstance(emission, ToolCallEmission):
                             saw_tool_call = True
@@ -2687,6 +2707,7 @@ async def _stream_completion(
                             chunk_payload = text_chunk(text)
                             if chunk_payload is not None:
                                 saw_text = True
+                                saw_output = True
                                 yield chunk_payload
                 except ProtocolError:
                     # A capped turn already ends with finish_reason="length";
@@ -2700,10 +2721,12 @@ async def _stream_completion(
                     chunk_payload = text_chunk(held)
                     if chunk_payload is not None:
                         saw_text = True
+                        saw_output = True
                         yield chunk_payload
             if structured is not None and structured_buffer is not None:
                 structured_text = structured_buffer.text()
-                _validate_structured_output(structured_text, structured)
+                if not capped:
+                    _validate_structured_output(structured_text, structured)
                 yield _sse(
                     _chunk_for_emission(
                         request_id,
@@ -2713,6 +2736,7 @@ async def _stream_completion(
                         include_usage=include_usage,
                     )
                 )
+                saw_output = saw_output or bool(structured_text)
             if capped:
                 if not saw_tool_call:
                     outcome = "truncated"
@@ -2857,13 +2881,16 @@ async def _stream_completion(
             raise
         if outcome_callback is not None:
             outcome_callback(outcome)
-        if outcome == "success" and completion_callback is not None:
-            completion_callback(
-                not saw_text
-                and not saw_tool_call
-                and structured is None
-                and not stop_buffer.triggered
-            )
+        if completion_callback is not None:
+            if outcome == "success":
+                completion_callback(
+                    not saw_text
+                    and not saw_tool_call
+                    and structured is None
+                    and not stop_buffer.triggered
+                )
+            elif capped and saw_output:
+                completion_callback(False)
         _log_stream_outcome(outcome, model=model, usage=usage, tool_calls=tool_call_index)
         yield "data: [DONE]\n\n"
 
