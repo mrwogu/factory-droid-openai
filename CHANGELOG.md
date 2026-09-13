@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.10.1](https://github.com/mrwogu/factory-droid-openai/compare/v1.10.0...v1.10.1) (2026-09-13)
+
+
+### Bug Fixes
+
+* **session:** tolerate the deferred-tool loader in tool-less turns ([#135](https://github.com/mrwogu/factory-droid-openai/issues/135)) ([8a477fb](https://github.com/mrwogu/factory-droid-openai/commit/8a477fbba992346b30d4bbf77d6e733af14dbf8c))
+
 ## [1.10.0](https://github.com/mrwogu/factory-droid-openai/compare/v1.9.1...v1.10.0) (2026-09-13)
 
 
