@@ -2369,9 +2369,10 @@ def test_stream_parser_keeps_diagnostics_when_a_transcript_echo_packs_too_many_c
         {"id": "call_1", "type": "function", "function": {"name": "weather", "arguments": "{}"}},
         {"id": "call_2", "type": "function", "function": {"name": "weather", "arguments": "{}"}},
     ]
+    message = json.dumps({"role": "assistant", "tool_calls": calls})
 
     with pytest.raises(MalformedToolCallError) as excinfo:
-        parser.feed(json.dumps({"role": "assistant", "tool_calls": calls}))
+        parser.feed(message)
 
     assert str(excinfo.value) == "more tool calls than the configured maximum"
 
@@ -3958,11 +3959,13 @@ def test_parser_accepts_several_tool_calls_when_allowed() -> None:
 
 def test_parser_stops_accepting_calls_past_the_configured_cap() -> None:
     parser = ToolCallStreamParser(frozenset({"weather"}), max_tool_calls=1)
+    stream = _tool_call("weather", '{"city":"Gdansk"}') + _tool_call(
+        "weather",
+        '{"city":"Sopot"}',
+    )
 
     with pytest.raises(MalformedToolCallError) as excinfo:
-        parser.feed(
-            _tool_call("weather", '{"city":"Gdansk"}') + _tool_call("weather", '{"city":"Sopot"}')
-        )
+        parser.feed(stream)
 
     assert str(excinfo.value) == "more tool calls than the configured maximum"
 

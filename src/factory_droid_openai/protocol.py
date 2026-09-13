@@ -79,6 +79,7 @@ _MANGLED_TOOL_CALLS_TAILS = ((":", '"id"', ":", '"call_'), (":", '"call_'))
 # reason the parser raised, instead of a second copy of the same sentence.
 TOOL_WITHOUT_CATALOG_MESSAGE = "the model requested a tool when none are available"
 TOOL_CALL_LIMIT_MESSAGE = "more tool calls than the configured maximum"
+_TOOL_CALL_OVER_LIMIT_EVENT = "tool_call.over_limit"
 
 __all__ = [
     "TOOL_CALL_CLOSE",
@@ -910,15 +911,15 @@ class ToolCallStreamParser:
         tool_name = _guess_tool_name(payload, self._allowed_tool_names)
         payload_bytes = len(payload.encode("utf-8"))
         log_trace(
-            "tool_call.over_limit",
+            _TOOL_CALL_OVER_LIMIT_EVENT,
             tool_name=tool_name,
             requested=requested,
             maximum=self._max_tool_calls,
             dialect=self._dialect.name,
             payload_bytes=payload_bytes,
         )
-        self._trace_payload("tool_call.over_limit", payload)
-        self._report_repair("tool_call.over_limit")
+        self._trace_payload(_TOOL_CALL_OVER_LIMIT_EVENT, payload)
+        self._report_repair(_TOOL_CALL_OVER_LIMIT_EVENT)
         return MalformedToolCallError(
             TOOL_CALL_LIMIT_MESSAGE,
             tool_name=tool_name,
