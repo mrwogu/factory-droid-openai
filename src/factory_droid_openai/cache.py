@@ -73,10 +73,12 @@ class ResponseCache:
         with self._lock:
             # Expired entries are dead weight even before their key is read
             # again, so a store reclaims them instead of evicting live ones.
-            for stale_key, entry in list(self._entries.items()):
-                if now >= entry.expires_at:
-                    del self._entries[stale_key]
-                    self._bytes -= entry.size_bytes
+            expired = [
+                stale_key for stale_key, entry in self._entries.items() if now >= entry.expires_at
+            ]
+            for stale_key in expired:
+                entry = self._entries.pop(stale_key)
+                self._bytes -= entry.size_bytes
             previous = self._entries.pop(key, None)
             if previous is not None:
                 self._bytes -= previous.size_bytes

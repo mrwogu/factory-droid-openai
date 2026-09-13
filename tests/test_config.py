@@ -241,8 +241,9 @@ def test_settings_rejects_invalid_response_cache_limits(
     field: str,
     value: object,
 ) -> None:
+    kwargs = cast("Any", {field: value})
     with pytest.raises(ValueError, match=field):
-        Settings(workdir=tmp_path, **cast("Any", {field: value}))
+        Settings(workdir=tmp_path, **kwargs)
 
 
 def test_warm_session_count_tracks_max_concurrency_unless_set(

@@ -160,6 +160,8 @@ _TRAILING_OUTPUT_ERROR_PREFIX = "unexpected text after tool call"
 # stay authoritative whenever they arrive mid-turn.
 _CHARS_PER_TOKEN_ESTIMATE = 4
 _OUTPUT_LIMIT_TRUNCATION = "output token limit reached"
+_CHAT_COMPLETED_EVENT = "chat.completed"
+_RESPONSE_CACHE_DISABLED_EVENT = "response_cache.disabled"
 
 CHAT_COMPLETION_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {
@@ -887,15 +889,15 @@ def create_app(
         if resolved_settings.trace_payloads != "off":
             # Tracing exists to capture prompts verbatim; a hit would skip the
             # very turns being traced, so tracing wins.
-            log_warning("response_cache.disabled", reason="payload_tracing")
+            log_warning(_RESPONSE_CACHE_DISABLED_EVENT, reason="payload_tracing")
         elif resolved_settings.session_continuity:
             # Continuation responses embed a per-request session id, so
             # replaying one would hand out a session the caller never owned.
-            log_warning("response_cache.disabled", reason="session_continuity")
+            log_warning(_RESPONSE_CACHE_DISABLED_EVENT, reason="session_continuity")
         elif resolved_settings.append_system_prompt_file is not None:
             # The appended file is a hidden model input that can change on
             # disk without a restart, so no fingerprint can cover it.
-            log_warning("response_cache.disabled", reason="append_system_prompt_file")
+            log_warning(_RESPONSE_CACHE_DISABLED_EVENT, reason="append_system_prompt_file")
         else:
             response_cache = ResponseCache(
                 max_bytes=resolved_settings.response_cache_max_bytes,
@@ -1551,7 +1553,7 @@ def create_app(
                 replayed = json.loads(cached.decode("utf-8"))
                 log_debug("chat.cache_hit", model=payload.model)
                 log_info(
-                    "chat.completed",
+                    _CHAT_COMPLETED_EVENT,
                     status=200,
                     model=payload.model,
                     stream=False,
@@ -2083,7 +2085,7 @@ def create_app(
                 auth_probe.record_success()
 
         log_info(
-            "chat.completed",
+            _CHAT_COMPLETED_EVENT,
             status=200,
             model=payload.model,
             stream=False,
@@ -3121,7 +3123,7 @@ def _log_stream_outcome(
 ) -> None:
     timeline = current_timeline()
     log_info(
-        "chat.completed",
+        _CHAT_COMPLETED_EVENT,
         outcome=outcome,
         model=model,
         stream=True,

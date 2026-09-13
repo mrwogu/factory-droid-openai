@@ -167,7 +167,10 @@ def test_put_prunes_expired_entries() -> None:
 
 
 def test_keys_are_stable_for_identical_inputs() -> None:
-    assert _key() == _key()
+    first = _key()
+    second = _key()
+
+    assert first == second
 
 
 def test_keys_separate_each_execution_input() -> None:
