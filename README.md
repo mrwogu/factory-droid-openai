@@ -1809,7 +1809,10 @@ For every Droid session, the bridge:
    profile change invalidates it. Per-request `openai-bridge` IDs are never
    cached.
 6. Applies the discovered or cached disabled set, then calls
-   `droid.list_tools` once to verify no unexpected tool remains. A new tool
+   `droid.list_tools` once to verify no unexpected tool remains. The two meta
+   tools Droid pins callable, `exit-spec-mode` and the deferred-tool loader,
+   are the only tolerated leftovers, in tool-carrying and tool-less sessions
+   alike. A new tool
    found during verification is disabled in the bounded retry and added to the
    snapshot. Tools that appear after this point stay denied, because Droid
    defaults to deny once a disabled set has been sent.
