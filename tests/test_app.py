@@ -60,6 +60,7 @@ from factory_droid_openai.protocol import (
     ProtocolEmission,
     TextEmission,
     ToolCallStreamParser,
+    build_prompt,
 )
 from factory_droid_openai.runner import (
     DroidModel,
@@ -7373,6 +7374,82 @@ async def test_response_cache_hit_replays_without_a_droid_turn(tmp_path: Path) -
     assert "factory_droid_openai_response_cache_misses_total 1" in render
     assert "factory_droid_openai_response_cache_entries 1" in render
     assert _cache_bytes(render) > 0
+
+
+class _OffsetClockLoop:
+    """Loop view whose clock jumps forward once armed.
+
+    Everything except ``time()`` delegates to the real running loop, so
+    event-loop internals and every other caller keep seeing real time.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, armed: Callable[[], bool]) -> None:
+        self._loop = loop
+        self._armed = armed
+
+    def time(self) -> float:
+        return self._loop.time() + (1000.0 if self._armed() else 0.0)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._loop, name)
+
+
+class _OffsetClockAsyncio:
+    """asyncio view for app.py that offsets the loop clock when armed."""
+
+    def __init__(self, armed: Callable[[], bool]) -> None:
+        self._armed = armed
+
+    def get_running_loop(self) -> _OffsetClockLoop:
+        return _OffsetClockLoop(asyncio.get_running_loop(), self._armed)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(asyncio, name)
+
+
+@pytest.mark.asyncio
+async def test_response_cache_hit_past_the_deadline_returns_504(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+    events = _recorded_events("hello--gpt-5-4-mini.jsonl")
+    app = create_app(
+        _cache_settings(tmp_path),
+        runner_factory=cast("RunnerFactory", _counting_factory(events, calls)),
+    )
+
+    # The per-request timeout is not part of the cache key, and prompt
+    # building is the only synchronous step between the deadline and the
+    # cache lookup. Arming the offset there crosses the deadline with a
+    # fixed clock jump, so no wall-clock margin is involved at all.
+    armed: list[bool] = [False]
+
+    def armed_build_prompt(*args: Any, **kwargs: Any) -> Any:
+        armed[0] = True
+        return build_prompt(*args, **kwargs)
+
+    async with _client(app) as client:
+        first = await client.post("/v1/chat/completions", json=_payload())
+        # app.py calls the prompt builder and asyncio through its own module
+        # namespace, so both patches have to replace them there.
+        monkeypatch.setattr("factory_droid_openai.app.build_prompt", armed_build_prompt)
+        monkeypatch.setattr(
+            "factory_droid_openai.app.asyncio",
+            _OffsetClockAsyncio(lambda: armed[0]),
+        )
+        second = await client.post(
+            "/v1/chat/completions",
+            json=_payload(timeout=0.05),
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 504
+    assert second.json()["error"]["type"] == "factory_droid_timeout"
+    assert calls == [1]
+    render = app.state.metrics.render()
+    assert "factory_droid_openai_response_cache_hits_total 0" in render
+    assert "factory_droid_openai_response_cache_entries 1" in render
 
 
 @pytest.mark.asyncio

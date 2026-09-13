@@ -567,6 +567,14 @@ Build or run with updates disabled when the running CLI must match the image
 digest. Droid runs as a non-root user (`uid 1000`) and the bridge listens on
 `0.0.0.0:8787` inside the container.
 
+The image runs [tini](https://github.com/krallin/tini) as PID 1. Droid's
+tool-search loader spawns short-lived `git` helper processes, and a helper can
+outlive the Droid process that spawned it. tini reaps those orphans; without
+an init they accumulate as zombies under PID 1 until the container can no
+longer fork. If you override the image entrypoint, start the container with
+`docker run --init` (or Compose `init: true`) so a reaping init is still
+present.
+
 Run it with a Factory service-account key and a bridge bearer token. Bind
 the port to loopback on the host so the bridge is not exposed to the
 network:
@@ -1990,6 +1998,18 @@ A session torn down right after a turn needs a few seconds to exit, so raise
 a slower host; `FACTORY_DROID_OPENAI_CLEANUP_TIMEOUT_SECONDS` must stay above
 it. With detached cleanup the kill happens after the response, so it costs the
 client nothing either way.
+
+### git zombies and fork failures under PID 1
+
+```text
+factory-execute-supervisor: fork: Resource temporarily unavailable
+```
+
+`docker top droid-bridge` listing `git` rows in `Z` state means orphaned git
+helpers are not being reaped. Current images run tini as PID 1 and reap them,
+so this points to an older image or an overridden entrypoint. Pull the newest
+image, or add `docker run --init` (or Compose `init: true`) when the
+entrypoint is overridden.
 
 ### Model not allowed by organization policy
 

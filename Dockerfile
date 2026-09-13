@@ -40,7 +40,7 @@ ENV FACTORY_DROID_OPENAI_HOST=0.0.0.0 \
     PYTHONDONTWRITEBYTECODE=1
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl git \
+ && apt-get install -y --no-install-recommends ca-certificates curl git tini \
  && rm -rf /var/lib/apt/lists/*
 
 # Install the Droid CLI binary with SHA256 verification.
@@ -119,4 +119,9 @@ EXPOSE 8787
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD curl -fsS http://127.0.0.1:8787/health || exit 1
 
+# tini is PID 1 so orphaned grandchildren (git helpers the Droid CLI's
+# tool-search loader spawns) are reaped instead of accumulating as zombies
+# under the bridge, which is not a reaping init (#138). It also forwards
+# signals to the bridge process.
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["factory-droid-openai"]
