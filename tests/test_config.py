@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
@@ -64,6 +64,10 @@ _ENVIRONMENT_KEYS = (
     "FACTORY_DROID_OPENAI_TELEMETRY",
     "FACTORY_DROID_OPENAI_TRACE_PAYLOADS",
     "FACTORY_DROID_OPENAI_TRACE_FILE",
+    "FACTORY_DROID_OPENAI_RESPONSE_CACHE_ENABLED",
+    "FACTORY_DROID_OPENAI_RESPONSE_CACHE_TTL_SECONDS",
+    "FACTORY_DROID_OPENAI_RESPONSE_CACHE_MAX_BYTES",
+    "FACTORY_DROID_OPENAI_RESPONSE_CACHE_MAX_ENTRIES",
     "DO_NOT_TRACK",
 )
 
@@ -193,6 +197,52 @@ def test_settings_rejects_invalid_dangling_member_repair_budget(
 ) -> None:
     with pytest.raises(ValueError, match="max_dangling_member_repairs"):
         Settings(workdir=tmp_path, max_dangling_member_repairs=value)
+
+
+def test_settings_response_cache_defaults_to_off(tmp_path: Path) -> None:
+    settings = Settings(workdir=tmp_path)
+
+    assert settings.response_cache_enabled is False
+    assert settings.response_cache_ttl_seconds == 21_600.0
+    assert settings.response_cache_max_bytes == 67_108_864
+    assert settings.response_cache_max_entries == 1024
+
+
+def test_settings_from_env_reads_response_cache_options(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_environment(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_RESPONSE_CACHE_ENABLED", "true")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_RESPONSE_CACHE_TTL_SECONDS", "3600")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_RESPONSE_CACHE_MAX_BYTES", "1048576")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_RESPONSE_CACHE_MAX_ENTRIES", "8")
+
+    settings = Settings.from_env()
+
+    assert settings.response_cache_enabled is True
+    assert settings.response_cache_ttl_seconds == 3600.0
+    assert settings.response_cache_max_bytes == 1_048_576
+    assert settings.response_cache_max_entries == 8
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("response_cache_ttl_seconds", 0.0),
+        ("response_cache_ttl_seconds", float("inf")),
+        ("response_cache_max_bytes", 0),
+        ("response_cache_max_entries", 0),
+    ],
+)
+def test_settings_rejects_invalid_response_cache_limits(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        Settings(workdir=tmp_path, **cast("Any", {field: value}))
 
 
 def test_warm_session_count_tracks_max_concurrency_unless_set(

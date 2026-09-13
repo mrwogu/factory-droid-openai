@@ -511,3 +511,37 @@ async def test_official_openai_client_sends_image_parts(tmp_path: Path) -> None:
     assert runner.requests[0].images == (
         {"type": "base64", "mediaType": "image/png", "data": "QUJD"},
     )
+
+
+@pytest.mark.asyncio
+async def test_response_cache_hit_keeps_the_official_client_shape(
+    tmp_path: Path,
+) -> None:
+    usage = Usage(input_tokens=7, output_tokens=3)
+    runner = ScriptedRunner([TextDelta("Hello from Droid"), RunComplete(usage)])
+    settings = Settings(
+        api_key="sdk-token",
+        workdir=tmp_path,
+        response_cache_enabled=True,
+    )
+    client, http_client = _sdk_client(tmp_path, runner, settings=settings)
+
+    async with http_client:
+        first = await client.chat.completions.create(
+            model="factory-droid",
+            messages=[{"role": "user", "content": "Hello"}],
+        )
+        second = await client.chat.completions.create(
+            model="factory-droid",
+            messages=[{"role": "user", "content": "Hello"}],
+        )
+
+    # The second call is a cache hit: no extra Droid turn, fresh envelope.
+    assert len(runner.requests) == 1
+    assert second.object == "chat.completion"
+    assert second.id != first.id
+    assert second.choices[0].finish_reason == "stop"
+    assert second.choices[0].message.content == "Hello from Droid"
+    assert second.usage is not None
+    assert second.usage.prompt_tokens == 7
+    assert second.usage.completion_tokens == 3
