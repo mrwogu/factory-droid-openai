@@ -32,6 +32,8 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from jsonschema import ValidationError as JsonSchemaValidationError
+from jsonschema.validators import validator_for
 
 from factory_droid_openai.dialects import strip_code_fence
 
@@ -275,6 +277,90 @@ def _tool_scenarios() -> list[Scenario]:
     ]
 
 
+# The structured pair mirrors the issue #112 census workload: retain
+# extraction over a json_schema response_format, where a flat schema and a
+# nested one answer whether schema complexity predicts the failures.
+_STRUCTURED_SIMPLE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "city": {"type": "string"},
+        "temperature_c": {"type": "number"},
+    },
+    "required": ["city", "temperature_c"],
+    "additionalProperties": False,
+}
+_STRUCTURED_HEAVY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "topic": {"type": "string"},
+        "keywords": {"type": "array", "items": {"type": "string"}},
+        "decisions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "confidence": {"enum": ["low", "medium", "high"]},
+                },
+                "required": ["text", "confidence"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["topic", "keywords", "decisions"],
+    "additionalProperties": False,
+}
+
+
+def _structured_scenarios() -> list[Scenario]:
+    return [
+        Scenario(
+            name="structured_simple",
+            body={
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            "The weather in Gdansk is 20 degrees Celsius and windy. "
+                            "Extract the city and temperature."
+                        ),
+                    }
+                ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "weather_reading",
+                        "schema": _STRUCTURED_SIMPLE_SCHEMA,
+                    },
+                },
+            },
+        ),
+        Scenario(
+            name="structured_heavy",
+            body={
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Summarize this session note into the extraction schema. "
+                            "Note: 'We decided to retry phantom tool calls in a fresh "
+                            "session, high confidence, and to enforce max_tokens, medium "
+                            "confidence. Topic: bridge reliability.'"
+                        ),
+                    }
+                ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "session_extraction",
+                        "schema": _STRUCTURED_HEAVY_SCHEMA,
+                    },
+                },
+            },
+        ),
+    ]
+
+
 def _hostile_scenarios() -> list[Scenario]:
     return [
         Scenario(
@@ -345,7 +431,7 @@ def _hostile_scenarios() -> list[Scenario]:
 
 def scenarios(*, streaming: bool = True) -> list[Scenario]:
     """Every scenario, each non-hostile one in both transport modes."""
-    base = _baseline_scenarios() + _tool_scenarios()
+    base = _baseline_scenarios() + _tool_scenarios() + _structured_scenarios()
     built: list[Scenario] = []
     for scenario in base:
         built.append(scenario)
@@ -422,6 +508,7 @@ class Observation:
     tool_calls: int = 0
     tool_call_payloads: tuple[dict[str, Any], ...] = ()
     content_chars: int = 0
+    content_text: str = ""
     request_id: str | None = None
     session_id: str | None = None
     duration_ms: float = 0.0
@@ -437,6 +524,8 @@ class Observation:
 _TOOL_CHOICE_IGNORED = "did not produce the required tool call"
 _UNAVAILABLE_TOOL = " is not available"
 _TRAILING_TOOL_TEXT = "unexpected text after tool call"
+_INVALID_STRUCTURED_JSON = "invalid structured JSON output"
+_STRUCTURED_SCHEMA_VIOLATION = "violated the requested schema"
 
 
 def _content_semantic_error(content: str) -> str | None:
@@ -478,12 +567,58 @@ def _error_verdict(observation: Observation) -> tuple[str, str] | None:
             or _TRAILING_TOOL_TEXT in observation.error_message
         ):
             return MODEL_BEHAVIOR, "model emitted an invalid tool-call response"
+        if (
+            _INVALID_STRUCTURED_JSON in observation.error_message
+            or _STRUCTURED_SCHEMA_VIOLATION in observation.error_message
+        ):
+            return MODEL_BEHAVIOR, "model produced schema-invalid structured output"
     if observation.status == 429:
         return CAPACITY, "bridge queue is full"
     if observation.status == 503:
         return PROVIDER_UNAVAILABLE, "Droid executable or provider unavailable"
     if observation.status == 504 or error_type == "factory_droid_timeout":
         return BACKEND_TIMEOUT, "backend timed out"
+    return None
+
+
+def _response_format_schema(body: dict[str, Any]) -> dict[str, Any] | None:
+    """The JSON schema a response_format body asks the bridge to enforce."""
+    response_format = body.get("response_format")
+    if not isinstance(response_format, dict):
+        return None
+    kind = response_format.get("type")
+    if kind == "json_object":
+        return {"type": "object", "additionalProperties": True}
+    if kind == "json_schema":
+        json_schema = response_format.get("json_schema")
+        if isinstance(json_schema, dict):
+            schema = json_schema.get("schema")
+            if isinstance(schema, dict):
+                return schema
+    return None
+
+
+def _structured_content_error(scenario: Scenario, observation: Observation) -> str | None:
+    """Tripwire: a 200 structured completion must satisfy the schema.
+
+    The bridge validates before completing, so schema-invalid content on a
+    200 means bridge validation regressed. A capped turn ends with
+    finish_reason "length" and skips validation by design, so it is not
+    judged here.
+    """
+    if observation.finish_reason == "length":
+        return None
+    schema = _response_format_schema(scenario.body)
+    if schema is None:
+        return None
+    try:
+        payload = json.loads(observation.content_text)
+    except ValueError:
+        return "structured content is not valid JSON"
+    try:
+        validator_for(schema)(schema).validate(payload)
+    except JsonSchemaValidationError:
+        return "structured content violated the response_format schema"
     return None
 
 
@@ -532,6 +667,9 @@ def classify(scenario: Scenario, observation: Observation) -> tuple[str, str]:
         return MODEL_BEHAVIOR, "model produced no client tool call"
     if scenario.expect_content and observation.content_chars == 0:
         return MODEL_BEHAVIOR, "model produced no content"
+    structured_error = _structured_content_error(scenario, observation)
+    if structured_error is not None:
+        return BRIDGE_DEFECT, structured_error
     return SUCCESS, "contract satisfied"
 
 
@@ -593,6 +731,7 @@ def _completion_observation(
         tool_calls=len(tool_calls) if isinstance(tool_calls, list) else 0,
         tool_call_payloads=tool_call_payloads,
         content_chars=len(content) if isinstance(content, str) else 0,
+        content_text=content if isinstance(content, str) else "",
         request_id=headers.get("x-request-id"),
         session_id=session_id if isinstance(session_id, str) else None,
         duration_ms=duration_ms,
@@ -684,6 +823,7 @@ def _stream_observation(
             streamed_tool_calls[index] for index in sorted(streamed_tool_calls)
         ),
         content_chars=content_chars,
+        content_text="".join(content_parts),
         request_id=headers.get("x-request-id"),
         session_id=session_id,
         duration_ms=duration_ms,

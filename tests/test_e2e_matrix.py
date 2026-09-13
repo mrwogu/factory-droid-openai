@@ -127,6 +127,101 @@ def test_contract_satisfied_is_a_pass(e2e: ModuleType) -> None:
     assert verdict == e2e.SUCCESS
 
 
+def test_structured_scenarios_run_per_model_in_both_transports(e2e: ModuleType) -> None:
+    scenarios = [
+        scenario for scenario in e2e.scenarios() if scenario.name.startswith("structured_")
+    ]
+
+    assert {scenario.name for scenario in scenarios} == {"structured_simple", "structured_heavy"}
+    assert {scenario.stream for scenario in scenarios} == {False, True}
+    for scenario in scenarios:
+        assert e2e._response_format_schema(scenario.body) is not None
+        assert scenario.per_model
+
+
+def test_structured_scenario_classifies_schema_valid_content_as_success(e2e: ModuleType) -> None:
+    scenario = next(
+        scenario
+        for scenario in e2e.scenarios()
+        if scenario.name == "structured_simple" and scenario.stream
+    )
+    content = json.dumps({"city": "Gdansk", "temperature_c": 20})
+    observation = _observation(
+        e2e,
+        content_text=content,
+        content_chars=len(content),
+        stream_done=True,
+    )
+
+    assert e2e.classify(scenario, observation) == (e2e.SUCCESS, "contract satisfied")
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "not json",
+        '{"city": "Gdansk"}',
+        '{"city": "Gdansk", "temperature_c": "20"}',
+        '{"city": "Gdansk", "temperature_c": 20, "extra": true}',
+    ],
+)
+def test_structured_tripwire_flags_bridge_validation_regressions(
+    e2e: ModuleType,
+    content: str,
+) -> None:
+    scenario = next(
+        scenario
+        for scenario in e2e.scenarios()
+        if scenario.name == "structured_simple" and not scenario.stream
+    )
+    observation = _observation(e2e, content_text=content, content_chars=len(content))
+
+    verdict, detail = e2e.classify(scenario, observation)
+
+    assert verdict == e2e.BRIDGE_DEFECT
+    assert "structured" in detail
+
+
+def test_structured_failure_after_the_bridge_retry_is_model_behavior(e2e: ModuleType) -> None:
+    scenario = next(
+        scenario
+        for scenario in e2e.scenarios()
+        if scenario.name == "structured_heavy" and not scenario.stream
+    )
+    invalid = _observation(
+        e2e,
+        status=502,
+        error_type="factory_protocol_error",
+        error_message="Factory Droid returned invalid structured JSON output",
+        content_chars=0,
+    )
+    violated = _observation(
+        e2e,
+        status=502,
+        error_type="factory_protocol_error",
+        error_message="Factory Droid structured output violated the requested schema: bad",
+        content_chars=0,
+    )
+
+    assert e2e.classify(scenario, invalid)[0] == e2e.MODEL_BEHAVIOR
+    assert e2e.classify(scenario, violated)[0] == e2e.MODEL_BEHAVIOR
+
+
+def test_json_object_scenario_judges_object_shape(e2e: ModuleType) -> None:
+    scenario = _scenario(
+        e2e,
+        body={
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_object"},
+        },
+    )
+    valid = _observation(e2e, content_text='{"answer": "ok"}')
+    invalid = _observation(e2e, content_text="[1, 2]")
+
+    assert e2e.classify(scenario, valid)[0] == e2e.SUCCESS
+    assert e2e.classify(scenario, invalid)[0] == e2e.BRIDGE_DEFECT
+
+
 @pytest.mark.parametrize(
     ("content", "expected"),
     [
