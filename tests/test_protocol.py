@@ -693,6 +693,12 @@ def test_stream_parser_rejects_invalid_marker_sequences(
         parser.feed(value)
         with pytest.raises(ProtocolError, match=message):
             parser.finish()
+    elif "unexpected text" in message:
+        emissions = parser.feed(value)
+        assert len(emissions) == 1
+        assert isinstance(emissions[0], ToolCallEmission)
+        with pytest.raises(ProtocolError, match=message):
+            parser.finish()
     else:
         with pytest.raises(ProtocolError, match=message):
             parser.feed(value)
@@ -940,9 +946,25 @@ def test_stream_parser_ignores_transcript_tail_after_message_json() -> None:
     assert parser.feed('{"role":"tool","content":"copied"}') == []
 
 
-def test_stream_parser_rejects_message_json_tool_call_without_catalog() -> None:
+@pytest.mark.parametrize(
+    "function",
+    [
+        {"arguments": "{}"},
+        {"name": None, "arguments": "{}"},
+        {"name": "", "arguments": "{}"},
+        {"name": "weather", "arguments": "{}"},
+    ],
+)
+def test_stream_parser_rejects_message_json_tool_call_without_catalog(
+    function: dict[str, object],
+) -> None:
     parser = ToolCallStreamParser(frozenset())
-    message = '{"role":"assistant","tool_calls":[{"function":{"name":"weather","arguments":"{}"}}]}'
+    message = json.dumps(
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": function}],
+        }
+    )
 
     with pytest.raises(ProtocolError) as excinfo:
         parser.feed(message)
@@ -956,6 +978,26 @@ def test_stream_parser_keeps_an_unknown_message_json_tool_failing() -> None:
 
     with pytest.raises(ProtocolError, match="tool 'weather' is not available"):
         parser.feed(message)
+
+
+def test_stream_parser_keeps_valid_message_call_before_later_error() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}), max_tool_calls=2)
+    message = json.dumps(
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {"function": {"name": "weather", "arguments": "{}"}},
+                {"function": {"arguments": "{}"}},
+            ],
+        }
+    )
+
+    emissions = parser.feed(message)
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
+    with pytest.raises(MalformedToolCallError, match="echoed an OpenAI transcript"):
+        parser.finish()
 
 
 def test_stream_parser_rejects_incomplete_transcript_message() -> None:
@@ -2635,18 +2677,25 @@ def test_stream_parser_rejects_pipe_tag_call_to_unknown_tool() -> None:
 def test_stream_parser_rejects_prose_after_pipe_tag_call() -> None:
     parser = ToolCallStreamParser(frozenset({"weather"}))
 
+    emissions = parser.feed(f"{_PIPE_TAG_OPEN}{_PIPE_TAG_CALL}{_PIPE_TAG_CLOSE} and done")
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
     with pytest.raises(ProtocolError, match="unexpected text after tool call"):
-        parser.feed(f"{_PIPE_TAG_OPEN}{_PIPE_TAG_CALL}{_PIPE_TAG_CLOSE} and done")
+        parser.finish()
 
 
 def test_stream_parser_names_the_dialect_in_trailing_text_error() -> None:
     parser = ToolCallStreamParser(frozenset({"weather"}))
 
+    emissions = parser.feed(f"{_PIPE_TAG_OPEN}{_PIPE_TAG_CALL}{_PIPE_TAG_CLOSE} and done")
+
+    assert len(emissions) == 1
     with pytest.raises(
         ProtocolError,
         match=r"unexpected text after tool call \(pipe_tag dialect\)",
     ):
-        parser.feed(f"{_PIPE_TAG_OPEN}{_PIPE_TAG_CALL}{_PIPE_TAG_CLOSE} and done")
+        parser.finish()
 
 
 def test_every_trailing_text_error_names_the_native_dialect() -> None:
@@ -2658,8 +2707,11 @@ def test_every_trailing_text_error_names_the_native_dialect() -> None:
         capped.feed("trailing")
 
     over_cap = ToolCallStreamParser(frozenset({"weather"}), max_tool_calls=1)
+    emissions = over_cap.feed(_tool_call("weather", "{}") + "trailing")
+
+    assert len(emissions) == 1
     with pytest.raises(ProtocolError, match=expected):
-        over_cap.feed(_tool_call("weather", "{}") + "trailing")
+        over_cap.finish()
 
     between = ToolCallStreamParser(frozenset({"weather"}), max_tool_calls=3)
     between.feed(_tool_call("weather", "{}"))
@@ -2951,10 +3003,14 @@ def test_stream_parser_translates_deepseek_calls_across_chunks() -> None:
 def test_stream_parser_rejects_prose_after_a_deepseek_section() -> None:
     parser = ToolCallStreamParser(frozenset({"get_weather"}))
 
+    emissions = parser.feed(
+        f"{_DEEPSEEK_OPEN}{_DEEPSEEK_V31_CALL}{_DEEPSEEK_CLOSE} some suffix text",
+    )
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
     with pytest.raises(ProtocolError, match="unexpected text after tool call"):
-        parser.feed(
-            f"{_DEEPSEEK_OPEN}{_DEEPSEEK_V31_CALL}{_DEEPSEEK_CLOSE} some suffix text",
-        )
+        parser.finish()
 
 
 @pytest.mark.parametrize(
@@ -3343,6 +3399,15 @@ def test_stream_parser_can_discard_an_unclosed_call() -> None:
     parser = ToolCallStreamParser(frozenset({"weather"}))
 
     parser.feed(f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Hel"}}}}')
+    parser.discard_partial_call()
+
+    assert parser.finish() == []
+
+
+def test_stream_parser_can_discard_a_partial_open_marker() -> None:
+    parser = ToolCallStreamParser(frozenset({"weather"}))
+
+    assert parser.feed("<tool_") == []
     parser.discard_partial_call()
 
     assert parser.finish() == []

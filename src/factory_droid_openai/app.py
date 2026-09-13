@@ -8,7 +8,7 @@ import secrets
 import time
 import uuid
 from collections import OrderedDict, deque
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeVar, cast
 
@@ -1867,8 +1867,15 @@ def create_app(
                             )
                         if retry_request is None:
                             if retry_in_flight and retry_reason_in_flight is not None:
+                                terminal_malformed = (
+                                    result is not None
+                                    and result.malformed_note is not None
+                                    and not result.tool_calls
+                                )
                                 outcome: RetryOutcome = (
-                                    "refailed" if retry_reason is not None else "recovered"
+                                    "refailed"
+                                    if retry_reason is not None or terminal_malformed
+                                    else "recovered"
                                 )
                                 _log_retry_outcome(
                                     retry_reason_in_flight,
@@ -2378,6 +2385,10 @@ async def _collect_completion(
     observed_ttft = not observe_ttft
 
     def record_malformed(exc: MalformedToolCallError) -> None:
+        if str(exc) == TOOL_CALL_LIMIT_MESSAGE:
+            # A limit violation invalidates the whole turn, independent of
+            # which SDK event carried each call.
+            result.tool_calls.clear()
         result.malformed_note = _malformed_tool_call_note(exc)
         result.malformed_reason = str(exc)
         result.completed = True
@@ -2408,6 +2419,7 @@ async def _collect_completion(
                     metrics,
                     request_started_at,
                 )
+                first_event_call = len(result.tool_calls)
                 try:
                     emissions = parser.feed(event.text)
                     _apply_emissions(result, emissions, stop_buffer)
@@ -2428,6 +2440,7 @@ async def _collect_completion(
                     # Same interruption as a stop sequence: reading past the
                     # requested output limit only burns tokens nobody asked
                     # for (issue #130).
+                    del result.tool_calls[first_event_call:]
                     result.output_capped = True
                     result.completed = True
                     break
@@ -2602,9 +2615,26 @@ async def _stream_completion(
     stop_buffer = StopSequenceBuffer(stop_sequences)
     token_cap = OutputTokenCap(output_token_limit)
     tool_call_index = 0
+    pending_tool_calls: list[ToolCallEmission] = []
     structured_buffer = (
         StructuredOutputBuffer(structured.max_bytes) if structured is not None else None
     )
+
+    def pending_tool_call_chunks() -> Iterator[str]:
+        nonlocal tool_call_index
+        while pending_tool_calls:
+            emission = pending_tool_calls.pop(0)
+            yield _sse(
+                _chunk_for_emission(
+                    request_id,
+                    created,
+                    model,
+                    emission,
+                    include_usage=include_usage,
+                    tool_call_index=tool_call_index,
+                )
+            )
+            tool_call_index += 1
 
     def text_chunk(text: str) -> str | None:
         if structured_buffer is not None:
@@ -2647,19 +2677,11 @@ async def _stream_completion(
                             metrics,
                             request_started_at,
                         )
+                        first_event_call = len(pending_tool_calls)
                         for emission in parser.feed(event.text):
                             if isinstance(emission, ToolCallEmission):
                                 saw_tool_call = True
-                                chunk = _chunk_for_emission(
-                                    request_id,
-                                    created,
-                                    model,
-                                    emission,
-                                    include_usage=include_usage,
-                                    tool_call_index=tool_call_index,
-                                )
-                                tool_call_index += 1
-                                yield _sse(chunk)
+                                pending_tool_calls.append(emission)
                                 continue
                             text = stop_buffer.feed(emission.text)
                             if text:
@@ -2668,6 +2690,8 @@ async def _stream_completion(
                                     saw_text = True
                                     saw_output = True
                                     yield chunk_payload
+                            if stop_buffer.triggered:
+                                break
                         if stop_buffer.triggered:
                             # Closing the runner generator interrupts the Droid
                             # turn instead of draining output nobody will read.
@@ -2677,6 +2701,8 @@ async def _stream_completion(
                             # Same interruption as a stop sequence: reading
                             # past the requested output limit only burns
                             # tokens nobody asked for (issue #130).
+                            del pending_tool_calls[first_event_call:]
+                            saw_tool_call = bool(pending_tool_calls)
                             capped = True
                             completed = True
                             break
@@ -2760,17 +2786,7 @@ async def _stream_completion(
                     for emission in parser.finish():
                         if isinstance(emission, ToolCallEmission):
                             saw_tool_call = True
-                            yield _sse(
-                                _chunk_for_emission(
-                                    request_id,
-                                    created,
-                                    model,
-                                    emission,
-                                    include_usage=include_usage,
-                                    tool_call_index=tool_call_index,
-                                )
-                            )
-                            tool_call_index += 1
+                            pending_tool_calls.append(emission)
                             continue
                         text = stop_buffer.feed(emission.text)
                         if text:
@@ -2793,6 +2809,8 @@ async def _stream_completion(
                         saw_text = True
                         saw_output = True
                         yield chunk_payload
+            for chunk in pending_tool_call_chunks():
+                yield chunk
             if structured is not None and structured_buffer is not None:
                 structured_text = structured_buffer.text()
                 if not capped:
@@ -2846,6 +2864,8 @@ async def _stream_completion(
             # blind-retrying an unrecoverable request. The partial call is
             # dropped, never executed.
             outcome = "success" if saw_tool_call else "truncated"
+            for chunk in pending_tool_call_chunks():
+                yield chunk
             _log_truncated_tool_call(
                 _TruncatedToolCall.from_error(exc),
                 stream=True,
@@ -2883,6 +2903,12 @@ async def _stream_completion(
             # exposing or repeating garbage. Return a plain-text note with
             # finish_reason="stop"; the call is dropped, never executed.
             outcome = "malformed"
+            if str(exc) == TOOL_CALL_LIMIT_MESSAGE:
+                pending_tool_calls.clear()
+                saw_tool_call = False
+            else:
+                for chunk in pending_tool_call_chunks():
+                    yield chunk
             log_warning(
                 "chat.malformed",
                 stream=True,
@@ -2915,6 +2941,8 @@ async def _stream_completion(
                 yield _sse(_usage_chunk(request_id, created, model, usage))
         except ProtocolError as exc:
             outcome = "error"
+            for chunk in pending_tool_call_chunks():
+                yield chunk
             log_warning(
                 "chat.failed",
                 stream=True,
@@ -2925,6 +2953,8 @@ async def _stream_completion(
             yield _sse(_error_body(str(exc), "factory_protocol_error"))
         except RunnerError as exc:
             outcome = "timeout" if exc.error_type == "factory_droid_timeout" else "error"
+            for chunk in pending_tool_call_chunks():
+                yield chunk
             log_warning(
                 "chat.failed",
                 stream=True,
@@ -3033,6 +3063,8 @@ def _apply_emissions(
             text = emission.text if stop_buffer is None else stop_buffer.feed(emission.text)
             if text:
                 result.text_parts.append(text)
+            if stop_buffer is not None and stop_buffer.triggered:
+                break
         else:
             result.tool_calls.append(_tool_call_dict(emission))
 

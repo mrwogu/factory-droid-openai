@@ -618,8 +618,14 @@ def test_every_dialect_rejects_text_after_a_completed_call(
     fixture = _MARKER_FIXTURES[dialect.name]
     parser = ToolCallStreamParser(frozenset({"weather"}))
 
+    emissions = parser.feed(
+        dialect.open_marker + fixture.payload + dialect.close_marker + "unexpected"
+    )
+
+    assert len(emissions) == 1
+    assert isinstance(emissions[0], ToolCallEmission)
     with pytest.raises(ProtocolError, match="unexpected text after tool call"):
-        parser.feed(dialect.open_marker + fixture.payload + dialect.close_marker + "unexpected")
+        parser.finish()
 
 
 @pytest.mark.parametrize("dialect", MARKER_DIALECTS, ids=lambda dialect: dialect.name)

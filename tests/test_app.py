@@ -455,6 +455,14 @@ async def _post_completion(
         return await client.post("/v1/chat/completions", json=payload)
 
 
+def _sse_json_events(response: httpx.Response) -> list[dict[str, Any]]:
+    return [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and not line.endswith("[DONE]")
+    ]
+
+
 def _continuation_app(tmp_path: Path, runner: FakeRunner) -> Any:
     settings = Settings(
         droid_path="droid",
@@ -3053,6 +3061,7 @@ async def test_non_streaming_message_shaped_phantom_retries_fresh_session(
     assert response.json()["choices"][0]["message"]["content"] == "Direct answer"
     assert len(runner.requests) == 2
     assert runner.requests[1].session_id is None
+    assert runner.requests[1].warm_session is None
     assert runner.requests[0].prompt in runner.requests[1].prompt
     assert "no tools are available" in runner.requests[1].prompt
     records = _warning_records(log_stream)
@@ -3075,6 +3084,7 @@ async def test_non_streaming_message_shaped_phantom_retry_is_bounded(
     assert response.status_code == 502
     assert len(runner.requests) == 2
     assert runner.requests[1].session_id is None
+    assert runner.requests[1].warm_session is None
     assert "no tools are available" in runner.requests[1].prompt
     _assert_retry_refailed(log_stream, "tool_without_catalog")
 
@@ -3115,6 +3125,111 @@ async def test_non_streaming_sequential_over_limit_keeps_single_call_failure(
     records = _warning_records(log_stream)
     assert not any(record["event"] == "chat.retry" for record in records)
     assert not any(record["event"] == "chat.retry_outcome" for record in records)
+
+
+@pytest.mark.asyncio
+async def test_streaming_sequential_over_limit_keeps_single_call_failure(
+    tmp_path: Path,
+) -> None:
+    runner = RetryRunner(["retry/double-tool.jsonl"])
+
+    response = await _post_completion(
+        _app(tmp_path, runner),
+        _weather_payload(parallel_tool_calls=False, stream=True),
+    )
+
+    assert response.status_code == 200
+    chunks = _sse_json_events(response)
+    assert not any(
+        choice["delta"].get("tool_calls") for chunk in chunks for choice in chunk["choices"]
+    )
+    assert [
+        choice["finish_reason"]
+        for chunk in chunks
+        for choice in chunk["choices"]
+        if choice["finish_reason"] is not None
+    ] == ["stop"]
+    assert any(
+        "dropped a malformed tool call" in choice["delta"].get("content", "")
+        for chunk in chunks
+        for choice in chunk["choices"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_over_limit_retry_logs_refailed(tmp_path: Path) -> None:
+    log_stream = _retry_log_stream()
+    runner = RetryRunner(["retry/malformed-tool.jsonl", "retry/double-tool.jsonl"])
+
+    response = await _post_completion(
+        _app(tmp_path, runner),
+        _weather_payload(parallel_tool_calls=False),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["finish_reason"] == "stop"
+    _assert_retry_refailed(log_stream, "malformed_tool_call")
+
+
+@pytest.mark.asyncio
+async def test_streaming_malformed_call_keeps_prior_call(tmp_path: Path) -> None:
+    first = f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"A"}}}}{TOOL_CALL_CLOSE}'
+    malformed = f"{TOOL_CALL_OPEN}not json{TOOL_CALL_CLOSE}"
+    runner = FakeRunner([TextDelta(first), TextDelta(malformed), RunComplete(Usage())])
+
+    response = await _post_completion(
+        _app(tmp_path, runner),
+        _weather_payload(stream=True),
+    )
+
+    assert response.status_code == 200
+    chunks = _sse_json_events(response)
+    calls = [
+        call
+        for chunk in chunks
+        for choice in chunk["choices"]
+        for call in choice["delta"].get("tool_calls", [])
+    ]
+    assert len(calls) == 1
+    assert json.loads(calls[0]["function"]["arguments"]) == {"city": "A"}
+    assert any(
+        "dropped a malformed tool call" in choice["delta"].get("content", "")
+        for chunk in chunks
+        for choice in chunk["choices"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_streaming_protocol_error_keeps_prior_call(tmp_path: Path) -> None:
+    first = f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"A"}}}}{TOOL_CALL_CLOSE}'
+    runner = FakeRunner([TextDelta(first), TextDelta("trailing prose"), RunComplete(Usage())])
+
+    response = await _post_completion(
+        _app(tmp_path, runner),
+        _weather_payload(stream=True),
+    )
+
+    assert response.status_code == 200
+    chunks = _sse_json_events(response)
+    assert any(choice["delta"].get("tool_calls") for chunk in chunks for choice in chunk["choices"])
+    assert chunks[-1]["error"]["type"] == "factory_protocol_error"
+
+
+@pytest.mark.asyncio
+async def test_streaming_runner_error_keeps_prior_call(tmp_path: Path) -> None:
+    runner = ToolCallFailingRunner(
+        RunnerError("Factory Droid SDK failed: boom", error_type="factory_droid_sdk_error")
+    )
+
+    response = await _post_completion(
+        _app(tmp_path, runner),
+        _weather_payload(stream=True),
+    )
+
+    assert response.status_code == 200
+    chunks = _sse_json_events(response)
+    assert any(choice["delta"].get("tool_calls") for chunk in chunks for choice in chunk["choices"])
+    assert chunks[-1]["error"]["type"] == "factory_droid_sdk_error"
 
 
 @pytest.mark.asyncio
@@ -3264,6 +3379,79 @@ async def test_output_limit_text_fallback_caps_without_usage_events(
     assert choice["finish_reason"] == "length"
     assert choice["message"]["content"] == "x" * 200
     assert len(runner.requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_output_limit_drops_same_delta_call_after_cap(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    call = f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{}}}}{TOOL_CALL_CLOSE}'
+    runner = FakeRunner(_output_cap_events(TextDelta(("x" * 128) + call)))
+    payload = _weather_payload(stream=stream, max_tokens=32)
+
+    response = await _post_completion(_app(tmp_path, runner), payload)
+
+    assert response.status_code == 200
+    if stream:
+        chunks = _sse_json_events(response)
+        assert not any(
+            choice["delta"].get("tool_calls") for chunk in chunks for choice in chunk["choices"]
+        )
+        assert '"finish_reason":"length"' in response.text
+    else:
+        choice = response.json()["choices"][0]
+        assert "tool_calls" not in choice["message"]
+        assert choice["finish_reason"] == "length"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_stop_drops_same_delta_call_after_match(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    call = f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{}}}}{TOOL_CALL_CLOSE}'
+    runner = FakeRunner([TextDelta("before STOP" + call), RunComplete(Usage())])
+    payload = _weather_payload(stream=stream, stop="STOP")
+
+    response = await _post_completion(_app(tmp_path, runner), payload)
+
+    assert response.status_code == 200
+    if stream:
+        chunks = _sse_json_events(response)
+        assert not any(
+            choice["delta"].get("tool_calls") for chunk in chunks for choice in chunk["choices"]
+        )
+        content = "".join(
+            choice["delta"].get("content", "") for chunk in chunks for choice in chunk["choices"]
+        )
+        assert content == "before "
+        assert '"finish_reason":"stop"' in response.text
+    else:
+        choice = response.json()["choices"][0]
+        assert "tool_calls" not in choice["message"]
+        assert choice["message"]["content"] == "before "
+        assert choice["finish_reason"] == "stop"
+
+
+@pytest.mark.asyncio
+async def test_streaming_partial_stop_prefix_before_call_keeps_call(
+    tmp_path: Path,
+) -> None:
+    call = f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{}}}}{TOOL_CALL_CLOSE}'
+    runner = FakeRunner([TextDelta("ST" + call), RunComplete(Usage())])
+    payload = _weather_payload(stream=True, stop="STOP")
+
+    response = await _post_completion(_app(tmp_path, runner), payload)
+
+    assert response.status_code == 200
+    chunks = _sse_json_events(response)
+    assert any(choice["delta"].get("tool_calls") for chunk in chunks for choice in chunk["choices"])
+    assert any(
+        choice["delta"].get("content") == "ST" for chunk in chunks for choice in chunk["choices"]
+    )
 
 
 @pytest.mark.asyncio
