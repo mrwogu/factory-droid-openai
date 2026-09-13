@@ -1547,6 +1547,14 @@ def create_app(
                 entry_count=response_cache.entry_count,
             )
             if cached is not None:
+                if deadline <= asyncio.get_running_loop().time():
+                    request.state.telemetry_error_type = "factory_droid_timeout"
+                    log_warning("chat.rejected", status=504, phase="cache")
+                    return _error_response(
+                        f"Factory Droid timed out after {timeout_seconds:.1f} seconds.",
+                        504,
+                        "factory_droid_timeout",
+                    )
                 # The hit runs no Droid turn, so it clears no auth-probe state;
                 # the gate above stays the only authority on a dead key.
                 metrics.increment_response_cache_hits()
