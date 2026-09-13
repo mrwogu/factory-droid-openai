@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.10.0](https://github.com/mrwogu/factory-droid-openai/compare/v1.9.1...v1.10.0) (2026-09-13)
+
+
+### Features
+
+* **api:** enforce max_tokens and stop capped turns ([#131](https://github.com/mrwogu/factory-droid-openai/issues/131)) ([4161717](https://github.com/mrwogu/factory-droid-openai/commit/4161717bef936c08415dd8c55c90c06b48316980))
+* **e2e:** add structured-output scenarios to the live matrix ([#132](https://github.com/mrwogu/factory-droid-openai/issues/132)) ([4e1d835](https://github.com/mrwogu/factory-droid-openai/commit/4e1d8358df3e5d448aaa3e4d4a6c73c39d602346))
+* **observability:** auth probe, cancel and empty telemetry ([#126](https://github.com/mrwogu/factory-droid-openai/issues/126)) ([2935d3d](https://github.com/mrwogu/factory-droid-openai/commit/2935d3d94ec55d4bd019fbbf5fcde1ddd562e845))
+* **telemetry:** log retry outcomes and attempt breadcrumbs ([#123](https://github.com/mrwogu/factory-droid-openai/issues/123)) ([d3994b3](https://github.com/mrwogu/factory-droid-openai/commit/d3994b3413b5d4c1246b58f562dae11ac12cd1b1))
+
+
+### Bug Fixes
+
+* **api:** retry phantom tool calls and trailing output ([#129](https://github.com/mrwogu/factory-droid-openai/issues/129)) ([f84f818](https://github.com/mrwogu/factory-droid-openai/commit/f84f8180aa08e2e42c1a8663afa3185446c4a3dd))
+
 ## [1.9.1](https://github.com/mrwogu/factory-droid-openai/compare/v1.9.0...v1.9.1) (2026-09-11)
 
 
