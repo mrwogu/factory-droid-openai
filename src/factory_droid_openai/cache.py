@@ -129,7 +129,7 @@ def response_cache_key(
     _feed(hasher, reasoning_effort or "")
     _feed(hasher, prompt)
     if output_format is not None:
-        _feed(hasher, _canonical_json(output_format))
+        _feed(hasher, _serialize_json(output_format, sort_keys=True))
     _feed(hasher, str(output_token_limit) if output_token_limit is not None else "none")
     for sequence in stop_sequences:
         _feed(hasher, sequence)
@@ -145,12 +145,12 @@ def response_cache_key(
         _feed(hasher, document.name or "")
         _feed(hasher, _digest(document.data))
     for tool in native_tools:
-        _feed(hasher, _canonical_json(tool.model_dump(mode="json")))
+        _feed(hasher, _serialize_json(tool.model_dump(mode="json"), sort_keys=False))
     return hasher.hexdigest()
 
 
-def _canonical_json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+def _serialize_json(value: Any, *, sort_keys: bool) -> str:
+    return json.dumps(value, sort_keys=sort_keys, separators=(",", ":"), ensure_ascii=False)
 
 
 def _digest(data: str) -> str:

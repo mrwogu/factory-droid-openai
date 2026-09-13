@@ -51,10 +51,19 @@ def _key(**overrides: object) -> str:
     return response_cache_key(**cast("Any", components))
 
 
-def _tool(name: str, description: str = "Read the weather.") -> ToolDefinition:
+def _tool(
+    name: str,
+    description: str = "Read the weather.",
+    parameters: dict[str, Any] | None = None,
+) -> ToolDefinition:
+    function = (
+        ToolFunction(name=name, description=description)
+        if parameters is None
+        else ToolFunction(name=name, description=description, parameters=parameters)
+    )
     return ToolDefinition(
         type="function",
-        function=ToolFunction(name=name, description=description),
+        function=function,
     )
 
 
@@ -232,3 +241,22 @@ def test_keys_separate_native_tool_catalogs() -> None:
     assert _key(native_tools=(_tool("calendar"),)) != baseline
     assert _key(native_tools=(_tool("weather", description="Read the calendar."),)) != baseline
     assert _key(native_tools=(_tool("weather"),)) == baseline
+
+
+def test_keys_preserve_native_tool_schema_order() -> None:
+    first = _tool(
+        "weather",
+        parameters={
+            "type": "object",
+            "properties": {"zone": {"type": "string"}, "city": {"type": "string"}},
+        },
+    )
+    second = _tool(
+        "weather",
+        parameters={
+            "type": "object",
+            "properties": {"city": {"type": "string"}, "zone": {"type": "string"}},
+        },
+    )
+
+    assert _key(native_tools=(first,)) != _key(native_tools=(second,))

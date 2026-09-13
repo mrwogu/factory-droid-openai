@@ -1564,7 +1564,7 @@ surface.
 | `factory_droid_openai_auth_probe_successes_total` | Auth probes that completed with assistant text and a terminal event |
 | `factory_droid_openai_auth_probe_failures_total` | Auth probes that failed, timed out, or returned no complete answer |
 | `factory_droid_openai_response_cache_hits_total` | Eligible lookups served from the response cache |
-| `factory_droid_openai_response_cache_misses_total` | Eligible lookups that ran a Droid turn instead |
+| `factory_droid_openai_response_cache_misses_total` | Eligible lookups with no cached entry |
 | `factory_droid_openai_response_cache_bytes` | Resident response-cache bytes, keys included |
 | `factory_droid_openai_response_cache_entries` | Resident response-cache entries |
 
@@ -1665,9 +1665,10 @@ choices and usage replayed verbatim. The replayed `usage` describes the
 original generation, not the cost of the hit.
 
 A hit skips admission, the warm pool, and the runner entirely, so cached
-traffic cannot occupy a Droid slot. The auth gate and model quarantine stay
-in front of the cache: a dead key or a withheld model rejects before any
-lookup. A hit runs no Droid turn, so it also clears no auth-probe state.
+traffic cannot occupy a Droid slot. When auth probing is enabled, its failure
+gate stays in front of the cache, so a key that crossed the configured failure
+threshold rejects before lookup. Model quarantine also stays in front of the
+cache. A hit runs no Droid turn, so it clears no auth-probe state.
 
 The cache is process-local and in-memory. A restart empties it, so no answer
 survives a deploy, and multi-worker deployments keep one cache per worker,
