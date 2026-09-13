@@ -106,6 +106,16 @@ class Settings:
     # Off by default: prompts and tool payloads are private user content.
     trace_payloads: str = "off"
     trace_payload_file: Path | None = None
+    # Off by default: a hit replays a private response and serves a stale
+    # answer whenever the model is nondeterministic, so only an operator who
+    # accepts that trade for cyclic traffic turns it on (issue #106).
+    response_cache_enabled: bool = False
+    # Absolute, non-sliding: a hit does not extend freshness. Six hours covers
+    # the roughly 2.1-2.4 h cycle of the hindsight refresh workers the cache
+    # is sized for.
+    response_cache_ttl_seconds: float = 21_600.0
+    response_cache_max_bytes: int = 67_108_864
+    response_cache_max_entries: int = 1024
 
     def __post_init__(self) -> None:
         if self.max_tool_calls > MAX_PACKED_CALLS:
@@ -130,6 +140,14 @@ class Settings:
             or self.warm_session_idle_drain_seconds <= 0
         ):
             raise ValueError("warm_session_idle_drain_seconds must be greater than zero and finite")
+        if not math.isfinite(self.response_cache_ttl_seconds) or (
+            self.response_cache_ttl_seconds <= 0
+        ):
+            raise ValueError("response_cache_ttl_seconds must be greater than zero and finite")
+        if self.response_cache_max_bytes <= 0:
+            raise ValueError("response_cache_max_bytes must be greater than zero")
+        if self.response_cache_max_entries <= 0:
+            raise ValueError("response_cache_max_entries must be greater than zero")
         if not math.isfinite(self.auth_probe_seconds) or self.auth_probe_seconds < 0:
             raise ValueError("auth_probe_seconds must be zero or greater and finite")
         if self.auth_failure_threshold < 1:
@@ -358,6 +376,22 @@ class Settings:
             allowed=PAYLOAD_TRACE_MODES,
         )
         trace_payload_file = _optional_path("FACTORY_DROID_OPENAI_TRACE_FILE")
+        response_cache_enabled = _boolean(
+            "FACTORY_DROID_OPENAI_RESPONSE_CACHE_ENABLED",
+            default=False,
+        )
+        response_cache_ttl_seconds = _positive_float(
+            "FACTORY_DROID_OPENAI_RESPONSE_CACHE_TTL_SECONDS",
+            default=21_600.0,
+        )
+        response_cache_max_bytes = _positive_int(
+            "FACTORY_DROID_OPENAI_RESPONSE_CACHE_MAX_BYTES",
+            default=67_108_864,
+        )
+        response_cache_max_entries = _positive_int(
+            "FACTORY_DROID_OPENAI_RESPONSE_CACHE_MAX_ENTRIES",
+            default=1024,
+        )
         if trace_payloads != "off" and trace_payload_file is None:
             # No implicit default: the Droid session runs with workdir as its cwd,
             # so a trace file placed there would expose every prompt to the agent.
@@ -421,6 +455,10 @@ class Settings:
             native_tool_call_url=native_tool_call_url,
             trace_payloads=trace_payloads,
             trace_payload_file=trace_payload_file,
+            response_cache_enabled=response_cache_enabled,
+            response_cache_ttl_seconds=response_cache_ttl_seconds,
+            response_cache_max_bytes=response_cache_max_bytes,
+            response_cache_max_entries=response_cache_max_entries,
         )
 
     def native_tool_call_base_url(self) -> str:

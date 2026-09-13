@@ -78,7 +78,7 @@ from factory_droid_openai.runner import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Callable
 
     from factory_droid_openai.app import RunnerFactory
 
@@ -7310,3 +7310,440 @@ async def test_a_native_request_without_tools_publishes_nothing(tmp_path: Path) 
 
     assert response.status_code == 200
     assert runner.requests[0].native_tools is None
+
+
+def _cache_settings(tmp_path: Path, **overrides: object) -> Settings:
+    options: dict[str, object] = {
+        "droid_path": "droid",
+        "workdir": tmp_path,
+        "timeout_seconds": 30.0,
+        "response_cache_enabled": True,
+    }
+    options.update(overrides)
+    return Settings(**cast("Any", options))
+
+
+def _counting_factory(
+    events: list[RunEvent],
+    calls: list[int],
+) -> Callable[[], FakeRunner]:
+    def factory() -> FakeRunner:
+        calls.append(1)
+        return FakeRunner(events)
+
+    return factory
+
+
+def _cache_bytes(rendered: str) -> int:
+    line = next(
+        candidate
+        for candidate in rendered.splitlines()
+        if candidate.startswith("factory_droid_openai_response_cache_bytes ")
+    )
+    return int(line.split(" ")[1])
+
+
+@pytest.mark.asyncio
+async def test_response_cache_hit_replays_without_a_droid_turn(tmp_path: Path) -> None:
+    calls: list[int] = []
+    events: list[RunEvent] = [
+        TextDelta("Hello there"),
+        RunComplete(Usage(input_tokens=3, output_tokens=2)),
+    ]
+    app = create_app(
+        _cache_settings(tmp_path),
+        runner_factory=cast("RunnerFactory", _counting_factory(events, calls)),
+    )
+
+    async with _client(app) as client:
+        first = await client.post("/v1/chat/completions", json=_payload())
+        second = await client.post("/v1/chat/completions", json=_payload())
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert calls == [1]
+    first_body = first.json()
+    second_body = second.json()
+    assert second_body["choices"] == first_body["choices"]
+    assert second_body["usage"] == first_body["usage"]
+    assert second_body["id"] != first_body["id"]
+    assert second.headers["x-request-id"] != first.headers["x-request-id"]
+    render = app.state.metrics.render()
+    assert "factory_droid_openai_response_cache_hits_total 1" in render
+    assert "factory_droid_openai_response_cache_misses_total 1" in render
+    assert "factory_droid_openai_response_cache_entries 1" in render
+    assert _cache_bytes(render) > 0
+
+
+@pytest.mark.asyncio
+async def test_response_cache_off_by_default_runs_each_request(tmp_path: Path) -> None:
+    calls: list[int] = []
+    events: list[RunEvent] = [TextDelta("Hello"), RunComplete(Usage())]
+    app = create_app(
+        _cache_settings(tmp_path, response_cache_enabled=False),
+        runner_factory=cast("RunnerFactory", _counting_factory(events, calls)),
+    )
+
+    async with _client(app) as client:
+        first = await client.post("/v1/chat/completions", json=_payload())
+        second = await client.post("/v1/chat/completions", json=_payload())
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert calls == [1, 1]
+    assert app.state.response_cache is None
+    assert "factory_droid_openai_response_cache_hits_total 0" in app.state.metrics.render()
+
+
+@pytest.mark.asyncio
+async def test_response_cache_skips_streaming_requests(tmp_path: Path) -> None:
+    calls: list[int] = []
+    events: list[RunEvent] = [TextDelta("Hello"), RunComplete(Usage())]
+    app = create_app(
+        _cache_settings(tmp_path),
+        runner_factory=cast("RunnerFactory", _counting_factory(events, calls)),
+    )
+
+    async with _client(app) as client:
+        first = await client.post("/v1/chat/completions", json=_payload(stream=True))
+        second = await client.post("/v1/chat/completions", json=_payload(stream=True))
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert calls == [1, 1]
+    render = app.state.metrics.render()
+    assert "factory_droid_openai_response_cache_hits_total 0" in render
+    assert "factory_droid_openai_response_cache_misses_total 0" in render
+
+
+@pytest.mark.asyncio
+async def test_response_cache_skips_multiple_choices(tmp_path: Path) -> None:
+    calls: list[int] = []
+    events: list[RunEvent] = [TextDelta("Hello"), RunComplete(Usage())]
+    app = create_app(
+        _cache_settings(tmp_path),
+        runner_factory=cast("RunnerFactory", _counting_factory(events, calls)),
+    )
+
+    async with _client(app) as client:
+        first = await client.post("/v1/chat/completions", json=_payload(n=2))
+        second = await client.post("/v1/chat/completions", json=_payload(n=2))
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    # One admission runner plus one runner per extra choice, twice.
+    assert calls == [1, 1, 1, 1]
+    render = app.state.metrics.render()
+    assert "factory_droid_openai_response_cache_hits_total 0" in render
+    assert "factory_droid_openai_response_cache_misses_total 0" in render
+
+
+@pytest.mark.asyncio
+async def test_response_cache_separates_distinct_fingerprints(tmp_path: Path) -> None:
+    calls: list[int] = []
+    events: list[RunEvent] = [TextDelta("Hello"), RunComplete(Usage())]
+    app = create_app(
+        _cache_settings(tmp_path),
+        runner_factory=cast("RunnerFactory", _counting_factory(events, calls)),
+    )
+
+    async with _client(app) as client:
+        first = await client.post(
+            "/v1/chat/completions",
+            json=_payload(messages=[{"role": "user", "content": "One"}]),
+        )
+        second = await client.post(
+            "/v1/chat/completions",
+            json=_payload(messages=[{"role": "user", "content": "Two"}]),
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert calls == [1, 1]
+    render = app.state.metrics.render()
+    assert "factory_droid_openai_response_cache_hits_total 0" in render
+    assert "factory_droid_openai_response_cache_misses_total 2" in render
+
+
+@pytest.mark.asyncio
+async def test_response_cache_replays_structured_output(tmp_path: Path) -> None:
+    calls: list[int] = []
+    events: list[RunEvent] = [
+        TextDelta('{"answer": 5}'),
+        RunComplete(Usage(input_tokens=1, output_tokens=1)),
+    ]
+    app = create_app(
+        _cache_settings(tmp_path),
+        runner_factory=cast("RunnerFactory", _counting_factory(events, calls)),
+    )
+
+    async with _client(app) as client:
+        first = await client.post("/v1/chat/completions", json=_integer_answer_payload())
+        second = await client.post("/v1/chat/completions", json=_integer_answer_payload())
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert calls == [1]
+    assert second.json()["choices"] == first.json()["choices"]
+
+
+@pytest.mark.asyncio
+async def test_response_cache_replays_stop_sequence_responses(tmp_path: Path) -> None:
+    calls: list[int] = []
+    events: list[RunEvent] = [TextDelta("before STOP"), RunComplete(Usage())]
+    app = create_app(
+        _cache_settings(tmp_path),
+        runner_factory=cast("RunnerFactory", _counting_factory(events, calls)),
+    )
+
+    async with _client(app) as client:
+        first = await client.post("/v1/chat/completions", json=_payload(stop=["STOP"]))
+        second = await client.post("/v1/chat/completions", json=_payload(stop=["STOP"]))
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert calls == [1]
+    assert first.json()["choices"][0]["finish_reason"] == "stop"
+    assert second.json()["choices"] == first.json()["choices"]
+
+
+@pytest.mark.asyncio
+async def test_response_cache_skips_tool_call_responses(tmp_path: Path) -> None:
+    calls: list[int] = []
+    marker = f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{}}}}{TOOL_CALL_CLOSE}'
+    events: list[RunEvent] = [TextDelta(marker)]
+    app = create_app(
+        _cache_settings(tmp_path),
+        runner_factory=cast("RunnerFactory", _counting_factory(events, calls)),
+    )
+
+    async with _client(app) as client:
+        first = await client.post("/v1/chat/completions", json=_weather_payload())
+        second = await client.post("/v1/chat/completions", json=_weather_payload())
+
+    assert first.status_code == 200
+    assert first.json()["choices"][0]["finish_reason"] == "tool_calls"
+    assert second.status_code == 200
+    assert calls == [1, 1]
+    assert "factory_droid_openai_response_cache_hits_total 0" in app.state.metrics.render()
+
+
+@pytest.mark.asyncio
+async def test_response_cache_skips_malformed_notice_responses(tmp_path: Path) -> None:
+    calls: list[int] = []
+    marker = f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{}}}}{TOOL_CALL_CLOSE}'
+    events: list[RunEvent] = [TextDelta(marker * 2)]
+    app = create_app(
+        _cache_settings(tmp_path),
+        runner_factory=cast("RunnerFactory", _counting_factory(events, calls)),
+    )
+
+    async with _client(app) as client:
+        first = await client.post(
+            "/v1/chat/completions",
+            json=_weather_payload(parallel_tool_calls=False),
+        )
+        second = await client.post(
+            "/v1/chat/completions",
+            json=_weather_payload(parallel_tool_calls=False),
+        )
+
+    assert first.status_code == 200
+    assert first.json()["choices"][0]["finish_reason"] == "stop"
+    assert second.status_code == 200
+    assert calls == [1, 1]
+    assert "factory_droid_openai_response_cache_hits_total 0" in app.state.metrics.render()
+
+
+@pytest.mark.asyncio
+async def test_response_cache_skips_empty_completions(tmp_path: Path) -> None:
+    calls: list[int] = []
+    events: list[RunEvent] = [RunComplete(Usage())]
+    app = create_app(
+        _cache_settings(tmp_path),
+        runner_factory=cast("RunnerFactory", _counting_factory(events, calls)),
+    )
+
+    async with _client(app) as client:
+        first = await client.post("/v1/chat/completions", json=_payload())
+        second = await client.post("/v1/chat/completions", json=_payload())
+
+    assert first.status_code == 200
+    assert first.json()["choices"][0]["message"]["content"] is None
+    assert second.status_code == 200
+    assert calls == [1, 1]
+    assert "factory_droid_openai_response_cache_hits_total 0" in app.state.metrics.render()
+
+
+@pytest.mark.asyncio
+async def test_payload_tracing_disables_the_response_cache(tmp_path: Path) -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
+    app = create_app(
+        _cache_settings(
+            tmp_path,
+            trace_payloads="full",
+            trace_payload_file=tmp_path / "trace.jsonl",
+        ),
+        runner_factory=cast("RunnerFactory", _counting_factory([], [])),
+    )
+
+    assert app.state.response_cache is None
+    disabled = [
+        record
+        for record in _warning_records(log_stream)
+        if record["event"] == "response_cache.disabled"
+    ]
+    assert [record["reason"] for record in disabled] == ["payload_tracing"]
+
+
+@pytest.mark.asyncio
+async def test_session_continuity_disables_the_response_cache(tmp_path: Path) -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
+    app = create_app(
+        _cache_settings(tmp_path, session_continuity=True),
+        runner_factory=cast("RunnerFactory", _counting_factory([], [])),
+    )
+
+    assert app.state.response_cache is None
+    disabled = [
+        record
+        for record in _warning_records(log_stream)
+        if record["event"] == "response_cache.disabled"
+    ]
+    assert [record["reason"] for record in disabled] == ["session_continuity"]
+
+
+@pytest.mark.asyncio
+async def test_append_system_prompt_file_disables_the_response_cache(
+    tmp_path: Path,
+) -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
+    appended = tmp_path / "extra.md"
+    appended.write_text("extra instructions", encoding="utf-8")
+    app = create_app(
+        _cache_settings(tmp_path, append_system_prompt_file=appended),
+        runner_factory=cast("RunnerFactory", _counting_factory([], [])),
+    )
+
+    assert app.state.response_cache is None
+    disabled = [
+        record
+        for record in _warning_records(log_stream)
+        if record["event"] == "response_cache.disabled"
+    ]
+    assert [record["reason"] for record in disabled] == ["append_system_prompt_file"]
+
+
+@pytest.mark.asyncio
+async def test_auth_gate_rejects_before_the_response_cache_lookup(
+    tmp_path: Path,
+) -> None:
+    calls: list[int] = []
+    events: list[RunEvent] = [TextDelta("Hello"), RunComplete(Usage())]
+    app = create_app(
+        _cache_settings(
+            tmp_path,
+            auth_probe_seconds=60.0,
+            auth_failure_threshold=2,
+        ),
+        runner_factory=cast("RunnerFactory", _counting_factory(events, calls)),
+    )
+    probe = app.state.auth_probe
+    assert probe is not None
+    probe._consecutive_failures = 2
+
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=_payload())
+
+    assert response.status_code == 503
+    # The gate fires before the cache, so no Droid turn is spent either way.
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_quarantine_rejects_before_the_response_cache_lookup(
+    tmp_path: Path,
+) -> None:
+    calls: list[int] = []
+    events: list[RunEvent] = [TextDelta("Hello"), RunComplete(Usage())]
+    app = create_app(
+        _cache_settings(tmp_path),
+        runner_factory=cast("RunnerFactory", _counting_factory(events, calls)),
+    )
+
+    async with _client(app) as client:
+        first = await client.post(
+            "/v1/chat/completions",
+            json=_payload(model="gpt-5.4"),
+        )
+        assert first.status_code == 200
+        assert app.state.quarantine.record("gpt-5.4", "boom") is True
+        second = await client.post(
+            "/v1/chat/completions",
+            json=_payload(model="gpt-5.4"),
+        )
+
+    assert second.status_code == 404
+    assert calls == [1]
+
+
+@pytest.mark.asyncio
+async def test_response_cache_hit_does_not_refresh_pool_activity(
+    tmp_path: Path,
+) -> None:
+    calls: list[int] = []
+    events: list[RunEvent] = [TextDelta("Hello"), RunComplete(Usage())]
+    app = create_app(
+        _cache_settings(tmp_path),
+        runner_factory=cast("RunnerFactory", _counting_factory(events, calls)),
+    )
+    activity: list[int] = []
+    original = app.state.pool.record_activity
+
+    def record_activity() -> None:
+        activity.append(len(activity))
+        original()
+
+    cast("Any", app.state.pool).record_activity = record_activity
+
+    async with _client(app) as client:
+        await client.post("/v1/chat/completions", json=_payload())
+        baseline = len(activity)
+        await client.post("/v1/chat/completions", json=_payload())
+        rejected = await client.post(
+            "/v1/chat/completions",
+            json=_payload(),
+            headers={"X-Factory-Droid-Priority": "bogus"},
+        )
+
+    assert rejected.status_code == 400
+    assert calls == [1]
+    # Only the miss refreshed the pool: the hit and the priority rejection
+    # both stay off the pool-activity path.
+    assert len(activity) == baseline
+
+
+@pytest.mark.asyncio
+async def test_response_cache_emits_hit_and_miss_events(tmp_path: Path) -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="debug", log_format="json", stream=log_stream)
+    calls: list[int] = []
+    events: list[RunEvent] = [TextDelta("Hello"), RunComplete(Usage())]
+    app = create_app(
+        _cache_settings(tmp_path),
+        runner_factory=cast("RunnerFactory", _counting_factory(events, calls)),
+    )
+
+    async with _client(app) as client:
+        await client.post("/v1/chat/completions", json=_payload())
+        await client.post("/v1/chat/completions", json=_payload())
+
+    records = _warning_records(log_stream)
+    events_logged = [record["event"] for record in records]
+    assert events_logged.count("chat.cache_miss") == 1
+    assert events_logged.count("chat.cache_hit") == 1
+    completed = [record for record in records if record["event"] == "chat.completed"]
+    assert [record.get("cache_hit") for record in completed] == [None, True]

@@ -61,6 +61,10 @@ class BridgeMetrics:
         self._empty_completions = 0
         self._auth_probe_successes = 0
         self._auth_probe_failures = 0
+        self._response_cache_hits = 0
+        self._response_cache_misses = 0
+        self._response_cache_bytes = 0
+        self._response_cache_entries = 0
         self._telemetry_requests: Counter[tuple[str, str, str]] = Counter()
         self._telemetry_request_duration_seconds: dict[tuple[str, str, str], float] = {}
         self._telemetry_features: Counter[str] = Counter()
@@ -166,6 +170,19 @@ class BridgeMetrics:
         with self._lock:
             self._auth_probe_failures += 1
 
+    def increment_response_cache_hits(self) -> None:
+        with self._lock:
+            self._response_cache_hits += 1
+
+    def increment_response_cache_misses(self) -> None:
+        with self._lock:
+            self._response_cache_misses += 1
+
+    def set_response_cache(self, *, byte_size: int, entry_count: int) -> None:
+        with self._lock:
+            self._response_cache_bytes = byte_size
+            self._response_cache_entries = entry_count
+
     def telemetry_snapshot(self) -> MetricsSnapshot:
         with self._lock:
             requests = tuple(
@@ -232,6 +249,10 @@ class BridgeMetrics:
                 "empty_completions": self._empty_completions,
                 "auth_probe_successes": self._auth_probe_successes,
                 "auth_probe_failures": self._auth_probe_failures,
+                "response_cache_hits": self._response_cache_hits,
+                "response_cache_misses": self._response_cache_misses,
+                "response_cache_bytes": self._response_cache_bytes,
+                "response_cache_entries": self._response_cache_entries,
             }
 
         lines = [
@@ -299,5 +320,13 @@ class BridgeMetrics:
             (f"factory_droid_openai_auth_probe_successes_total {values['auth_probe_successes']}"),
             "# TYPE factory_droid_openai_auth_probe_failures_total counter",
             f"factory_droid_openai_auth_probe_failures_total {values['auth_probe_failures']}",
+            "# TYPE factory_droid_openai_response_cache_hits_total counter",
+            f"factory_droid_openai_response_cache_hits_total {values['response_cache_hits']}",
+            "# TYPE factory_droid_openai_response_cache_misses_total counter",
+            (f"factory_droid_openai_response_cache_misses_total {values['response_cache_misses']}"),
+            "# TYPE factory_droid_openai_response_cache_bytes gauge",
+            f"factory_droid_openai_response_cache_bytes {values['response_cache_bytes']}",
+            "# TYPE factory_droid_openai_response_cache_entries gauge",
+            f"factory_droid_openai_response_cache_entries {values['response_cache_entries']}",
         ]
         return "\n".join(lines) + "\n"

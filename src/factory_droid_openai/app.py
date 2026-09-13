@@ -22,6 +22,7 @@ from jsonschema.validators import validator_for
 
 from factory_droid_openai.auth_probe import AuthProbe
 from factory_droid_openai.availability import ModelQuarantine
+from factory_droid_openai.cache import ResponseCache, response_cache_key
 from factory_droid_openai.config import DEFAULT_TOOL_CALL_DRAIN_SECONDS, Settings
 from factory_droid_openai.droid_rpc import DroidRpcExtension, ToolCatalogCache
 from factory_droid_openai.logs import bind_request, current_timeline
@@ -159,6 +160,8 @@ _TRAILING_OUTPUT_ERROR_PREFIX = "unexpected text after tool call"
 # stay authoritative whenever they arrive mid-turn.
 _CHARS_PER_TOKEN_ESTIMATE = 4
 _OUTPUT_LIMIT_TRUNCATION = "output token limit reached"
+_CHAT_COMPLETED_EVENT = "chat.completed"
+_RESPONSE_CACHE_DISABLED_EVENT = "response_cache.disabled"
 
 CHAT_COMPLETION_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {
@@ -881,6 +884,26 @@ def create_app(
             failure_threshold=resolved_settings.auth_failure_threshold,
             metrics=metrics,
         )
+    response_cache: ResponseCache | None = None
+    if resolved_settings.response_cache_enabled:
+        if resolved_settings.trace_payloads != "off":
+            # Tracing exists to capture prompts verbatim; a hit would skip the
+            # very turns being traced, so tracing wins.
+            log_warning(_RESPONSE_CACHE_DISABLED_EVENT, reason="payload_tracing")
+        elif resolved_settings.session_continuity:
+            # Continuation responses embed a per-request session id, so
+            # replaying one would hand out a session the caller never owned.
+            log_warning(_RESPONSE_CACHE_DISABLED_EVENT, reason="session_continuity")
+        elif resolved_settings.append_system_prompt_file is not None:
+            # The appended file is a hidden model input that can change on
+            # disk without a restart, so no fingerprint can cover it.
+            log_warning(_RESPONSE_CACHE_DISABLED_EVENT, reason="append_system_prompt_file")
+        else:
+            response_cache = ResponseCache(
+                max_bytes=resolved_settings.response_cache_max_bytes,
+                max_entries=resolved_settings.response_cache_max_entries,
+                ttl_seconds=resolved_settings.response_cache_ttl_seconds,
+            )
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -912,6 +935,7 @@ def create_app(
                 if resolved_settings.trace_payload_file is not None
                 else None
             ),
+            response_cache=bool(response_cache),
         )
         try:
             yield
@@ -969,6 +993,7 @@ def create_app(
     application.state.auth_probe = auth_probe
     application.state.tool_catalog_cache = tool_catalog_cache
     application.state.native_tools = native_tools
+    application.state.response_cache = response_cache
     if resolved_settings.native_tool_calls:
         # The token in each path is the credential, so the endpoint carries no
         # API-key dependency: it is told to a Droid process this bridge
@@ -1360,7 +1385,6 @@ def create_app(
         deadline = request_started_at + timeout_seconds
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         timeline = bind_request(request_id)
-        pool.record_activity()
         log_debug(
             "chat.received",
             model=payload.model,
@@ -1491,6 +1515,81 @@ def create_app(
         if payload.n > 1:
             features.append("multiple_choices")
         metrics.record_features(tuple(features))
+
+        # A hit replays an answer the bridge already holds, so it skips the
+        # warm pool, admission, and the runner entirely. The response envelope
+        # (id, created, headers) is regenerated per hit; only the choices and
+        # usage are replayed. Continuation requests can never reach this
+        # lookup: continuity-on disables the cache entirely, and continuity-off
+        # rejects the session id upstream.
+        cache_key: str | None = None
+        if response_cache is not None and not payload.stream and payload.n == 1:
+            cache_key = response_cache_key(
+                model=payload.model,
+                reasoning_effort=reasoning_effort,
+                prompt=plan.prompt,
+                output_format=structured.payload if structured is not None else None,
+                output_token_limit=(
+                    payload.max_completion_tokens
+                    if payload.max_completion_tokens is not None
+                    else payload.max_tokens
+                ),
+                stop_sequences=payload.stop_sequences,
+                max_tool_calls=(
+                    resolved_settings.max_tool_calls if payload.parallel_tool_calls else 1
+                ),
+                attachments=plan.attachments,
+                native_tools=plan.native_tools,
+            )
+            cached = response_cache.get(cache_key)
+            metrics.set_response_cache(
+                byte_size=response_cache.byte_size,
+                entry_count=response_cache.entry_count,
+            )
+            if cached is not None:
+                if deadline <= asyncio.get_running_loop().time():
+                    request.state.telemetry_error_type = "factory_droid_timeout"
+                    log_warning("chat.rejected", status=504, phase="cache")
+                    return _error_response(
+                        f"Factory Droid timed out after {timeout_seconds:.1f} seconds.",
+                        504,
+                        "factory_droid_timeout",
+                    )
+                # The hit runs no Droid turn, so it clears no auth-probe state;
+                # the gate above stays the only authority on a dead key.
+                metrics.increment_response_cache_hits()
+                replayed = json.loads(cached.decode("utf-8"))
+                log_debug("chat.cache_hit", model=payload.model)
+                log_info(
+                    _CHAT_COMPLETED_EVENT,
+                    status=200,
+                    model=payload.model,
+                    stream=False,
+                    choices=1,
+                    tool_calls=0,
+                    cache_hit=True,
+                    input_tokens=replayed["usage"]["prompt_tokens"],
+                    output_tokens=replayed["usage"]["completion_tokens"],
+                    **timeline.fields(),
+                )
+                return JSONResponse(
+                    {
+                        "id": request_id,
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": payload.model,
+                        "choices": replayed["choices"],
+                        "usage": replayed["usage"],
+                    },
+                    headers={"x-request-id": request_id},
+                )
+            metrics.increment_response_cache_misses()
+            log_debug("chat.cache_miss", model=payload.model)
+
+        # Recorded here instead of at the top of the handler so a cache hit
+        # cannot keep idle warm sessions alive, and rejected traffic no longer
+        # counts as pool activity.
+        pool.record_activity()
 
         created = int(time.time())
         run_request = RunRequest(
@@ -1734,6 +1833,7 @@ def create_app(
         started_session: str | None = None
         retry_reason_in_flight: ModelOutputRetryReason | None = None
         empty_choices = 0
+        cacheable_result = False
         try:
             async with lease:
                 # Choices run one after another so n completions never exceed the
@@ -1938,6 +2038,17 @@ def create_app(
                             model=payload.model,
                             choice=index,
                         )
+                    if (
+                        cache_key is not None
+                        and not completed_result.tool_calls
+                        and completed_result.malformed_note is None
+                        and completed_result.truncation is None
+                        and not completed_result.output_capped
+                        and choice_message["content"] is not None
+                    ):
+                        # Only a clean stop turn is replayable: a cached tool
+                        # call would poison the client loop that answers it.
+                        cacheable_result = True
         except ProtocolError as exc:
             request.state.telemetry_error_type = "factory_protocol_error"
             if retry_reason_in_flight is not None:
@@ -1982,7 +2093,7 @@ def create_app(
                 auth_probe.record_success()
 
         log_info(
-            "chat.completed",
+            _CHAT_COMPLETED_EVENT,
             status=200,
             model=payload.model,
             stream=False,
@@ -2005,6 +2116,22 @@ def create_app(
         if resolved_settings.session_continuity and started_session is not None:
             body["factory_droid_session_id"] = started_session
             headers["x-factory-droid-session-id"] = started_session
+
+        if cache_key is not None and response_cache is not None and cacheable_result:
+            # Session continuity is off whenever the cache exists, so the
+            # stored payload can never carry a factory_droid_session_id.
+            response_cache.put(
+                cache_key,
+                json.dumps(
+                    {"choices": choices, "usage": body["usage"]},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+            )
+            metrics.set_response_cache(
+                byte_size=response_cache.byte_size,
+                entry_count=response_cache.entry_count,
+            )
 
         return JSONResponse(body, headers=headers)
 
@@ -3004,7 +3131,7 @@ def _log_stream_outcome(
 ) -> None:
     timeline = current_timeline()
     log_info(
-        "chat.completed",
+        _CHAT_COMPLETED_EVENT,
         outcome=outcome,
         model=model,
         stream=True,

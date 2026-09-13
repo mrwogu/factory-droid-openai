@@ -37,6 +37,7 @@ Not affiliated with, endorsed by, or maintained by Factory.
 - [Requirements](#requirements)
 - [Limits and metrics](#limits-and-metrics)
 - [Warm sessions](#warm-sessions)
+- [Response cache](#response-cache)
 - [Logging](#logging)
 - [Authentication](#authentication)
 - [Tool execution safety](#tool-execution-safety)
@@ -204,6 +205,7 @@ factory-droid-openai
 - Inline image and document attachments over the native SDK channel
 - Stop sequences, `n` choices, and multiple tool calls per turn
 - Optional Droid session continuity across requests
+- Opt-in exact-match response cache for cyclic repeated completions
 - Guarded context, compaction, fork, rename, and close session extensions
 - Client disconnect cancellation
 - Discoverable, verified Factory-native tool disabling
@@ -1440,6 +1442,10 @@ error types.
 | `DO_NOT_TRACK` | unset | Any value other than `0` disables telemetry |
 | `FACTORY_DROID_OPENAI_TRACE_PAYLOADS` | `off` | Payload tracing: `off`, `heads`, or `full` |
 | `FACTORY_DROID_OPENAI_TRACE_FILE` | unset | Trace destination, required unless tracing is `off` |
+| `FACTORY_DROID_OPENAI_RESPONSE_CACHE_ENABLED` | `false` | Serve repeated exact-match non-streaming completions from an in-memory cache |
+| `FACTORY_DROID_OPENAI_RESPONSE_CACHE_TTL_SECONDS` | `21600` | Absolute, non-sliding lifetime of a cached response |
+| `FACTORY_DROID_OPENAI_RESPONSE_CACHE_MAX_BYTES` | `67108864` | Resident cache byte cap, key included |
+| `FACTORY_DROID_OPENAI_RESPONSE_CACHE_MAX_ENTRIES` | `1024` | Resident cache entry cap, bounding Python object overhead |
 
 Command-line options:
 
@@ -1557,6 +1563,10 @@ surface.
 | `factory_droid_openai_empty_completions_total` | Completions that returned no text or tool calls |
 | `factory_droid_openai_auth_probe_successes_total` | Auth probes that completed with assistant text and a terminal event |
 | `factory_droid_openai_auth_probe_failures_total` | Auth probes that failed, timed out, or returned no complete answer |
+| `factory_droid_openai_response_cache_hits_total` | Eligible lookups served from the response cache |
+| `factory_droid_openai_response_cache_misses_total` | Eligible lookups with no cached entry |
+| `factory_droid_openai_response_cache_bytes` | Resident response-cache bytes, keys included |
+| `factory_droid_openai_response_cache_entries` | Resident response-cache entries |
 
 `forced_kills_total` counts processes that had to be killed with a signal
 because they did not exit within `FACTORY_DROID_OPENAI_PROCESS_GRACE_SECONDS`.
@@ -1627,6 +1637,57 @@ request path instead, and `FACTORY_DROID_OPENAI_WARM_SESSIONS=0` to disable
 pre-warming. Either way one Droid process serves one request; warm sessions
 only move the startup cost off the request path, and each idle session holds
 a Droid process while it waits.
+
+## Response cache
+
+Set `FACTORY_DROID_OPENAI_RESPONSE_CACHE_ENABLED=true` to serve repeated
+identical completions from memory instead of running another Droid turn. The
+cache exists for cyclic traffic - a worker that re-runs the same query with
+the same tool schemas pays one real turn, then hits until the entry expires.
+
+A cache key is a SHA-256 fingerprint of everything that can change the
+generated answer: the model, the effective reasoning effort, the serialized
+prompt (which already covers messages, tool schemas, and `tool_choice`), the
+structured-output schema, the effective `max_tokens`, the stop sequences, the
+effective tool-call cap, attachment digests, and the native tool catalog.
+Two requests share an entry only when this fingerprint matches. The TTL is
+absolute: a hit does not extend freshness, so every replayed answer is at
+most `FACTORY_DROID_OPENAI_RESPONSE_CACHE_TTL_SECONDS` old. Six hours is the
+default; 12-24 hours suits the hindsight refresh cadence this feature was
+sized for.
+
+Only clean `finish_reason="stop"` non-streaming single-choice (`n=1`)
+responses are stored. Tool-call turns, malformed notices, truncated or
+capped output, and empty completions are never cached, and neither are
+streaming or session-continuation requests. A hit returns a fresh response
+envelope - a new `id`, `created`, and `x-request-id` - with the cached
+choices and usage replayed verbatim. The replayed `usage` describes the
+original generation, not the cost of the hit.
+
+A hit skips admission, the warm pool, and the runner entirely, so cached
+traffic cannot occupy a Droid slot. When auth probing is enabled, its failure
+gate stays in front of the cache, so a key that crossed the configured failure
+threshold rejects before lookup. Model quarantine also stays in front of the
+cache. A hit runs no Droid turn, so it clears no auth-probe state.
+
+The cache is process-local and in-memory. A restart empties it, so no answer
+survives a deploy, and multi-worker deployments keep one cache per worker,
+which lowers the hit rate. Entries are bounded twice: a byte cap
+(`FACTORY_DROID_OPENAI_RESPONSE_CACHE_MAX_BYTES`, 64 MiB by default, key
+included) and an entry cap (`FACTORY_DROID_OPENAI_RESPONSE_CACHE_MAX_ENTRIES`,
+1024 by default) bound the resident Python overhead.
+
+The cache turns itself off with a `response_cache.disabled` warning when
+payload tracing is on, session continuity is on, or
+`FACTORY_DROID_OPENAI_APPEND_SYSTEM_PROMPT_FILE` is set: tracing must not
+miss turns, continuity responses embed a per-request session id, and the
+appended prompt file is a hidden model input that can change without a
+restart.
+
+There is no single-flight: identical requests racing the first lookup each
+run their own Droid turn and each store the answer. `chat.cache_hit` and
+`chat.cache_miss` events plus the `/metrics` counters above cover everything
+the cache does.
 
 ## Logging
 
