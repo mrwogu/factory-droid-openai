@@ -3207,6 +3207,25 @@ async def test_output_limit_drops_an_unclosed_complete_payload(
 
 
 @pytest.mark.asyncio
+async def test_output_limit_discards_a_deferred_transcript_error(tmp_path: Path) -> None:
+    prefix = 'safe answer (reset|", '
+    mangled = (
+        '"tool_calls":"id":"call_1","type":"function","function":'
+        '("name":"weather","arguments":("city":"Gdansk"))'
+    )
+    runner = FakeRunner([TextDelta(prefix + mangled)])
+    payload = _weather_payload(max_tokens=8)
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["message"]["content"] == prefix
+    assert choice["finish_reason"] == "length"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
 async def test_output_limit_skips_partial_structured_output_validation(
     tmp_path: Path,
