@@ -779,6 +779,58 @@ async def test_disable_native_tools_spares_the_tools_the_bridge_published() -> N
 
 
 @pytest.mark.asyncio
+async def test_disable_native_tools_tolerates_the_loader_in_a_toolless_session() -> None:
+    """Issue #134: the CLI keeps the loader callable even with no MCP tools."""
+    disabled: set[str] = set()
+
+    def handler(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if method == "droid.list_tools":
+            return {
+                "result": {
+                    "tools": [
+                        {"id": "read-cli", "currentlyAllowed": "read-cli" not in disabled},
+                        {"id": "exit-spec-mode", "currentlyAllowed": True},
+                        {"id": "tool-search-cli", "currentlyAllowed": True},
+                    ]
+                }
+            }
+        if method == "droid.update_session_settings":
+            disabled.update(params["disabledToolIds"])
+            return {"result": {}}
+        raise AssertionError(method)
+
+    protocol = FakeProtocol(handler)
+
+    await DroidRpcExtension().disable_native_tools(_client(protocol))
+
+    # The disable request still names the loader; only verification tolerates it.
+    assert disabled == {"read-cli", "exit-spec-mode", "tool-search-cli"}
+
+
+@pytest.mark.asyncio
+async def test_disable_native_tools_still_fails_closed_in_a_toolless_session() -> None:
+    def handler(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        del params
+        if method == "droid.list_tools":
+            return {
+                "result": {
+                    "tools": [
+                        {"id": "execute-cli", "currentlyAllowed": True},
+                        {"id": "tool-search-cli", "currentlyAllowed": True},
+                    ]
+                }
+            }
+        if method == "droid.update_session_settings":
+            return {"result": {}}
+        raise AssertionError(method)
+
+    extension = DroidRpcExtension()
+    client = _client(FakeProtocol(handler))
+    with pytest.raises(DroidClientError, match="execute-cli"):
+        await extension.disable_native_tools(client)
+
+
+@pytest.mark.asyncio
 async def test_native_tool_setup_waits_for_only_the_bridge_server() -> None:
     disabled: set[str] = set()
     expected = frozenset({f"{MCP_TOOL_ID_PREFIX}get_weather"})

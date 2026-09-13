@@ -33,9 +33,11 @@ _TOOL_DISABLE_RETRIES = 3
 _TOOL_DISABLE_RETRY_SECONDS = 0.1
 _UNAVOIDABLE_TOOL_IDS = frozenset({"exit-spec-mode"})
 # Droid keeps the deferred-tool loader callable in any session that has a tool
-# left to load, which is every session that publishes tools over MCP. It only
-# fetches a schema Droid already holds, and the model needs it to reach those
-# tools at all.
+# left to load, and current CLI builds keep it callable in every session, not
+# only the ones that publish tools over MCP (issue #134: a tool-less session
+# failing on it broke every probe, warm and chat). It only fetches a schema
+# Droid already holds, and Droid refuses to run it in a session with every
+# tool disabled, so tolerating it cannot re-open a machine tool.
 _DEFERRED_TOOL_LOADER_IDS = frozenset({"tool-search-cli"})
 _CONNECTED_MCP_STATUS = "connected"
 _FAILED_MCP_STATUSES = frozenset({"failed", "disconnected", "disabled"})
@@ -290,9 +292,7 @@ class DroidRpcExtension:
             if cache_hit:
                 tool_ids.update(expected_tool_ids)
             self._verify_native_tool_ids(tool_ids, expected_tool_ids)
-        tolerated = _UNAVOIDABLE_TOOL_IDS
-        if keep_tool_prefix is not None:
-            tolerated = tolerated | _DEFERRED_TOOL_LOADER_IDS
+        tolerated = _UNAVOIDABLE_TOOL_IDS | _DEFERRED_TOOL_LOADER_IDS
         unexpected: set[str] = set()
         missing_expected: set[str] = set()
         for attempt in range(_TOOL_DISABLE_RETRIES):
