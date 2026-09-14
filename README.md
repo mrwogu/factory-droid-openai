@@ -345,12 +345,13 @@ client can run it.
 
 The cap compares Droid's session-cumulative output tokens with the counter
 captured before the turn, so a pooled or continued session cannot fire it
-on earlier output. Each usage snapshot claims the text streamed so far and
-restarts a coarse chars-per-token estimate for whatever follows it, so a
-turn whose snapshots stop arriving still hits the cap instead of running
-free (issue #139). That estimate must overshoot a full limit worth of
-characters before cutting, so a healthy turn that grazes the limit is not
-severed mid-stream by the estimate alone.
+on earlier output. Each advancing usage snapshot claims the text streamed so
+far and restarts a coarse chars-per-token estimate for whatever follows it,
+so a turn whose snapshots stop arriving still hits the cap instead of running
+free (issue #139). A stale or regressing snapshot cannot clear that estimate.
+The estimate must overshoot a full limit worth of characters before cutting,
+so a healthy turn that grazes the limit is not severed mid-stream by the
+estimate alone.
 
 A capped completion is never retried server-side. The limit ended the
 turn, so a second attempt would regenerate the same capped output, and the

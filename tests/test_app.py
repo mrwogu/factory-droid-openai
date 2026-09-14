@@ -277,6 +277,33 @@ class TruncationRetryRunner(FakeRunner):
             self.closed = True
 
 
+class DistinctSessionTruncationRunner(FakeRunner):
+    def __init__(self) -> None:
+        super().__init__([])
+        events = _recorded_events("retry/truncated-tool.jsonl")
+        self.attempts: list[list[RunEvent]] = [
+            [
+                (
+                    SessionStarted(session_id, event.output_tokens)
+                    if isinstance(event, SessionStarted)
+                    else event
+                )
+                for event in events
+            ]
+            for session_id in ("attempt-1", "attempt-2")
+        ]
+
+    async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
+        self.requests.append(request)
+        if request.warm_session is not None:
+            request.warm_session.consumed = True
+        try:
+            for event in self.attempts[len(self.requests) - 1]:
+                yield event
+        finally:
+            self.closed = True
+
+
 class BlockingRunner(FakeRunner):
     def __init__(self) -> None:
         super().__init__([])
@@ -2889,6 +2916,29 @@ async def test_repeated_truncated_tool_call_logs_final_outcome(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_failed_truncated_retry_keeps_visible_session_registered(tmp_path: Path) -> None:
+    runner = DistinctSessionTruncationRunner()
+    settings = Settings(
+        droid_path="droid",
+        workdir=tmp_path,
+        timeout_seconds=30.0,
+        session_continuity=True,
+        max_tracked_sessions=1,
+    )
+    app = create_app(settings, runner_factory=cast("RunnerFactory", lambda: runner))
+    key = SessionKey(model_id=None, reasoning_effort=None)
+    app.state.sessions.remember("visible-session", key)
+
+    response = await _post_completion(app, _weather_payload())
+
+    assert response.status_code == 502
+    assert [request.session_id for request in runner.requests] == [None, None]
+    assert app.state.sessions.key("visible-session") == key
+    assert app.state.sessions.key("attempt-1") is None
+    assert app.state.sessions.key("attempt-2") is None
+
+
+@pytest.mark.asyncio
 async def test_continuation_truncated_tool_call_retries_same_session(tmp_path: Path) -> None:
     runner = RetryRunner(
         [
@@ -3464,8 +3514,9 @@ async def test_output_limit_keeps_fallback_until_the_baseline_is_known(
 ) -> None:
     runner = FakeRunner(
         _output_cap_events(
+            TextDelta("x" * 200),
             UsageUpdate(Usage(output_tokens=5000)),
-            TextDelta("x" * 300),
+            TextDelta("x" * 100),
             baseline=None,
         )
     )
@@ -3478,6 +3529,26 @@ async def test_output_limit_keeps_fallback_until_the_baseline_is_known(
     choice = response.json()["choices"][0]
     assert choice["finish_reason"] == "length"
     assert choice["message"]["content"] == "x" * 300
+
+
+@pytest.mark.asyncio
+async def test_output_limit_uses_exact_delta_after_adopting_unknown_baseline(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner(
+        _output_cap_events(
+            UsageUpdate(Usage(output_tokens=5000)),
+            UsageUpdate(Usage(output_tokens=5032)),
+            baseline=None,
+        )
+    )
+    payload = _payload(max_tokens=32)
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["finish_reason"] == "length"
 
 
 @pytest.mark.asyncio
@@ -3502,6 +3573,27 @@ async def test_output_limit_keeps_fallback_after_snapshots_stop_arriving(
     choice = response.json()["choices"][0]
     assert choice["finish_reason"] == "length"
     assert choice["message"]["content"] == "x" * 300
+
+
+@pytest.mark.asyncio
+async def test_output_limit_keeps_fallback_after_unchanged_usage_snapshot(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner(
+        _output_cap_events(
+            TextDelta("x" * 200),
+            UsageUpdate(Usage(output_tokens=0)),
+            TextDelta("x" * 200),
+            RunComplete(Usage(output_tokens=0)),
+        )
+    )
+    payload = _payload(max_tokens=32)
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["finish_reason"] == "length"
 
 
 @pytest.mark.asyncio
@@ -4434,6 +4526,12 @@ def test_telemetry_error_category_covers_status_fallbacks(
         )
         == expected
     )
+
+
+def test_telemetry_error_category_maps_truncated_tool_call_to_protocol() -> None:
+    scope = cast("Any", {"state": {"telemetry_error_type": "truncated_tool_call"}})
+
+    assert _telemetry_error_category(scope, status_code=502, outcome="error") == "protocol"
 
 
 @pytest.mark.asyncio

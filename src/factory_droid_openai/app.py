@@ -2018,9 +2018,6 @@ def create_app(
                         request.state.stream_outcome = "truncated"
                     elif completed_result.malformed_note is not None:
                         request.state.stream_outcome = "malformed"
-                    if completed_result.session_id is not None:
-                        sessions.remember(completed_result.session_id, requested_key)
-                        started_session = completed_result.session_id
                     total_usage = _add_usage(total_usage, completed_result.usage)
                     if (
                         completed_result.truncation is not None
@@ -2040,6 +2037,9 @@ def create_app(
                             502,
                             "truncated_tool_call",
                         )
+                    if completed_result.session_id is not None:
+                        sessions.remember(completed_result.session_id, requested_key)
+                        started_session = completed_result.session_id
                     choice = _choice_dict(completed_result, index)
                     choices.append(choice)
                     choice_message = cast("dict[str, Any]", choice["message"])
@@ -2197,47 +2197,50 @@ class OutputTokenCap:
 
     Droid reports session-cumulative counters, so SessionStarted carries the
     pre-turn baseline and the cap watches the delta; a continued session
-    cannot fire the cap on tokens its earlier turns produced. Each usage
-    snapshot marks the turn text it accounts for, and the coarse chars-per-
-    token estimate only has to judge the text no snapshot has claimed. One
-    early snapshot no longer disarms that fallback, so turns whose snapshots
-    stop arriving still hit the cap instead of running free (issues #130
-    and #139).
+    cannot fire the cap on tokens its earlier turns produced. Each advancing
+    usage snapshot marks the turn text it accounts for, and the coarse chars-
+    per-token estimate only has to judge the text no snapshot has claimed.
+    One early snapshot no longer disarms that fallback, so turns whose
+    snapshots stop arriving still hit the cap instead of running free
+    (issues #130 and #139).
     """
 
     def __init__(self, limit: int | None) -> None:
         self._limit = limit
         self._baseline: int | None = None
+        self._last_usage_output_tokens = 0
         self._uncovered_chars = 0
 
     def start_turn(self, output_tokens: int | None) -> None:
         self._baseline = output_tokens
+        self._last_usage_output_tokens = output_tokens if output_tokens is not None else 0
 
     def record_usage(self, usage: Usage) -> bool:
         """Returns True when reported output tokens reached the limit."""
         if self._limit is None:
             return False
-        if self._baseline is None:
-            # No stored session baseline, so the snapshot cannot say how much
-            # of its counter this turn produced. Adopt it for later deltas but
-            # grant the turn no credit for text streamed before it.
+        baseline = self._baseline
+        if baseline is None:
+            # The first absolute snapshot cannot claim text emitted before it.
             self._baseline = usage.output_tokens
+            self._last_usage_output_tokens = usage.output_tokens
             return False
-        delta = max(0, usage.output_tokens - self._baseline)
-        # The snapshot claims the text streamed so far this turn; only what
-        # arrives after it falls back to the char estimate.
+        if usage.output_tokens <= self._last_usage_output_tokens:
+            delta = max(0, self._last_usage_output_tokens - baseline)
+            return delta >= self._limit
+        self._last_usage_output_tokens = usage.output_tokens
         self._uncovered_chars = 0
-        return delta >= self._limit
+        return usage.output_tokens - baseline >= self._limit
 
     def record_text(self, text: str) -> bool:
         """Returns True when unsnapshotted text plausibly reached the limit."""
         if self._limit is None:
             return False
         self._uncovered_chars += len(text)
-        # The estimate restarts after each snapshot, and judging a full limit
-        # worth of chars keeps verbose-but-healthy turns uncut: the coarse
-        # threshold only has to catch snapshotless monsters, not graze exact
-        # budgets (issue #139).
+        # The estimate restarts after each advancing snapshot. Judging a full
+        # limit worth of chars keeps verbose-but-healthy turns uncut: the
+        # coarse threshold only has to catch snapshotless monsters, not graze
+        # exact budgets (issue #139).
         return self._uncovered_chars >= (
             self._limit * _CHARS_PER_TOKEN_ESTIMATE * _FALLBACK_SAFETY_FACTOR
         )
@@ -3740,6 +3743,7 @@ def _telemetry_error_category(
             "model_not_found": "model_not_found",
             "rate_limit_error": "rate_limited",
             "session_not_found": "session_not_found",
+            "truncated_tool_call": "protocol",
         }
         return categories.get(error_type, "other")
     if outcome == "cancelled":
