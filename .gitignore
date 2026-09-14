@@ -1,5 +1,6 @@
 .DS_Store
 .venv/
+.github/promptscript/node_modules/
 .env
 .code-review-graph/
 .mypy_cache/

@@ -31,10 +31,11 @@ jobs:
         with:
           node-version: "22"
 
-      # --ignore-scripts so the pinned CLI package's lifecycle hooks cannot
-      # run on the runner (githubactions:S6505).
+      # npm ci resolves the committed package-lock, while --ignore-scripts
+      # keeps the pinned CLI package's lifecycle hooks from running on the
+      # runner (githubactions:S6505).
       - name: Install PromptScript
-        run: npm install --global --ignore-scripts @promptscript/cli@1.14.2
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix .github/promptscript
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -124,9 +125,9 @@ jobs:
 
       - name: Validate PromptScript targets
         run: |
-          prs validate
-          prs diff --all --no-color
-          prs check
+          ./.github/promptscript/node_modules/.bin/prs validate
+          ./.github/promptscript/node_modules/.bin/prs diff --all --no-color
+          ./.github/promptscript/node_modules/.bin/prs check
 
   tests:
     name: Python ${{ matrix.python-version }} on ${{ matrix.os }}

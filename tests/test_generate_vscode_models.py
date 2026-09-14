@@ -121,7 +121,19 @@ def test_fetch_models_rejects_non_http_scheme(gen: ModuleType) -> None:
         gen._fetch_models("ftp://example.test/v1", None)
 
 
-def test_fetch_models_sends_bearer_header(gen: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("base_url", "expected_url"),
+    [
+        ("http://127.0.0.1:8787/v1/", "http://127.0.0.1:8787/v1/models"),
+        ("http://[::1]:8787/v1/", "http://[::1]:8787/v1/models"),
+    ],
+)
+def test_fetch_models_sends_bearer_header(
+    gen: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    base_url: str,
+    expected_url: str,
+) -> None:
     captured: dict[str, Any] = {}
 
     class _Response:
@@ -138,11 +150,16 @@ def test_fetch_models_sends_bearer_header(gen: ModuleType, monkeypatch: pytest.M
 
     monkeypatch.setattr(gen.urllib.request, "urlopen", fake_urlopen)
 
-    models = gen._fetch_models("http://127.0.0.1:8787/v1/", "secret")
+    models = gen._fetch_models(base_url, "secret")
 
-    assert captured["url"] == "http://127.0.0.1:8787/v1/models"
+    assert captured["url"] == expected_url
     assert captured["auth"] == "Bearer secret"
     assert [model["id"] for model in models] == ["factory-droid", "gpt-5.4", "glm-5.2"]
+
+
+def test_fetch_models_rejects_bearer_over_external_http(gen: ModuleType) -> None:
+    with pytest.raises(SystemExit, match="require HTTPS"):
+        gen._fetch_models("http://192.0.2.1/v1", "secret")
 
 
 def test_validated_base_url_rebuilds_the_endpoint_shape(gen: ModuleType) -> None:
@@ -151,6 +168,7 @@ def test_validated_base_url_rebuilds_the_endpoint_shape(gen: ModuleType) -> None
         gen._validated_base_url("https://bridge.internal.example")
         == "https://bridge.internal.example"
     )
+    assert gen._validated_base_url("http://[::1]:8787/v1/") == "http://[::1]:8787/v1"
 
 
 def test_validated_base_url_rejects_embedded_credentials(gen: ModuleType) -> None:

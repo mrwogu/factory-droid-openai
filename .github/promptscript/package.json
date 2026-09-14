@@ -1,0 +1,10 @@
+{
+  "name": "factory-droid-openai-promptscript-ci",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@promptscript/cli": "1.14.2"
+  }
+}

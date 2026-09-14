@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import json
 import os
 import re
@@ -58,12 +59,24 @@ def _validated_base_url(raw: str) -> str:
     path = parsed.path.rstrip("/")
     if path and not _URL_PATH.fullmatch(path):
         raise SystemExit(f"Unsupported URL path in {raw!r}")
-    netloc = f"{host}:{port}" if port is not None else host
+    netloc_host = f"[{host}]" if ":" in host else host
+    netloc = f"{netloc_host}:{port}" if port is not None else netloc_host
     return f"{scheme}://{netloc}{path}"
 
 
+def _is_loopback_host(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def _fetch_models(base_url: str, api_key: str | None) -> list[dict[str, Any]]:
-    url = f"{_validated_base_url(base_url)}/models"
+    validated_url = _validated_base_url(base_url)
+    parsed = urlsplit(validated_url)
+    if api_key and parsed.scheme == "http" and not _is_loopback_host(parsed.hostname or ""):
+        raise SystemExit("Bearer-authenticated HTTP requests require HTTPS for non-loopback hosts")
+    url = f"{validated_url}/models"
     request = urllib.request.Request(url)  # noqa: S310
     if api_key:
         request.add_header("Authorization", f"Bearer {api_key}")

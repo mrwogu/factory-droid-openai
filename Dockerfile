@@ -81,23 +81,27 @@ RUN set -e; \
 # untracked file can ride into the image (docker:S6470).
 # /work is created first so the bridge's Settings.from_env validation passes
 # during the --help smoke check; it is reused as the runtime working directory.
-# Dependencies come from the committed requirements lock, which carries the
-# uv.lock pins and digests, installed under --require-hashes so the image
-# builds exactly what the lock resolved and verifies each artifact
-# (docker:S8544). --only-binary :all: keeps every dependency a wheel, so no
-# third-party setup script executes during the image build (docker:S8541).
-# The bridge itself follows as a local --no-deps install, which resolves
-# nothing from an index.
+# Dependencies come from the committed requirements locks, which carry the
+# uv.lock pins, build backend pins, and digests, installed under
+# --require-hashes so the image builds exactly what the locks resolved and
+# verifies each artifact (docker:S8544). --only-binary :all: keeps every
+# dependency a wheel, so no third-party setup script executes during the image
+# build (docker:S8541). The bridge itself follows as a local --no-deps install
+# with build isolation disabled, so its backend comes from the build lock
+# instead of a fresh index resolution.
 RUN mkdir -p /work
 WORKDIR /app
-COPY pyproject.toml README.md LICENSE requirements-lock.txt ./
+COPY pyproject.toml README.md LICENSE requirements-lock.txt requirements-build-lock.txt ./
 COPY src ./src
 RUN if [ -n "${BRIDGE_VERSION}" ]; then \
       pip install --no-cache-dir "factory-droid-openai==${BRIDGE_VERSION}"; \
     else \
       pip install --no-cache-dir --only-binary :all: --require-hashes \
         -r requirements-lock.txt && \
-      pip install --no-cache-dir --no-deps --only-binary :all: .; \
+      pip install --no-cache-dir --only-binary :all: --require-hashes \
+        -r requirements-build-lock.txt && \
+      pip install --no-cache-dir --no-deps --only-binary :all: \
+        --no-build-isolation .; \
     fi; \
     factory-droid-openai --help >/dev/null
 
