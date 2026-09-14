@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.11.0](https://github.com/mrwogu/factory-droid-openai/compare/v1.10.1...v1.11.0) (2026-09-14)
+
+
+### Features
+
+* **api:** add opt-in exact-match response cache ([#106](https://github.com/mrwogu/factory-droid-openai/issues/106)) ([#133](https://github.com/mrwogu/factory-droid-openai/issues/133)) ([28593bc](https://github.com/mrwogu/factory-droid-openai/commit/28593bc52bbbef75d81d4ce8081bf2a60a586ae9))
+
+
+### Bug Fixes
+
+* **api:** arm the output cap on snapshot-less turns ([#142](https://github.com/mrwogu/factory-droid-openai/issues/142)) ([55f7f79](https://github.com/mrwogu/factory-droid-openai/commit/55f7f795a636819b48027e45a2962d62325793d7))
+* **docker:** run tini as PID 1 to reap orphaned git helpers ([#140](https://github.com/mrwogu/factory-droid-openai/issues/140)) ([12c0a55](https://github.com/mrwogu/factory-droid-openai/commit/12c0a55b93d29f160939074979823e4ba3eac270))
+
 ## [1.10.1](https://github.com/mrwogu/factory-droid-openai/compare/v1.10.0...v1.10.1) (2026-09-13)
 
 
