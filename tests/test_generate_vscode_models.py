@@ -145,6 +145,36 @@ def test_fetch_models_sends_bearer_header(gen: ModuleType, monkeypatch: pytest.M
     assert [model["id"] for model in models] == ["factory-droid", "gpt-5.4", "glm-5.2"]
 
 
+def test_validated_base_url_rebuilds_the_endpoint_shape(gen: ModuleType) -> None:
+    assert gen._validated_base_url("http://127.0.0.1:8787/v1/") == "http://127.0.0.1:8787/v1"
+    assert (
+        gen._validated_base_url("https://bridge.internal.example")
+        == "https://bridge.internal.example"
+    )
+
+
+def test_validated_base_url_rejects_embedded_credentials(gen: ModuleType) -> None:
+    with pytest.raises(SystemExit, match="credentials"):
+        gen._validated_base_url("http://user:pw@127.0.0.1:8787/v1")
+
+
+def test_validated_base_url_rejects_queries_and_fragments(gen: ModuleType) -> None:
+    with pytest.raises(SystemExit, match="query or fragment"):
+        gen._validated_base_url("http://127.0.0.1:8787/v1?token=1")
+    with pytest.raises(SystemExit, match="query or fragment"):
+        gen._validated_base_url("http://127.0.0.1:8787/v1#frag")
+
+
+def test_validated_base_url_rejects_unexpected_hosts(gen: ModuleType) -> None:
+    with pytest.raises(SystemExit, match="Unsupported host"):
+        gen._validated_base_url("http://bad host:8787")
+
+
+def test_validated_base_url_rejects_a_malformed_port(gen: ModuleType) -> None:
+    with pytest.raises(SystemExit, match="port is not valid"):
+        gen._validated_base_url("http://127.0.0.1:not-a-port/v1")
+
+
 def test_probe_model_returns_refusal_reason(
     gen: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

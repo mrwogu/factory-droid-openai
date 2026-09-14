@@ -228,3 +228,59 @@ def test_build_command_reports_when_nothing_matched(
 
     assert code == 1
     assert "no fixture matched" in capsys.readouterr().out
+
+
+def test_build_refuses_input_paths_with_parent_traversal(
+    fixtures_script: ModuleType,
+    tmp_path: Path,
+) -> None:
+    trace = tmp_path / "trace.jsonl"
+    run = tmp_path / "run.jsonl"
+    trace.write_text("", encoding="utf-8")
+    run.write_text("", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match=r"'\.\.'"):
+        fixtures_script.main(
+            ["build", "--trace", str(trace), "--run", str(tmp_path / ".." / "run.jsonl")]
+        )
+
+
+def test_build_refuses_output_directories_with_parent_traversal(
+    fixtures_script: ModuleType,
+    tmp_path: Path,
+) -> None:
+    trace = tmp_path / "trace.jsonl"
+    run = tmp_path / "run.jsonl"
+    trace.write_text("", encoding="utf-8")
+    run.write_text("", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match=r"'\.\.'"):
+        fixtures_script.main(
+            [
+                "build",
+                "--trace",
+                str(trace),
+                "--run",
+                str(run),
+                "--out",
+                str(tmp_path / "fixtures" / ".." / "escape"),
+            ]
+        )
+
+
+def test_output_directory_segments_must_pass_the_allowlist(
+    fixtures_script: ModuleType,
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(SystemExit, match="unsupported output path segment"):
+        fixtures_script.validated_output_dir(tmp_path / "bad*name")
+
+
+def test_validated_paths_keep_their_canonical_location(
+    fixtures_script: ModuleType,
+    tmp_path: Path,
+) -> None:
+    trace = tmp_path / "trace.jsonl"
+
+    assert fixtures_script.validated_input(trace) == trace.resolve()
+    assert fixtures_script.validated_output_dir(trace) == trace.resolve()

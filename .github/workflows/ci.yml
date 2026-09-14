@@ -31,8 +31,10 @@ jobs:
         with:
           node-version: "22"
 
+      # --ignore-scripts so the pinned CLI package's lifecycle hooks cannot
+      # run on the runner (githubactions:S6505).
       - name: Install PromptScript
-        run: npm install --global @promptscript/cli@1.14.2
+        run: npm install --global --ignore-scripts @promptscript/cli@1.14.2
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -46,20 +48,37 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
+      # The only step that installs dependencies, and it installs only what
+      # the lockfile resolved, as wheels: --frozen keeps the resolution on
+      # uv.lock (githubactions:S8544) and --no-build refuses a source
+      # distribution, whose build script runs third-party code on the runner
+      # (githubactions:S8541). Later steps run their tools straight from the
+      # environment instead of re-resolving them.
       - name: Install locked dependencies
-        run: uv sync --frozen --all-extras
+        run: |
+          uv sync --frozen --all-extras --no-install-project --no-build
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      # The bridge is the one source build left, so the sync above skips it.
+      # Its own wheel is built and installed instead: every install stays a
+      # binary, and the suite keeps the package metadata the /version
+      # contract asserts.
+      - name: Build and install the bridge wheel
+        run: |
+          uv build --wheel
+          python -m pip --python .venv install --only-binary :all: --no-deps dist/factory_droid_openai-*.whl
 
       - name: Lint
-        run: uv run ruff check .
+        run: ruff check .
 
       - name: Check formatting
-        run: uv run ruff format --check .
+        run: ruff format --check .
 
       - name: Type check
-        run: uv run mypy
+        run: mypy
 
       - name: Test with coverage
-        run: uv run pytest --cov=factory_droid_openai --cov-report=term-missing --cov-report=xml
+        run: pytest --cov=factory_droid_openai --cov-report=term-missing --cov-report=xml
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
@@ -71,7 +90,7 @@ jobs:
           version: v11.3.1
 
       - name: Validate OpenAPI contract
-        run: uv run openapi-spec-validator openapi.json
+        run: openapi-spec-validator openapi.json
 
       # Release Please rewrites JSON while updating info.version, so compare
       # re-serialized documents instead of the committed formatting. Dumping
@@ -80,8 +99,8 @@ jobs:
         run: |
           export COMMITTED_OPENAPI="$RUNNER_TEMP/openapi-committed.json"
           cp openapi.json "$COMMITTED_OPENAPI"
-          uv run python scripts/generate_openapi.py
-          uv run python - <<'PY'
+          python scripts/generate_openapi.py
+          python - <<'PY'
           import json
           import os
           from pathlib import Path
@@ -125,11 +144,24 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
+      # Same shape as the quality job: dependencies as wheels from the
+      # lockfile, the bridge built as its own wheel. The venv's scripts
+      # directory goes on PATH for the test step; Windows venvs use Scripts
+      # instead of bin, and pwd -W yields the native path form there.
       - name: Install locked dependencies
-        run: uv sync --frozen --all-extras
+        shell: bash
+        run: |
+          uv sync --frozen --all-extras --no-install-project --no-build
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            echo "$(pwd -W)/.venv/Scripts" >> "$GITHUB_PATH"
+          else
+            echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          fi
+          uv build --wheel
+          python -m pip --python .venv install --only-binary :all: --no-deps dist/factory_droid_openai-*.whl
 
       - name: Run tests
-        run: uv run pytest
+        run: pytest
 
   package:
     name: Package

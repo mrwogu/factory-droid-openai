@@ -1380,6 +1380,19 @@ def test_load_rows_names_the_line_it_cannot_parse(e2e: ModuleType, tmp_path: Pat
         e2e.load_rows(path)
 
 
+def test_load_rows_refuses_parent_traversal_in_artifact_paths(e2e: ModuleType) -> None:
+    with pytest.raises(e2e.MatrixUsageError, match=r"'\.\.'"):
+        e2e.load_rows(Path("traces") / ".." / "escape.jsonl")
+
+
+def test_validated_input_returns_the_canonical_artifact_path(
+    e2e: ModuleType, tmp_path: Path
+) -> None:
+    path = tmp_path / "run.jsonl"
+
+    assert e2e.validated_input(path) == path.resolve()
+
+
 def test_artifact_labels_report_distinct_labels(e2e: ModuleType) -> None:
     rows = [
         e2e.row("m1", _scenario(e2e), _observation(e2e), label="text"),

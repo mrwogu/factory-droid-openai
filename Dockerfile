@@ -47,10 +47,13 @@ RUN apt-get update \
 # When DROID_VERSION is unset, resolve the latest release from the npm
 # registry first. Direct binary download is used instead of the curl|sh
 # installer so the image is reproducible and the checksum is enforced.
+# --proto/--proto-redir pin the initial request and every redirect to HTTPS,
+# so a redirect cannot downgrade the transport (docker:S6506).
 RUN set -e; \
     _droid_version="${DROID_VERSION:-}"; \
     if [ -z "${_droid_version}" ]; then \
-      _droid_version=$(curl -fsSL https://registry.npmjs.org/@factory/cli/latest \
+      _droid_version=$(curl -fsSL --proto '=https' --proto-redir '=https' \
+        https://registry.npmjs.org/@factory/cli/latest \
         | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4); \
       if [ -z "${_droid_version}" ]; then \
         echo "Failed to resolve latest Droid CLI version from npm registry" >&2; \
@@ -64,8 +67,8 @@ RUN set -e; \
       *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;; \
     esac; \
     base="https://downloads.factory.ai/factory-cli/releases/${_droid_version}/linux/${arch}"; \
-    curl -fsSLO "${base}/droid"; \
-    curl -fsSLO "${base}/droid.sha256"; \
+    curl -fsSLO --proto '=https' --proto-redir '=https' "${base}/droid"; \
+    curl -fsSLO --proto '=https' --proto-redir '=https' "${base}/droid.sha256"; \
     echo "$(awk '{print $1}' droid.sha256)  droid" | sha256sum --check -; \
     chmod +x droid; \
     mv droid /usr/local/bin/droid; \
@@ -74,15 +77,20 @@ RUN set -e; \
 
 # Install the bridge. When BRIDGE_VERSION is set, pull from PyPI; otherwise
 # install from the copied source tree (used for development and CI builds).
+# Only the build inputs are copied instead of the whole build context, so no
+# untracked file can ride into the image (docker:S6470).
 # /work is created first so the bridge's Settings.from_env validation passes
 # during the --help smoke check; it is reused as the runtime working directory.
+# --only-binary :all: keeps every dependency a wheel, so no third-party setup
+# script executes during the image build (docker:S8541).
 RUN mkdir -p /work
 WORKDIR /app
-COPY . .
+COPY pyproject.toml README.md LICENSE ./
+COPY src ./src
 RUN if [ -n "${BRIDGE_VERSION}" ]; then \
       pip install --no-cache-dir "factory-droid-openai==${BRIDGE_VERSION}"; \
     else \
-      pip install --no-cache-dir .; \
+      pip install --no-cache-dir --only-binary :all: .; \
     fi; \
     factory-droid-openai --help >/dev/null
 
