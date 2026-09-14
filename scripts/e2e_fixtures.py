@@ -29,6 +29,31 @@ TRACE_EVENT = "droid.event"
 # without failing the suite on purpose are exported by default.
 DEFAULT_VERDICTS: tuple[str, ...] = ("pass",)
 _SLUG = re.compile(r"[^a-z0-9]+")
+# Paths arrive from CLI arguments, so they are validated before any filesystem
+# call: traversal is refused outright, and an output directory is rebuilt from
+# allowlisted segments so a faulty argument cannot smuggle itself into a write
+# (pythonsecurity:S8707).
+_SEGMENT = re.compile(r"[A-Za-z0-9._@+~ -]+")
+
+
+def validated_input(path: Path) -> Path:
+    """Refuse traversal in a CLI-supplied input path, then canonicalize it."""
+    if ".." in path.parts:
+        raise SystemExit(f"input path must not contain '..': {path}")
+    return path.resolve()
+
+
+def validated_output_dir(path: Path) -> Path:
+    """Rebuild a CLI-supplied output directory from allowlisted segments."""
+    if ".." in path.parts:
+        raise SystemExit(f"output path must not contain '..': {path}")
+    resolved = path.resolve()
+    rebuilt = Path(resolved.anchor)
+    for segment in resolved.parts[1:]:
+        if not _SEGMENT.fullmatch(segment):
+            raise SystemExit(f"unsupported output path segment: {segment!r}")
+        rebuilt = rebuilt / segment
+    return rebuilt
 
 
 def slug(value: str) -> str:
@@ -36,6 +61,7 @@ def slug(value: str) -> str:
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
+    path = validated_input(path)
     records: list[dict[str, Any]] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
@@ -124,6 +150,7 @@ def build_fixtures(
 
 
 def write_fixtures(fixtures: dict[str, list[dict[str, Any]]], out_dir: Path) -> list[Path]:
+    out_dir = validated_output_dir(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     for name, lines in sorted(fixtures.items()):

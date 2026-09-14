@@ -1484,7 +1484,20 @@ def render_comparison(result: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def validated_input(path: Path) -> Path:
+    """Refuse traversal in a CLI-supplied artifact path, then canonicalize it.
+
+    Artifacts are operator-chosen, so no root is imposed; the refusal exists
+    so a faulty CLI argument cannot smuggle a traversal into a read
+    (pythonsecurity:S8707).
+    """
+    if ".." in path.parts:
+        raise MatrixUsageError(f"artifact path must not contain '..': {path}")
+    return path.resolve()
+
+
 def load_rows(path: Path) -> list[dict[str, Any]]:
+    path = validated_input(path)
     rows: list[dict[str, Any]] = []
     for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         if not line.strip():

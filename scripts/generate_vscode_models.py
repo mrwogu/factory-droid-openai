@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import json
 import os
+import re
 import sys
 import urllib.request
 from pathlib import Path
@@ -26,13 +28,55 @@ CURATED_MODELS = (
     "gemini-3.1-pro-preview",
     "glm-5.2",
 )
+# The base URL arrives from a CLI argument, so the request target is rebuilt
+# from validated parts instead of being used as given: the scheme comes from
+# a lookup table, the port from an int, and the host and path must pass an
+# allowlist, so a faulty argument cannot aim the request somewhere unexpected
+# (pythonsecurity:S8703).
+_SCHEMES = {"http": "http", "https": "https"}
+_HOST = re.compile(r"[A-Za-z0-9.:_-]+")
+_URL_PATH = re.compile(r"/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*")
+
+
+def _validated_base_url(raw: str) -> str:
+    parsed = urlsplit(raw)
+    scheme = _SCHEMES.get(parsed.scheme)
+    if scheme is None:
+        raise SystemExit(f"Unsupported URL scheme in {raw!r}")
+    if parsed.username or parsed.password:
+        raise SystemExit("URL must not embed credentials")
+    if parsed.query or parsed.fragment:
+        raise SystemExit(f"URL must not carry a query or fragment: {raw!r}")
+    host = parsed.hostname
+    if not host:
+        raise SystemExit(f"URL must include a host: {raw!r}")
+    if not _HOST.fullmatch(host):
+        raise SystemExit(f"Unsupported host in {raw!r}")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise SystemExit(f"URL port is not valid: {raw!r}") from exc
+    path = parsed.path.rstrip("/")
+    if path and not _URL_PATH.fullmatch(path):
+        raise SystemExit(f"Unsupported URL path in {raw!r}")
+    netloc_host = f"[{host}]" if ":" in host else host
+    netloc = f"{netloc_host}:{port}" if port is not None else netloc_host
+    return f"{scheme}://{netloc}{path}"
+
+
+def _is_loopback_host(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _fetch_models(base_url: str, api_key: str | None) -> list[dict[str, Any]]:
-    url = f"{base_url.rstrip('/')}/models"
-    if urlsplit(url).scheme not in {"http", "https"}:
-        message = f"Unsupported URL scheme in {url!r}"
-        raise SystemExit(message)
+    validated_url = _validated_base_url(base_url)
+    parsed = urlsplit(validated_url)
+    if api_key and parsed.scheme == "http" and not _is_loopback_host(parsed.hostname or ""):
+        raise SystemExit("Bearer-authenticated HTTP requests require HTTPS for non-loopback hosts")
+    url = f"{validated_url}/models"
     request = urllib.request.Request(url)  # noqa: S310
     if api_key:
         request.add_header("Authorization", f"Bearer {api_key}")

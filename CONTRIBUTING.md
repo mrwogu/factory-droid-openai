@@ -158,6 +158,8 @@ delete anything that describes your machine rather than the bridge.
 - Never allow Factory-native tools to bypass client-owned tool execution.
 - Add behavior tests for every user-visible change.
 - Keep dependencies bounded and regenerate `uv.lock`.
+- Regenerate `requirements-lock.txt` with `uv --color never export --frozen --no-dev --no-emit-project` when dependencies change.
+- Regenerate `requirements-build-lock.txt` from `requirements-build.in` with the pinned uv compile command when build requirements change.
 - Avoid live network calls in tests.
 - Never commit credentials, private prompts, generated packages, or local logs.
 

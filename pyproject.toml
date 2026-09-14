@@ -61,6 +61,9 @@ packages = ["src/factory_droid_openai"]
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
 addopts = ["--strict-config", "--strict-markers"]
+# Tests import the repository tree rather than an installed copy, so coverage
+# maps to src/ no matter how the environment was built.
+pythonpath = ["src"]
 testpaths = ["tests"]
 
 [tool.mypy]
