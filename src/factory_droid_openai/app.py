@@ -157,8 +157,12 @@ _MODEL_OUTPUT_RETRY_PROMPTS: dict[ModelOutputRetryReason, str] = {
 _TRAILING_OUTPUT_ERROR_PREFIX = "unexpected text after tool call"
 # The bridge ships no tokenizer, so the text-length fallback in OutputTokenCap
 # counts roughly 4 characters per output token; Droid's own usage snapshots
-# stay authoritative whenever they arrive mid-turn.
+# stay authoritative for the text they cover. The fallback only judges text no
+# snapshot has claimed, and it must overshoot the remaining budget by this
+# safety factor before cutting, so a healthy turn that grazes the limit is
+# not severed mid-stream by the estimate alone (issue #139).
 _CHARS_PER_TOKEN_ESTIMATE = 4
+_FALLBACK_SAFETY_FACTOR = 2
 _OUTPUT_LIMIT_TRUNCATION = "output token limit reached"
 _CHAT_COMPLETED_EVENT = "chat.completed"
 _RESPONSE_CACHE_DISABLED_EVENT = "response_cache.disabled"
@@ -2018,6 +2022,24 @@ def create_app(
                         sessions.remember(completed_result.session_id, requested_key)
                         started_session = completed_result.session_id
                     total_usage = _add_usage(total_usage, completed_result.usage)
+                    if (
+                        completed_result.truncation is not None
+                        and not completed_result.tool_calls
+                        and not completed_result.output_capped
+                    ):
+                        # The turn died inside an unclosed tool-call payload and
+                        # the bounded retry did not recover it. A 200 with
+                        # finish_reason="length" hides that failure behind a
+                        # half-written body the client cannot classify, so the
+                        # final answer is a clean error envelope (issue #139).
+                        # A capped turn keeps its OpenAI-honest length cut, and a
+                        # captured call keeps its tool_calls completion.
+                        request.state.telemetry_error_type = "truncated_tool_call"
+                        return _error_response(
+                            completed_result.truncation.reason,
+                            502,
+                            "truncated_tool_call",
+                        )
                     choice = _choice_dict(completed_result, index)
                     choices.append(choice)
                     choice_message = cast("dict[str, Any]", choice["message"])
@@ -2175,16 +2197,18 @@ class OutputTokenCap:
 
     Droid reports session-cumulative counters, so SessionStarted carries the
     pre-turn baseline and the cap watches the delta; a continued session
-    cannot fire the cap on tokens its earlier turns produced. Models that
-    report no usage mid-turn get a coarse text-length fallback instead of
-    running free (issue #130).
+    cannot fire the cap on tokens its earlier turns produced. Each usage
+    snapshot marks the turn text it accounts for, and the coarse chars-per-
+    token estimate only has to judge the text no snapshot has claimed. One
+    early snapshot no longer disarms that fallback, so turns whose snapshots
+    stop arriving still hit the cap instead of running free (issues #130
+    and #139).
     """
 
     def __init__(self, limit: int | None) -> None:
         self._limit = limit
         self._baseline: int | None = None
-        self._emitted_chars = 0
-        self._usage_seen = False
+        self._uncovered_chars = 0
 
     def start_turn(self, output_tokens: int | None) -> None:
         self._baseline = output_tokens
@@ -2194,17 +2218,29 @@ class OutputTokenCap:
         if self._limit is None:
             return False
         if self._baseline is None:
+            # No stored session baseline, so the snapshot cannot say how much
+            # of its counter this turn produced. Adopt it for later deltas but
+            # grant the turn no credit for text streamed before it.
             self._baseline = usage.output_tokens
             return False
-        self._usage_seen = True
-        return usage.output_tokens - self._baseline >= self._limit
+        delta = max(0, usage.output_tokens - self._baseline)
+        # The snapshot claims the text streamed so far this turn; only what
+        # arrives after it falls back to the char estimate.
+        self._uncovered_chars = 0
+        return delta >= self._limit
 
     def record_text(self, text: str) -> bool:
-        """Returns True when emitted text plausibly reached the limit."""
-        if self._limit is None or self._usage_seen:
+        """Returns True when unsnapshotted text plausibly reached the limit."""
+        if self._limit is None:
             return False
-        self._emitted_chars += len(text)
-        return self._emitted_chars >= self._limit * _CHARS_PER_TOKEN_ESTIMATE
+        self._uncovered_chars += len(text)
+        # The estimate restarts after each snapshot, and judging a full limit
+        # worth of chars keeps verbose-but-healthy turns uncut: the coarse
+        # threshold only has to catch snapshotless monsters, not graze exact
+        # budgets (issue #139).
+        return self._uncovered_chars >= (
+            self._limit * _CHARS_PER_TOKEN_ESTIMATE * _FALLBACK_SAFETY_FACTOR
+        )
 
 
 class CollectedCompletion:
