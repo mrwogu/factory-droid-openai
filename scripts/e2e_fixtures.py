@@ -48,12 +48,12 @@ def validated_output_dir(path: Path) -> Path:
     if ".." in path.parts:
         raise SystemExit(f"output path must not contain '..': {path}")
     resolved = path.resolve()
-    trusted = Path(resolved.anchor)
+    rebuilt = Path(resolved.anchor)
     for segment in resolved.parts[1:]:
         if not _SEGMENT.fullmatch(segment):
             raise SystemExit(f"unsupported output path segment: {segment!r}")
-        trusted = trusted / segment
-    return trusted
+        rebuilt = rebuilt / segment
+    return rebuilt
 
 
 def slug(value: str) -> str:

@@ -48,6 +48,14 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
+      # requirements-lock.txt is what the image build installs under
+      # --require-hashes, so it has to stay byte-identical to what uv.lock
+      # resolves.
+      - name: Verify image requirements lock
+        run: |
+          uv --color never export --frozen --no-dev --no-emit-project > "$RUNNER_TEMP/requirements-lock.txt"
+          diff "$RUNNER_TEMP/requirements-lock.txt" requirements-lock.txt
+
       # The only step that installs dependencies, and it installs only what
       # the lockfile resolved, as wheels: --frozen keeps the resolution on
       # uv.lock (githubactions:S8544) and --no-build refuses a source
@@ -55,18 +63,19 @@ jobs:
       # (githubactions:S8541). Later steps run their tools straight from the
       # environment instead of re-resolving them.
       - name: Install locked dependencies
-        run: |
-          uv sync --frozen --all-extras --no-install-project --no-build
-          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+        run: uv sync --frozen --all-extras --no-install-project --no-build
 
       # The bridge is the one source build left, so the sync above skips it.
       # Its own wheel is built and installed instead: every install stays a
       # binary, and the suite keeps the package metadata the /version
-      # contract asserts.
+      # contract asserts. The venv joins PATH only after this step: its own
+      # python ships no pip module, so the install below still runs with the
+      # runner's interpreter.
       - name: Build and install the bridge wheel
         run: |
           uv build --wheel
           python -m pip --python .venv install --only-binary :all: --no-deps dist/factory_droid_openai-*.whl
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Lint
         run: ruff check .

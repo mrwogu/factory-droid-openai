@@ -81,16 +81,23 @@ RUN set -e; \
 # untracked file can ride into the image (docker:S6470).
 # /work is created first so the bridge's Settings.from_env validation passes
 # during the --help smoke check; it is reused as the runtime working directory.
-# --only-binary :all: keeps every dependency a wheel, so no third-party setup
-# script executes during the image build (docker:S8541).
+# Dependencies come from the committed requirements lock, which carries the
+# uv.lock pins and digests, installed under --require-hashes so the image
+# builds exactly what the lock resolved and verifies each artifact
+# (docker:S8544). --only-binary :all: keeps every dependency a wheel, so no
+# third-party setup script executes during the image build (docker:S8541).
+# The bridge itself follows as a local --no-deps install, which resolves
+# nothing from an index.
 RUN mkdir -p /work
 WORKDIR /app
-COPY pyproject.toml README.md LICENSE ./
+COPY pyproject.toml README.md LICENSE requirements-lock.txt ./
 COPY src ./src
 RUN if [ -n "${BRIDGE_VERSION}" ]; then \
       pip install --no-cache-dir "factory-droid-openai==${BRIDGE_VERSION}"; \
     else \
-      pip install --no-cache-dir --only-binary :all: .; \
+      pip install --no-cache-dir --only-binary :all: --require-hashes \
+        -r requirements-lock.txt && \
+      pip install --no-cache-dir --no-deps --only-binary :all: .; \
     fi; \
     factory-droid-openai --help >/dev/null
 
