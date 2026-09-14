@@ -12,6 +12,9 @@
 #   Set FACTORY_DROID_AUTO_UPDATE_ENABLED=false to keep the CLI version that
 #   ships in the image instead of updating at runtime.
 #
+# The image entrypoint is tini, a reaping PID 1 (see #138), so Compose needs
+# no `init: true` here; set it only when overriding the entrypoint.
+#
 # Usage:
 #   export FACTORY_API_KEY=fk-...
 #   export FACTORY_DROID_OPENAI_API_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')
