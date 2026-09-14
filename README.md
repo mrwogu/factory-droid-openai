@@ -289,7 +289,8 @@ Translation never widens validation. Each broken form maps to one outcome:
 - An unknown tool name, a duplicate argument key, or prose after a call
   still fails the turn.
 - A payload truncated before its close marker ends with
-  `finish_reason="length"`.
+  `finish_reason="length"`, or a `502` `truncated_tool_call` error envelope
+  when a non-streaming retry repeats the truncation (issue #139).
 - A closed malformed call, a mangled OpenAI `tool_calls` fragment, or a
   turn packing more calls than `FACTORY_DROID_OPENAI_MAX_TOOL_CALLS` allows
   ends with `finish_reason="stop"` and a plain-text bridge notice.
@@ -330,8 +331,9 @@ Never retried:
 - A capped completion; see token caps below.
 
 When the retry hits the same problem again, a repeated malformed call
-still returns the notice, a repeated truncated call returns
-`finish_reason="length"` without it, and a repeated tool call on a
+still returns the notice, a repeated truncated call fails with a `502`
+`truncated_tool_call` error envelope instead of a half-written body
+(issue #139), and a repeated tool call on a
 tool-less request or repeated prose after a tool call fails the turn.
 
 **Token caps.** `max_tokens` and `max_completion_tokens` stop the Droid
@@ -343,9 +345,13 @@ client can run it.
 
 The cap compares Droid's session-cumulative output tokens with the counter
 captured before the turn, so a pooled or continued session cannot fire it
-on earlier output. Once Droid reports usage, its counter is authoritative.
-Until then, a coarse text-length fallback of roughly four characters per
-token prevents unbounded output.
+on earlier output. Each advancing usage snapshot claims the text streamed so
+far and restarts a coarse chars-per-token estimate for whatever follows it,
+so a turn whose snapshots stop arriving still hits the cap instead of running
+free (issue #139). A stale or regressing snapshot cannot clear that estimate.
+The estimate must overshoot a full limit worth of characters before cutting,
+so a healthy turn that grazes the limit is not severed mid-stream by the
+estimate alone.
 
 A capped completion is never retried server-side. The limit ended the
 turn, so a second attempt would regenerate the same capped output, and the
@@ -1912,7 +1918,7 @@ This is a compatibility bridge, not a native OpenAI inference implementation.
 | Python SDK protocol drift | A small isolated compatibility shim supplies structured output, tool controls, and session RPCs |
 | Session-per-request execution | Prompt caching differs from a native inference endpoint |
 | Droid-reported token usage | `usage` mirrors the newest Droid session counter, so it can undercount a prompt and, on a continued session, include earlier turns |
-| Strict tool marker protocol | Invalid generated tool payloads fail closed; unparseable or truncated payloads end the turn with `finish_reason="length"` |
+| Strict tool marker protocol | Invalid generated tool payloads fail closed; unparseable or truncated payloads end the turn with `finish_reason="length"`, and a non-streaming truncation the retry cannot recover answers `502 truncated_tool_call` |
 | Sequential tool calls only | Calls arrive one after another, never concurrently |
 
 ## Troubleshooting

@@ -277,6 +277,33 @@ class TruncationRetryRunner(FakeRunner):
             self.closed = True
 
 
+class DistinctSessionTruncationRunner(FakeRunner):
+    def __init__(self) -> None:
+        super().__init__([])
+        events = _recorded_events("retry/truncated-tool.jsonl")
+        self.attempts: list[list[RunEvent]] = [
+            [
+                (
+                    SessionStarted(session_id, event.output_tokens)
+                    if isinstance(event, SessionStarted)
+                    else event
+                )
+                for event in events
+            ]
+            for session_id in ("attempt-1", "attempt-2")
+        ]
+
+    async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
+        self.requests.append(request)
+        if request.warm_session is not None:
+            request.warm_session.consumed = True
+        try:
+            for event in self.attempts[len(self.requests) - 1]:
+                yield event
+        finally:
+            self.closed = True
+
+
 class BlockingRunner(FakeRunner):
     def __init__(self) -> None:
         super().__init__([])
@@ -2866,8 +2893,11 @@ async def test_repeated_truncated_tool_call_logs_final_outcome(tmp_path: Path) -
     async with _client(_app(tmp_path, runner)) as client:
         response = await client.post("/v1/chat/completions", json=payload)
 
-    assert response.status_code == 200
-    assert response.json()["choices"][0]["finish_reason"] == "length"
+    # A truncation the retry could not recover is a clean error envelope, not a
+    # 200 with a half-written body the client cannot classify (issue #139).
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "truncated_tool_call"
+    assert response.json()["error"]["message"]
     records = [json.loads(line) for line in log_stream.getvalue().splitlines() if line.strip()]
     attempts = [record for record in records if record["event"] == "chat.attempt_truncated"]
     final = [record for record in records if record["event"] == "chat.truncated"]
@@ -2883,6 +2913,29 @@ async def test_repeated_truncated_tool_call_logs_final_outcome(tmp_path: Path) -
     assert outcomes[0]["reason"] == "truncated_tool_call"
     assert outcomes[0]["outcome"] == "refailed"
     assert outcomes[0]["attempt"] == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_truncated_retry_keeps_visible_session_registered(tmp_path: Path) -> None:
+    runner = DistinctSessionTruncationRunner()
+    settings = Settings(
+        droid_path="droid",
+        workdir=tmp_path,
+        timeout_seconds=30.0,
+        session_continuity=True,
+        max_tracked_sessions=1,
+    )
+    app = create_app(settings, runner_factory=cast("RunnerFactory", lambda: runner))
+    key = SessionKey(model_id=None, reasoning_effort=None)
+    app.state.sessions.remember("visible-session", key)
+
+    response = await _post_completion(app, _weather_payload())
+
+    assert response.status_code == 502
+    assert [request.session_id for request in runner.requests] == [None, None]
+    assert app.state.sessions.key("visible-session") == key
+    assert app.state.sessions.key("attempt-1") is None
+    assert app.state.sessions.key("attempt-2") is None
 
 
 @pytest.mark.asyncio
@@ -3369,7 +3422,7 @@ async def test_output_limit_caps_a_runaway_tool_argument(tmp_path: Path) -> None
 async def test_output_limit_text_fallback_caps_without_usage_events(
     tmp_path: Path,
 ) -> None:
-    runner = FakeRunner([TextDelta("x" * 200)])
+    runner = FakeRunner([TextDelta("x" * 300)])
     payload = _weather_payload(max_tokens=32)
 
     async with _client(_app(tmp_path, runner)) as client:
@@ -3378,7 +3431,7 @@ async def test_output_limit_text_fallback_caps_without_usage_events(
     assert response.status_code == 200
     choice = response.json()["choices"][0]
     assert choice["finish_reason"] == "length"
-    assert choice["message"]["content"] == "x" * 200
+    assert choice["message"]["content"] == "x" * 300
     assert len(runner.requests) == 1
 
 
@@ -3389,7 +3442,7 @@ async def test_output_limit_drops_same_delta_call_after_cap(
     stream: bool,
 ) -> None:
     call = f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{}}}}{TOOL_CALL_CLOSE}'
-    runner = FakeRunner(_output_cap_events(TextDelta(("x" * 128) + call)))
+    runner = FakeRunner(_output_cap_events(TextDelta(("x" * 300) + call)))
     payload = _weather_payload(stream=stream, max_tokens=32)
 
     response = await _post_completion(_app(tmp_path, runner), payload)
@@ -3461,8 +3514,9 @@ async def test_output_limit_keeps_fallback_until_the_baseline_is_known(
 ) -> None:
     runner = FakeRunner(
         _output_cap_events(
-            UsageUpdate(Usage(output_tokens=5000)),
             TextDelta("x" * 200),
+            UsageUpdate(Usage(output_tokens=5000)),
+            TextDelta("x" * 100),
             baseline=None,
         )
     )
@@ -3474,12 +3528,42 @@ async def test_output_limit_keeps_fallback_until_the_baseline_is_known(
     assert response.status_code == 200
     choice = response.json()["choices"][0]
     assert choice["finish_reason"] == "length"
-    assert choice["message"]["content"] == "x" * 200
+    assert choice["message"]["content"] == "x" * 300
 
 
 @pytest.mark.asyncio
-async def test_output_limit_caps_reasoning_output(tmp_path: Path) -> None:
-    runner = FakeRunner([ReasoningDelta("r" * 200)])
+async def test_output_limit_uses_exact_delta_after_adopting_unknown_baseline(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner(
+        _output_cap_events(
+            UsageUpdate(Usage(output_tokens=5000)),
+            UsageUpdate(Usage(output_tokens=5032)),
+            baseline=None,
+        )
+    )
+    payload = _payload(max_tokens=32)
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["finish_reason"] == "length"
+
+
+@pytest.mark.asyncio
+async def test_output_limit_keeps_fallback_after_snapshots_stop_arriving(
+    tmp_path: Path,
+) -> None:
+    # The #139 retain-path shape: one early usage snapshot, then silence while
+    # a monster keeps streaming. The first snapshot must not disarm the text
+    # estimate for the rest of the turn.
+    runner = FakeRunner(
+        _output_cap_events(
+            UsageUpdate(Usage(output_tokens=5)),
+            TextDelta("x" * 300),
+        )
+    )
     payload = _payload(max_tokens=32)
 
     async with _client(_app(tmp_path, runner)) as client:
@@ -3488,7 +3572,62 @@ async def test_output_limit_caps_reasoning_output(tmp_path: Path) -> None:
     assert response.status_code == 200
     choice = response.json()["choices"][0]
     assert choice["finish_reason"] == "length"
-    assert choice["message"]["reasoning"] == "r" * 200
+    assert choice["message"]["content"] == "x" * 300
+
+
+@pytest.mark.asyncio
+async def test_output_limit_keeps_fallback_after_unchanged_usage_snapshot(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner(
+        _output_cap_events(
+            TextDelta("x" * 200),
+            UsageUpdate(Usage(output_tokens=0)),
+            TextDelta("x" * 200),
+            RunComplete(Usage(output_tokens=0)),
+        )
+    )
+    payload = _payload(max_tokens=32)
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["finish_reason"] == "length"
+
+
+@pytest.mark.asyncio
+async def test_output_limit_snapshot_resets_the_text_estimate(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        _output_cap_events(
+            UsageUpdate(Usage(output_tokens=30)),
+            TextDelta("short tail"),
+            RunComplete(Usage(output_tokens=30)),
+        )
+    )
+    payload = _payload(max_tokens=32)
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "stop"
+    assert choice["message"]["content"] == "short tail"
+
+
+@pytest.mark.asyncio
+async def test_output_limit_caps_reasoning_output(tmp_path: Path) -> None:
+    runner = FakeRunner([ReasoningDelta("r" * 300)])
+    payload = _payload(max_tokens=32)
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "length"
+    assert choice["message"]["reasoning"] == "r" * 300
 
 
 @pytest.mark.asyncio
@@ -3532,7 +3671,7 @@ async def test_output_limit_counts_turn_tokens_not_session_totals(
 
 @pytest.mark.asyncio
 async def test_output_limit_honors_max_completion_tokens(tmp_path: Path) -> None:
-    runner = FakeRunner([TextDelta("y" * 200)])
+    runner = FakeRunner([TextDelta("y" * 300)])
     payload = _payload(max_completion_tokens=32)
 
     async with _client(_app(tmp_path, runner)) as client:
@@ -3541,7 +3680,7 @@ async def test_output_limit_honors_max_completion_tokens(tmp_path: Path) -> None
     assert response.status_code == 200
     choice = response.json()["choices"][0]
     assert choice["finish_reason"] == "length"
-    assert choice["message"]["content"] == "y" * 200
+    assert choice["message"]["content"] == "y" * 300
 
 
 @pytest.mark.asyncio
@@ -3559,7 +3698,9 @@ async def test_output_limit_prefers_max_completion_tokens(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_output_limit_real_usage_disables_text_fallback(tmp_path: Path) -> None:
+async def test_output_limit_usage_snapshots_do_not_cut_verbose_turns(
+    tmp_path: Path,
+) -> None:
     runner = FakeRunner(_recorded_events("tool-result-followup--gpt-5-2.jsonl"))
     payload = _payload(max_tokens=32)
 
@@ -3606,7 +3747,7 @@ async def test_output_limit_drops_an_unclosed_complete_payload(
     stream: bool,
 ) -> None:
     partial = f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{}}}}'
-    runner = FakeRunner([TextDelta(partial)])
+    runner = FakeRunner([TextDelta(("x" * 40) + partial)])
     payload = _weather_payload(stream=stream, max_tokens=8)
 
     async with _client(_app(tmp_path, runner)) as client:
@@ -3647,7 +3788,7 @@ async def test_output_limit_skips_partial_structured_output_validation(
     tmp_path: Path,
     stream: bool,
 ) -> None:
-    partial = '{"answer":"' + ("x" * 40)
+    partial = '{"answer":"' + ("x" * 60)
     runner = FakeRunner([TextDelta(partial)])
     payload = _payload(
         stream=stream,
@@ -3708,7 +3849,7 @@ async def test_output_limit_required_tool_call_finishes_length(
     tmp_path: Path,
     stream: bool,
 ) -> None:
-    runner = FakeRunner([TextDelta("x" * 200)])
+    runner = FakeRunner([TextDelta("x" * 300)])
     payload = _weather_payload(stream=stream, max_tokens=32, tool_choice="required")
 
     async with _client(_app(tmp_path, runner)) as client:
@@ -3755,14 +3896,14 @@ async def test_streaming_output_limit_caps_a_runaway_tool_argument(
 async def test_streaming_output_limit_text_fallback_finishes_length(
     tmp_path: Path,
 ) -> None:
-    runner = FakeRunner([TextDelta("z" * 200)])
+    runner = FakeRunner([TextDelta("z" * 300)])
     payload = _weather_payload(stream=True, max_tokens=32)
 
     async with _client(_app(tmp_path, runner)) as client:
         response = await client.post("/v1/chat/completions", json=payload)
 
     assert response.status_code == 200
-    assert "z" * 200 in response.text
+    assert "z" * 300 in response.text
     assert '"finish_reason":"length"' in response.text
     assert "factory_protocol_error" not in response.text
 
@@ -3784,14 +3925,14 @@ async def test_streaming_output_limit_marks_a_turn_completed_past_the_limit(
 
 @pytest.mark.asyncio
 async def test_streaming_output_limit_caps_reasoning_output(tmp_path: Path) -> None:
-    runner = FakeRunner([ReasoningDelta("r" * 200)])
+    runner = FakeRunner([ReasoningDelta("r" * 300)])
     payload = _payload(stream=True, max_tokens=32)
 
     async with _client(_app(tmp_path, runner)) as client:
         response = await client.post("/v1/chat/completions", json=payload)
 
     assert response.status_code == 200
-    assert "r" * 200 in response.text
+    assert "r" * 300 in response.text
     assert '"finish_reason":"length"' in response.text
     assert "factory_protocol_error" not in response.text
 
@@ -4153,7 +4294,9 @@ async def test_streaming_truncated_tool_call_finishes_with_length(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_non_streaming_truncated_tool_call_returns_length(tmp_path: Path) -> None:
+async def test_non_streaming_truncated_tool_call_returns_error_envelope(
+    tmp_path: Path,
+) -> None:
     runner = FakeRunner(
         [
             TextDelta("partial answer"),
@@ -4173,13 +4316,15 @@ async def test_non_streaming_truncated_tool_call_returns_length(tmp_path: Path) 
         response = await client.post("/v1/chat/completions", json=payload)
         metrics = await client.get("/metrics")
 
-    assert response.status_code == 200
-    choice = response.json()["choices"][0]
-    assert choice["finish_reason"] == "length"
-    assert choice["message"]["content"] == "partial answer"
-    assert "tool_calls" not in choice["message"]
+    # A turn that died mid-argument answers with a clean error envelope
+    # instead of a 200 carrying a half-written body the client cannot
+    # classify (issue #139). Streaming keeps its on-the-wire length finish.
+    assert response.status_code == 502
+    error = response.json()["error"]
+    assert error["type"] == "truncated_tool_call"
+    assert error["message"]
     assert runner.closed is True
-    assert 'outcome="truncated",status="200"} 1' in metrics.text
+    assert 'outcome="truncated",status="502"} 1' in metrics.text
 
 
 @pytest.mark.asyncio
@@ -4381,6 +4526,12 @@ def test_telemetry_error_category_covers_status_fallbacks(
         )
         == expected
     )
+
+
+def test_telemetry_error_category_maps_truncated_tool_call_to_protocol() -> None:
+    scope = cast("Any", {"state": {"telemetry_error_type": "truncated_tool_call"}})
+
+    assert _telemetry_error_category(scope, status_code=502, outcome="error") == "protocol"
 
 
 @pytest.mark.asyncio
