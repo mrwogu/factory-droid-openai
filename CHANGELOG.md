@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.11.1](https://github.com/mrwogu/factory-droid-openai/compare/v1.11.0...v1.11.1) (2026-09-14)
+
+
+### Bug Fixes
+
+* **security:** resolve all 29 open code-scanning alerts ([#145](https://github.com/mrwogu/factory-droid-openai/issues/145)) ([dcc3ed9](https://github.com/mrwogu/factory-droid-openai/commit/dcc3ed9ce08da42b61c5a1c5abee2d11d0ccab28))
+
 ## [1.11.0](https://github.com/mrwogu/factory-droid-openai/compare/v1.10.1...v1.11.0) (2026-09-14)
 
 
