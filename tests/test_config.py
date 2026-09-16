@@ -45,6 +45,7 @@ _ENVIRONMENT_KEYS = (
     "FACTORY_DROID_OPENAI_MAX_CHOICES",
     "FACTORY_DROID_OPENAI_MAX_STOP_SEQUENCES",
     "FACTORY_DROID_OPENAI_SESSION_CONTINUITY",
+    "FACTORY_DROID_OPENAI_AUTO_REASONING_CONTINUITY",
     "FACTORY_DROID_OPENAI_MAX_TRACKED_SESSIONS",
     "FACTORY_DROID_OPENAI_WORKTREE",
     "FACTORY_DROID_OPENAI_APPEND_SYSTEM_PROMPT_FILE",
@@ -638,6 +639,7 @@ def test_settings_read_feature_limits_from_environment(
     monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_CHOICES", "2")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_STOP_SEQUENCES", "0")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_SESSION_CONTINUITY", "yes")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_AUTO_REASONING_CONTINUITY", "no")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_TRACKED_SESSIONS", "5")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKTREE", "feature-branch")
     monkeypatch.setenv(
@@ -654,6 +656,7 @@ def test_settings_read_feature_limits_from_environment(
     assert settings.max_choices == 2
     assert settings.max_stop_sequences == 0
     assert settings.session_continuity is True
+    assert settings.auto_reasoning_continuity is False
     assert settings.max_tracked_sessions == 5
     assert settings.worktree == "feature-branch"
     assert settings.append_system_prompt_file == prompt_file.resolve()

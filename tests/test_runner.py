@@ -33,6 +33,7 @@ from droid_sdk.schemas.enums import (
     DroidWorkingState,
     ReasoningEffort,
 )
+from droid_sdk.schemas.messages import FactoryDroidMessage
 
 from factory_droid_openai import runner as runner_module
 from factory_droid_openai.droid_rpc import NativeToolUnavailableError
@@ -62,6 +63,8 @@ from factory_droid_openai.runner import (
     _build_exec_args,
     _create_client,
     _ManagedProcessTransport,
+    _reasoning_details,
+    _reasoning_format,
     _run_until,
     model_family,
     sdk_error,
@@ -73,8 +76,15 @@ if TYPE_CHECKING:
 
 
 class FakeClient:
-    def __init__(self, events: list[object], *, session_id: str | None = "session-1") -> None:
+    def __init__(
+        self,
+        events: list[object],
+        *,
+        session_id: str | None = "session-1",
+        notifications: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.events = events
+        self.notifications = notifications or []
         self.connected = False
         self.closed = False
         self.interrupted = False
@@ -91,6 +101,7 @@ class FakeClient:
         self.rpc_requests: list[tuple[str, dict[str, Any], float | None]] = []
         self.disabled_tool_ids: set[str] = set()
         self.output_format: dict[str, Any] | None = None
+        self.notification_callbacks: list[tuple[Any, Any]] = []
         self._protocol = self
 
     def set_permission_handler(self, handler: Any) -> None:
@@ -98,6 +109,20 @@ class FakeClient:
 
     def set_ask_user_handler(self, handler: Any) -> None:
         self.ask_user_handler = handler
+
+    def on_notification(
+        self,
+        callback: Any,
+        *,
+        notification_type: Any = None,
+    ) -> Any:
+        entry = (callback, notification_type)
+        self.notification_callbacks.append(entry)
+
+        def unsubscribe() -> None:
+            self.notification_callbacks.remove(entry)
+
+        return unsubscribe
 
     async def connect(self) -> None:
         self.connected = True
@@ -168,6 +193,13 @@ class FakeClient:
         raise AssertionError(f"unexpected RPC method: {method}")
 
     async def receive_response(self) -> AsyncIterator[object]:
+        for notification in self.notifications:
+            inner = notification.get("params", {}).get("notification", {})
+            notification_type = inner.get("type")
+            for callback, expected_type in list(self.notification_callbacks):
+                if expected_type is not None and notification_type != expected_type.value:
+                    continue
+                callback(notification)
         for event in self.events:
             yield event
 
@@ -271,6 +303,229 @@ async def test_runner_reports_newest_usage_snapshot_without_summing(tmp_path: Pa
         Usage(2000, 25, 6, 8),
     ]
     assert events[-1] == RunComplete(Usage(2000, 25, 6, 8))
+
+
+@pytest.mark.asyncio
+async def test_runner_maps_thinking_usage_and_signed_blocks(tmp_path: Path) -> None:
+    sdk_usage = TokenUsageUpdate(
+        input_tokens=12,
+        output_tokens=5,
+        cache_read_tokens=3,
+        cache_write_tokens=2,
+    )
+    notifications = [
+        {
+            "jsonrpc": "2.0",
+            "factoryApiVersion": "1.0.0",
+            "type": "notification",
+            "method": "droid.session_notification",
+            "params": {
+                "notification": {
+                    "type": "session_token_usage_changed",
+                    "sessionId": "session-1",
+                    "tokenUsage": {
+                        "inputTokens": 12,
+                        "outputTokens": 5,
+                        "cacheReadTokens": 3,
+                        "cacheCreationTokens": 2,
+                        "thinkingTokens": 7,
+                    },
+                }
+            },
+        },
+        {
+            "jsonrpc": "2.0",
+            "factoryApiVersion": "1.0.0",
+            "type": "notification",
+            "method": "droid.session_notification",
+            "params": {
+                "notification": {
+                    "type": "create_message",
+                    "message": {
+                        "id": "message-1",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "thinking",
+                                "thinking": "private summary",
+                                "signature": "signed-state",
+                                "signatureProvider": "anthropic",
+                                "id": "thinking-1",
+                            },
+                            {
+                                "type": "redacted_thinking",
+                                "data": "encrypted-state",
+                                "id": "thinking-2",
+                            },
+                        ],
+                        "createdAt": 1,
+                        "updatedAt": 2,
+                    },
+                }
+            },
+        },
+    ]
+    client = FakeClient(
+        [ThinkingTextDelta("private summary"), sdk_usage, TurnComplete(sdk_usage)],
+        notifications=notifications,
+    )
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    events = [event async for event in runner.run(_request())]
+
+    assert events[-2] == UsageUpdate(Usage(12, 12, 3, 2, 7))
+    assert events[-1] == RunComplete(
+        Usage(12, 12, 3, 2, 7),
+        reasoning_details=(
+            {
+                "type": "reasoning.text",
+                "text": "private summary",
+                "signature": "signed-state",
+                "id": "thinking-1",
+                "format": "anthropic-claude-v1",
+                "index": 0,
+            },
+            {
+                "type": "reasoning.encrypted",
+                "data": "encrypted-state",
+                "id": "thinking-2",
+                "format": "anthropic-claude-v1",
+                "index": 1,
+            },
+        ),
+    )
+    assert client.notification_callbacks == []
+
+
+def test_reasoning_details_maps_provider_metadata() -> None:
+    message = FactoryDroidMessage.model_validate(
+        {
+            "id": "message-1",
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "answer"},
+                {
+                    "type": "tool_use",
+                    "id": "tool-1",
+                    "name": "weather",
+                    "input": {},
+                    "thoughtSignature": "gemini-tool-state",
+                },
+                {
+                    "type": "tool_use",
+                    "id": "tool-2",
+                    "name": "weather",
+                    "input": {},
+                    "thoughtSignature": "gemini-tool-state",
+                },
+                {
+                    "type": "thinking",
+                    "thinking": "thought",
+                    "signature": "",
+                    "signatureProvider": "google",
+                },
+            ],
+            "createdAt": 1,
+            "updatedAt": 2,
+            "openaiReasoningId": "openai-reasoning",
+            "openaiReasoningSummary": "summary",
+            "openaiEncryptedContent": "openai-state",
+            "geminiThoughtSignature": "gemini-message-state",
+        }
+    )
+
+    details = _reasoning_details(message)
+
+    assert _reasoning_details(None) == ()
+    assert [detail["type"] for detail in details] == [
+        "reasoning.summary",
+        "reasoning.encrypted",
+        "reasoning.encrypted",
+        "reasoning.text",
+        "reasoning.encrypted",
+    ]
+    assert details[2]["data"] == "gemini-tool-state"
+    assert details[3]["signature"] is None
+    assert details[3]["format"] == "google-gemini-v1"
+    assert details[4]["data"] == "gemini-message-state"
+    assert _reasoning_format("openai") == "openai-responses-v1"
+    assert _reasoning_format("other") == "unknown"
+
+
+def test_reasoning_details_preserves_chat_completion_metadata() -> None:
+    message = FactoryDroidMessage.model_validate(
+        {
+            "id": "message-1",
+            "role": "assistant",
+            "content": [],
+            "createdAt": 1,
+            "updatedAt": 2,
+            "openaiReasoningId": "reasoning-1",
+            "chatCompletionReasoningField": "reasoning_content",
+            "chatCompletionReasoningContent": "provider thought",
+        }
+    )
+
+    assert _reasoning_details(message) == (
+        {
+            "type": "reasoning.text",
+            "text": "provider thought",
+            "signature": None,
+            "id": "reasoning-1",
+            "format": "unknown",
+            "field": "reasoning_content",
+            "index": 0,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_ignores_invalid_and_non_assistant_notifications(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient(
+        [AssistantTextDelta("answer"), TurnComplete()],
+        notifications=[
+            {
+                "params": {
+                    "notification": {
+                        "type": "create_message",
+                    }
+                }
+            },
+            {
+                "jsonrpc": "2.0",
+                "factoryApiVersion": "1.0.0",
+                "type": "notification",
+                "method": "droid.session_notification",
+                "params": {
+                    "notification": {
+                        "type": "create_message",
+                        "message": {
+                            "id": "message-1",
+                            "role": "user",
+                            "content": [{"type": "text", "text": "question"}],
+                            "createdAt": 1,
+                            "updatedAt": 2,
+                        },
+                    }
+                },
+            },
+        ],
+    )
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    events = [event async for event in runner.run(_request())]
+
+    assert events[-1] == RunComplete(Usage())
 
 
 @pytest.mark.asyncio

@@ -36,6 +36,21 @@
             ],
             "title": "Reasoning Content"
           },
+          "reasoning_details": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning Details"
+          },
           "role": {
             "const": "assistant",
             "default": "assistant",
@@ -376,6 +391,21 @@
               }
             ],
             "title": "Reasoning Content"
+          },
+          "reasoning_details": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning Details"
           },
           "role": {
             "enum": [
@@ -866,6 +896,368 @@
         "title": "RenameSessionRequest",
         "type": "object"
       },
+      "ResponsesReasoning": {
+        "additionalProperties": true,
+        "properties": {
+          "effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Effort"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Summary"
+          }
+        },
+        "title": "ResponsesReasoning",
+        "type": "object"
+      },
+      "ResponsesRequest": {
+        "additionalProperties": true,
+        "properties": {
+          "factory_droid_reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Factory Droid Reasoning Effort"
+          },
+          "input": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            ],
+            "title": "Input"
+          },
+          "instructions": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Instructions"
+          },
+          "max_output_tokens": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Output Tokens"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "parallel_tool_calls": {
+            "default": true,
+            "title": "Parallel Tool Calls",
+            "type": "boolean"
+          },
+          "previous_response_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previous Response Id"
+          },
+          "reasoning": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ResponsesReasoning"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "store": {
+            "default": true,
+            "title": "Store",
+            "type": "boolean"
+          },
+          "stream": {
+            "default": false,
+            "title": "Stream",
+            "type": "boolean"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text"
+          },
+          "timeout": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeout"
+          },
+          "tool_choice": {
+            "title": "Tool Choice"
+          },
+          "tools": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tools"
+          }
+        },
+        "required": [
+          "model",
+          "input"
+        ],
+        "title": "ResponsesRequest",
+        "type": "object"
+      },
+      "ResponsesResponse": {
+        "additionalProperties": true,
+        "properties": {
+          "completed_at": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "number"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "incomplete_details": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Incomplete Details"
+          },
+          "instructions": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Instructions"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "object": {
+            "const": "response",
+            "default": "response",
+            "title": "Object",
+            "type": "string"
+          },
+          "output": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Output",
+            "type": "array"
+          },
+          "parallel_tool_calls": {
+            "title": "Parallel Tool Calls",
+            "type": "boolean"
+          },
+          "previous_response_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previous Response Id"
+          },
+          "reasoning": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reasoning"
+          },
+          "status": {
+            "enum": [
+              "completed",
+              "incomplete",
+              "failed",
+              "in_progress"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "store": {
+            "title": "Store",
+            "type": "boolean"
+          },
+          "tool_choice": {
+            "title": "Tool Choice"
+          },
+          "tools": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Tools",
+            "type": "array"
+          },
+          "usage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ResponsesUsageResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "status",
+          "model",
+          "output",
+          "parallel_tool_calls",
+          "tool_choice",
+          "tools",
+          "store"
+        ],
+        "title": "ResponsesResponse",
+        "type": "object"
+      },
+      "ResponsesUsageResponse": {
+        "properties": {
+          "input_tokens": {
+            "title": "Input Tokens",
+            "type": "integer"
+          },
+          "input_tokens_details": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Input Tokens Details",
+            "type": "object"
+          },
+          "output_tokens": {
+            "title": "Output Tokens",
+            "type": "integer"
+          },
+          "output_tokens_details": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Output Tokens Details",
+            "type": "object"
+          },
+          "total_tokens": {
+            "title": "Total Tokens",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "input_tokens",
+          "input_tokens_details",
+          "output_tokens",
+          "output_tokens_details",
+          "total_tokens"
+        ],
+        "title": "ResponsesUsageResponse",
+        "type": "object"
+      },
       "SessionContextResponse": {
         "properties": {
           "breakdown": {
@@ -994,6 +1386,13 @@
             "title": "Completion Tokens",
             "type": "integer"
           },
+          "completion_tokens_details": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Completion Tokens Details",
+            "type": "object"
+          },
           "prompt_tokens": {
             "title": "Prompt Tokens",
             "type": "integer"
@@ -1014,7 +1413,8 @@
           "prompt_tokens",
           "completion_tokens",
           "total_tokens",
-          "prompt_tokens_details"
+          "prompt_tokens_details",
+          "completion_tokens_details"
         ],
         "title": "UsageResponse",
         "type": "object"
@@ -1169,6 +1569,16 @@
               }
             }
           },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
           "502": {
             "content": {
               "application/json": {
@@ -1198,16 +1608,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1284,6 +1684,16 @@
               }
             }
           },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
           "502": {
             "content": {
               "application/json": {
@@ -1313,16 +1723,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1407,6 +1807,16 @@
               }
             }
           },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
           "502": {
             "content": {
               "application/json": {
@@ -1436,16 +1846,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1532,6 +1932,16 @@
               }
             }
           },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
           "502": {
             "content": {
               "application/json": {
@@ -1561,16 +1971,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1647,6 +2047,16 @@
               }
             }
           },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
           "502": {
             "content": {
               "application/json": {
@@ -1676,16 +2086,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1762,6 +2162,16 @@
               }
             }
           },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
           "502": {
             "content": {
               "application/json": {
@@ -1791,16 +2201,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1864,6 +2264,16 @@
               }
             }
           },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
           "502": {
             "content": {
               "application/json": {
@@ -1893,16 +2303,6 @@
               }
             },
             "description": "Droid request timeout."
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Invalid request or bearer authentication failure."
           }
         },
         "security": [
@@ -1987,6 +2387,16 @@
               }
             }
           },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request or bearer authentication failure."
+          },
           "502": {
             "content": {
               "application/json": {
@@ -2016,6 +2426,114 @@
               }
             },
             "description": "Droid request timeout."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Retrieve one available Factory Droid model",
+        "tags": [
+          "OpenAI compatibility"
+        ]
+      }
+    },
+    "/v1/responses": {
+      "post": {
+        "operationId": "create_response_v1_responses_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Factory-Droid-Priority",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Factory-Droid-Priority"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResponsesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResponsesResponse"
+                }
+              },
+              "text/event-stream": {
+                "example": "data: {\"type\":\"response.output_text.delta\",...}\n\n",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "A JSON response or an SSE response event stream."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The requested Factory Droid session is unknown to this bridge."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The requested Factory Droid session is already in use."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request body or serialized transcript exceeds configured limits."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The bounded Droid request queue is full.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
           },
           "4XX": {
             "content": {
@@ -2026,6 +2544,36 @@
               }
             },
             "description": "Invalid request or bearer authentication failure."
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Droid SDK, process, or bridge protocol failure."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Droid executable unavailable or Factory authentication failed."
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Droid request timeout."
           }
         },
         "security": [
@@ -2033,7 +2581,7 @@
             "HTTPBearer": []
           }
         ],
-        "summary": "Retrieve one available Factory Droid model",
+        "summary": "Create a model response",
         "tags": [
           "OpenAI compatibility"
         ]

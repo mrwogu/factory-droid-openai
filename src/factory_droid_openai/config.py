@@ -67,6 +67,7 @@ class Settings:
     max_choices: int = 4
     max_stop_sequences: int = 4
     session_continuity: bool = False
+    auto_reasoning_continuity: bool = True
     max_tracked_sessions: int = 256
     mcp_settle_seconds: float = 0.0
     model_cache_seconds: float = 300.0
@@ -328,6 +329,10 @@ class Settings:
             "FACTORY_DROID_OPENAI_SESSION_CONTINUITY",
             default=False,
         )
+        auto_reasoning_continuity = _boolean(
+            "FACTORY_DROID_OPENAI_AUTO_REASONING_CONTINUITY",
+            default=True,
+        )
         max_tracked_sessions = _positive_int(
             "FACTORY_DROID_OPENAI_MAX_TRACKED_SESSIONS",
             default=256,
@@ -433,6 +438,7 @@ class Settings:
             max_choices=max_choices,
             max_stop_sequences=max_stop_sequences,
             session_continuity=session_continuity,
+            auto_reasoning_continuity=auto_reasoning_continuity,
             max_tracked_sessions=max_tracked_sessions,
             mcp_settle_seconds=mcp_settle_seconds,
             model_cache_seconds=model_cache_seconds,

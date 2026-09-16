@@ -71,11 +71,14 @@ class ReplayRunner:
 
 
 def _usage(payload: dict[str, Any]) -> Usage:
-    details = payload.get("prompt_tokens_details") or {}
+    prompt_details = payload.get("prompt_tokens_details") or {}
+    completion_details = payload.get("completion_tokens_details") or {}
     return Usage(
         input_tokens=int(payload.get("prompt_tokens", 0)),
         output_tokens=int(payload.get("completion_tokens", 0)),
-        cache_read_tokens=int(details.get("cached_tokens", 0)),
+        cache_read_tokens=int(prompt_details.get("cached_tokens", 0)),
+        cache_write_tokens=int(prompt_details.get("cache_write_tokens", 0)),
+        thinking_tokens=int(completion_details.get("reasoning_tokens", 0)),
     )
 
 

@@ -27,10 +27,23 @@ from droid_sdk import (
     WorkingStateChanged,
 )
 from droid_sdk import TimeoutError as DroidTimeoutError
+from droid_sdk.schemas.cli import (
+    CreateMessageNotification,
+    SessionNotification,
+    SessionTokenUsageChangedNotification,
+)
 from droid_sdk.schemas.enums import (
     AutonomyLevel,
     DroidInteractionMode,
     ReasoningEffort,
+    SessionNotificationType,
+)
+from droid_sdk.schemas.messages import (
+    FactoryDroidMessage,
+    MessageRole,
+    RedactedThinkingBlock,
+    ThinkingBlock,
+    ToolUseBlock,
 )
 
 from factory_droid_openai.config import (
@@ -268,6 +281,7 @@ class Usage:
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    thinking_tokens: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,6 +292,7 @@ class UsageUpdate:
 @dataclass(frozen=True, slots=True)
 class RunComplete:
     usage: Usage
+    reasoning_details: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -575,6 +590,33 @@ class DroidRunner:
         unmapped_event_kind: str | None = None
         usage = Usage()
         output_token_baseline: int | None = 0
+        thinking_tokens = 0
+        final_message: FactoryDroidMessage | None = None
+
+        def capture_notification(notification: dict[str, Any]) -> None:
+            nonlocal final_message, thinking_tokens
+            try:
+                inner = SessionNotification.model_validate(notification).params.notification
+            except ValueError:
+                return
+            if (
+                isinstance(inner, CreateMessageNotification)
+                and inner.message.role is MessageRole.Assistant
+            ):
+                final_message = inner.message
+            elif isinstance(inner, SessionTokenUsageChangedNotification):
+                thinking_tokens = max(0, inner.token_usage.thinking_tokens)
+
+        unsubscribe_notifications = (
+            client.on_notification(
+                capture_notification,
+                notification_type=SessionNotificationType.CREATE_MESSAGE,
+            ),
+            client.on_notification(
+                capture_notification,
+                notification_type=SessionNotificationType.SESSION_TOKEN_USAGE_CHANGED,
+            ),
+        )
 
         try:
             async with asyncio.timeout_at(deadline) as request_timeout:
@@ -609,7 +651,12 @@ class DroidRunner:
                             )
                             loaded_usage = getattr(loaded, "token_usage", None)
                             output_token_baseline = (
-                                None if loaded_usage is None else max(0, loaded_usage.output_tokens)
+                                None
+                                if loaded_usage is None
+                                # Droid stores thinking outside outputTokens,
+                                # while OpenAI caps their combined total.
+                                else max(0, loaded_usage.output_tokens)
+                                + max(0, getattr(loaded_usage, "thinking_tokens", 0))
                             )
                         else:
                             await client.initialize_session(
@@ -703,7 +750,7 @@ class DroidRunner:
                         # own TurnComplete carries the newest update as the turn
                         # total. Summing them would count the same tokens once
                         # per event.
-                        usage = _map_usage(event)
+                        usage = _map_usage(event, thinking_tokens=thinking_tokens)
                         yield UsageUpdate(usage)
                     elif isinstance(event, TurnComplete):
                         if (
@@ -721,7 +768,10 @@ class DroidRunner:
                                 error_type="factory_incomplete_response",
                             )
                         if event.token_usage is not None:
-                            usage = _map_usage(event.token_usage)
+                            usage = _map_usage(
+                                event.token_usage,
+                                thinking_tokens=thinking_tokens,
+                            )
                         completed = True
                         turn_timeline = current_timeline()
                         log_debug(
@@ -735,7 +785,10 @@ class DroidRunner:
                                 else None
                             ),
                         )
-                        yield RunComplete(usage)
+                        yield RunComplete(
+                            usage,
+                            reasoning_details=_reasoning_details(final_message),
+                        )
                     elif isinstance(event, (ToolUse, ToolResult, ToolProgress)):
                         if request.native_tools is not None:
                             published = request.native_tools.resolve(event.tool_name)
@@ -809,6 +862,8 @@ class DroidRunner:
             model_id = _resolve_model_id(request.model, request.model_alias)
             raise sdk_error(exc, model=model_id) from exc
         finally:
+            for unsubscribe in unsubscribe_notifications:
+                unsubscribe()
             interrupt = initialized and not completed
             if self._reaper is not None:
                 # Interrupting and reaping a Droid process costs about a second
@@ -1210,13 +1265,119 @@ def _state_value(state: object) -> str:
     return str(getattr(state, "value", state))
 
 
-def _map_usage(event: TokenUsageUpdate) -> Usage:
+def _map_usage(event: TokenUsageUpdate, *, thinking_tokens: int = 0) -> Usage:
+    thinking = max(0, thinking_tokens)
     return Usage(
         input_tokens=max(0, event.input_tokens),
-        output_tokens=max(0, event.output_tokens),
+        # Droid's thinkingTokens counter is disjoint from outputTokens.
+        output_tokens=max(0, event.output_tokens) + thinking,
         cache_read_tokens=max(0, event.cache_read_tokens),
         cache_write_tokens=max(0, event.cache_write_tokens),
+        thinking_tokens=thinking,
     )
+
+
+def _reasoning_details(
+    message: FactoryDroidMessage | None,
+) -> tuple[dict[str, Any], ...]:
+    if message is None:
+        return ()
+    details: list[dict[str, Any]] = []
+    seen_encrypted: set[str] = set()
+
+    if message.openai_reasoning_summary:
+        details.append(
+            {
+                "type": "reasoning.summary",
+                "summary": message.openai_reasoning_summary,
+                "id": message.openai_reasoning_id,
+                "format": "openai-responses-v1",
+                "index": len(details),
+            }
+        )
+    if message.openai_encrypted_content:
+        seen_encrypted.add(message.openai_encrypted_content)
+        details.append(
+            {
+                "type": "reasoning.encrypted",
+                "data": message.openai_encrypted_content,
+                "id": message.openai_reasoning_id,
+                "format": "openai-responses-v1",
+                "index": len(details),
+            }
+        )
+    if message.chat_completion_reasoning_content:
+        details.append(
+            {
+                "type": "reasoning.text",
+                "text": message.chat_completion_reasoning_content,
+                "signature": None,
+                "id": message.openai_reasoning_id,
+                "format": "unknown",
+                "field": message.chat_completion_reasoning_field,
+                "index": len(details),
+            }
+        )
+
+    for block in message.content:
+        if isinstance(block, ThinkingBlock):
+            details.append(
+                {
+                    "type": "reasoning.text",
+                    "text": block.thinking,
+                    "signature": block.signature or None,
+                    "id": block.id,
+                    "format": _reasoning_format(block.signature_provider),
+                    "index": len(details),
+                }
+            )
+        elif isinstance(block, RedactedThinkingBlock):
+            seen_encrypted.add(block.data)
+            details.append(
+                {
+                    "type": "reasoning.encrypted",
+                    "data": block.data,
+                    "id": block.id,
+                    "format": "anthropic-claude-v1",
+                    "index": len(details),
+                }
+            )
+        elif (
+            isinstance(block, ToolUseBlock)
+            and block.thought_signature
+            and block.thought_signature not in seen_encrypted
+        ):
+            seen_encrypted.add(block.thought_signature)
+            details.append(
+                {
+                    "type": "reasoning.encrypted",
+                    "data": block.thought_signature,
+                    "id": block.id,
+                    "format": "google-gemini-v1",
+                    "index": len(details),
+                }
+            )
+
+    if message.gemini_thought_signature and message.gemini_thought_signature not in seen_encrypted:
+        details.append(
+            {
+                "type": "reasoning.encrypted",
+                "data": message.gemini_thought_signature,
+                "id": None,
+                "format": "google-gemini-v1",
+                "index": len(details),
+            }
+        )
+    return tuple(details)
+
+
+def _reasoning_format(provider: str | None) -> str:
+    formats = {
+        "anthropic": "anthropic-claude-v1",
+        "google": "google-gemini-v1",
+        "openai": "openai-responses-v1",
+    }
+    return formats.get((provider or "").casefold(), "unknown")
 
 
 async def _run_until(
