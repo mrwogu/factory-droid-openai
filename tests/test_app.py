@@ -110,7 +110,12 @@ def _recorded_event(record: dict[str, Any]) -> RunEvent:
     if kind == "usage":
         return UsageUpdate(_recorded_usage(record["usage"]))
     if kind == "run_complete":
-        return RunComplete(_recorded_usage(record["usage"]))
+        return RunComplete(
+            _recorded_usage(record["usage"]),
+            reasoning_details=tuple(
+                cast("list[dict[str, Any]]", record.get("reasoning_details") or ())
+            ),
+        )
     if kind == "status":
         return StatusUpdate(record["state"])
     if kind == "session_started":
@@ -5946,20 +5951,7 @@ async def test_multiple_choices_cannot_continue_a_session(tmp_path: Path) -> Non
 async def test_multiple_choices_cannot_automatically_continue_a_session(
     tmp_path: Path,
 ) -> None:
-    class ToolLoopRunner(FakeRunner):
-        async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
-            self.requests.append(request)
-            if len(self.requests) == 1:
-                yield SessionStarted("session-auto")
-                yield TextDelta(
-                    f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{}}}}{TOOL_CALL_CLOSE}'
-                )
-            else:
-                yield SessionStarted("session-other")
-                yield TextDelta("It is sunny.")
-            yield RunComplete(Usage())
-
-    runner = ToolLoopRunner([])
+    runner = FakeRunner(_recorded_events("tool-auto--factory-droid.jsonl"))
     payload = _payload(
         tools=[
             {
@@ -8302,12 +8294,7 @@ async def test_response_cache_strips_continuation_references_from_entries(
         },
     )
     calls: list[int] = []
-    events: list[RunEvent] = [
-        SessionStarted("session-cache"),
-        ReasoningDelta("thinking"),
-        TextDelta("Hello there"),
-        RunComplete(Usage(input_tokens=3, output_tokens=2), reasoning_details=details),
-    ]
+    events = _recorded_events("reasoning_cache--factory-droid.jsonl")
     app = create_app(
         _cache_settings(tmp_path),
         runner_factory=cast("RunnerFactory", _counting_factory(events, calls)),
@@ -8327,7 +8314,7 @@ async def test_response_cache_strips_continuation_references_from_entries(
     assert second.json()["choices"][0]["message"]["reasoning"] == "thinking"
     digest = reasoning_details_digest(details)
     assert digest is not None
-    assert app.state.sessions.session_for_reference("reasoning", digest) == "session-cache"
+    assert app.state.sessions.session_for_reference("reasoning", digest) == "replay-session"
 
 
 class _OffsetClockLoop:

@@ -196,7 +196,7 @@ factory-droid-openai
 - OpenAI-compatible `POST /v1/responses`
 - Dynamic OpenAI-compatible `GET /v1/models`
 - Non-streaming JSON responses
-- Streaming server-sent events with `[DONE]` termination
+- Streaming server-sent events: Chat chunks end with `[DONE]`, Responses with typed terminal events
 - System, developer, user, assistant, and tool message mapping
 - Function tool schemas and validated tool-call responses
 - Signed reasoning blocks, reasoning deltas, and thinking-token usage

@@ -5,7 +5,7 @@ import json
 import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from factory_droid_openai.models import (
     ChatCompletionRequest,
@@ -291,8 +291,12 @@ def _append_reasoning_reference(
     item: dict[str, Any],
 ) -> None:
     item_id = item.get("id")
-    if isinstance(item_id, str) and item_id:
-        references.append(("reasoning_item", item_id))
+    # Echoed reasoning items always carry the bridge's rs_<id>; an id-less
+    # item is malformed input and fails closed instead of silently losing
+    # the continuation reference.
+    if not isinstance(item_id, str) or not item_id:
+        raise ResponsesConversionError("reasoning.id is required")
+    references.append(("reasoning_item", item_id))
 
 
 def _input_message(item: dict[str, Any]) -> dict[str, Any]:
@@ -517,12 +521,17 @@ def _function_call_item(call: Any) -> dict[str, Any] | None:
     function = call.get("function")
     if not isinstance(function, dict):
         return None
+    name = function.get("name")
+    if not isinstance(name, str) or not name:
+        # Upstream requires a function name; a nameless call is dropped
+        # rather than emitted as a function_call item with name null.
+        return None
     call_id = str(call.get("id") or f"call_{uuid.uuid4().hex[:24]}")
     return {
         "id": f"fc_{call_id.removeprefix('call_')}",
         "call_id": call_id,
         "type": "function_call",
-        "name": function.get("name"),
+        "name": name,
         "arguments": function.get("arguments", "{}"),
         "status": "completed",
     }
@@ -633,7 +642,7 @@ class _ResponsesStreamState:
         self.reasoning_content_started = False
         self.message_content_started = False
         self.tool_items: list[dict[str, Any]] = []
-        self._output_count = 0
+        self.output_order: list[tuple[str, int | None]] = []
 
     @property
     def reasoning_text(self) -> str:
@@ -649,21 +658,27 @@ class _ResponsesStreamState:
         return _sse(payload)
 
     def response(self, status: str) -> dict[str, Any]:
-        # Canonical order matches the non-streaming shape (reasoning, message,
-        # function calls) even when encrypted reasoning only arrives with the
-        # terminal chunk, after message text already took an output index.
+        # Output follows allocation order so every output_index emitted in an
+        # event matches its position in this array. Encrypted reasoning can
+        # only arrive with the terminal chunk, after text already started, so
+        # a late reasoning item lands after the message here; the
+        # non-streaming shape keeps reasoning first. Buffering text to force
+        # that order was rejected: it would add end-to-end latency to every
+        # streamed response.
         output: list[dict[str, Any]] = []
-        if self.reasoning_index is not None:
-            output.append(
-                _reasoning_item(
-                    self.plan.reasoning_item_id,
-                    self.reasoning_text,
-                    self.reasoning_details,
+        for kind, tool_index in self.output_order:
+            if kind == "reasoning":
+                output.append(
+                    _reasoning_item(
+                        self.plan.reasoning_item_id,
+                        self.reasoning_text,
+                        self.reasoning_details,
+                    )
                 )
-            )
-        if self.message_index is not None:
-            output.append(_message_item(self.plan.message_item_id, self.text, status))
-        output.extend(self.tool_items)
+            elif kind == "message":
+                output.append(_message_item(self.plan.message_item_id, self.text, status))
+            else:
+                output.append(self.tool_items[cast("int", tool_index)])
         return {
             "id": self.plan.response_id,
             "object": "response",
@@ -774,6 +789,7 @@ class _ResponsesStreamState:
         if self.reasoning_index is not None:
             return None
         self.reasoning_index = self._next_output_index()
+        self.output_order.append(("reasoning", None))
         added_item = _reasoning_item(self.plan.reasoning_item_id, "", [])
         added_item["status"] = "in_progress"
         return self.event(
@@ -786,6 +802,7 @@ class _ResponsesStreamState:
         if self.message_index is not None:
             return None
         self.message_index = self._next_output_index()
+        self.output_order.append(("message", None))
         return self.event(
             _OUTPUT_ITEM_ADDED_EVENT,
             output_index=self.message_index,
@@ -801,6 +818,7 @@ class _ResponsesStreamState:
     def _tool_call_events(self, item: dict[str, Any]) -> Iterator[str]:
         output_index = self._next_output_index()
         self.tool_items.append(item)
+        self.output_order.append(("tool", len(self.tool_items) - 1))
         added_item = item | {
             "arguments": "",
             "status": "in_progress",
@@ -831,21 +849,41 @@ class _ResponsesStreamState:
 
     async def done_events(self) -> AsyncIterator[str]:
         status = "incomplete" if self.finish_reason == "length" else "completed"
+        # Done blocks follow allocation order too, so the emitted
+        # output_index values match the final response.output array even
+        # when encrypted reasoning arrived after message text.
+        blocks: list[tuple[int, list[str]]] = []
         if self.reasoning_index is not None:
-            item = _reasoning_item(
-                self.plan.reasoning_item_id,
-                self.reasoning_text,
-                self.reasoning_details,
-            )
-            if self.reasoning_text:
-                yield self.event(
+            blocks.append((self.reasoning_index, self._reasoning_done_events()))
+        if self.message_index is not None:
+            blocks.append((self.message_index, self._message_done_events(status)))
+        for _, events in sorted(blocks, key=lambda block: block[0]):
+            for event in events:
+                yield event
+        yield self.event(
+            "response.completed" if status == "completed" else "response.incomplete",
+            response=self.response(status),
+        )
+
+    def _reasoning_done_events(self) -> list[str]:
+        item = _reasoning_item(
+            self.plan.reasoning_item_id,
+            self.reasoning_text,
+            self.reasoning_details,
+        )
+        events: list[str] = []
+        if self.reasoning_text:
+            events.append(
+                self.event(
                     "response.reasoning_text.done",
                     item_id=self.plan.reasoning_item_id,
                     output_index=self.reasoning_index,
                     content_index=0,
                     text=self.reasoning_text,
                 )
-                yield self.event(
+            )
+            events.append(
+                self.event(
                     "response.content_part.done",
                     item_id=self.plan.reasoning_item_id,
                     output_index=self.reasoning_index,
@@ -855,22 +893,28 @@ class _ResponsesStreamState:
                         "text": self.reasoning_text,
                     },
                 )
-            yield self.event(
+            )
+        events.append(
+            self.event(
                 _OUTPUT_ITEM_DONE_EVENT,
                 output_index=self.reasoning_index,
                 item=item,
             )
-        if self.message_index is not None:
-            item = _message_item(self.plan.message_item_id, self.text, status)
-            yield self.event(
+        )
+        return events
+
+    def _message_done_events(self, status: str) -> list[str]:
+        item = _message_item(self.plan.message_item_id, self.text, status)
+        return [
+            self.event(
                 "response.output_text.done",
                 item_id=self.plan.message_item_id,
                 output_index=self.message_index,
                 content_index=0,
                 text=self.text,
                 logprobs=[],
-            )
-            yield self.event(
+            ),
+            self.event(
                 "response.content_part.done",
                 item_id=self.plan.message_item_id,
                 output_index=self.message_index,
@@ -881,18 +925,13 @@ class _ResponsesStreamState:
                     "annotations": [],
                     "logprobs": [],
                 },
-            )
-            yield self.event(
+            ),
+            self.event(
                 _OUTPUT_ITEM_DONE_EVENT,
                 output_index=self.message_index,
                 item=item,
-            )
-        yield self.event(
-            "response.completed" if status == "completed" else "response.incomplete",
-            response=self.response(status),
-        )
+            ),
+        ]
 
     def _next_output_index(self) -> int:
-        value = self._output_count
-        self._output_count += 1
-        return value
+        return len(self.output_order)

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import time
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -118,19 +117,23 @@ def test_response_from_chat_maps_length_and_empty_usage() -> None:
     assert response["tool_choice"] == "auto"
 
 
-def test_response_from_chat_records_completion_time() -> None:
+def test_response_from_chat_records_completion_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # responses.py imports the stdlib time module, so patching time.time
+    # covers the completed_at call under test deterministically.
+    monkeypatch.setattr("time.time", lambda: 1234.5)
+
     payload = _request()
-    before = time.time()
     response = response_from_chat(
         payload,
         build_responses_plan(payload),
         _chat({"content": "done"}),
     )
-    after = time.time()
 
     assert response["status"] == "completed"
     assert response["created_at"] == 10.0
-    assert before <= response["completed_at"] <= after
+    assert response["completed_at"] == 1234.5
 
 
 def test_build_responses_plan_maps_all_supported_inputs() -> None:
@@ -175,7 +178,6 @@ def test_build_responses_plan_maps_all_supported_inputs() -> None:
                 ],
             },
             {"type": "reasoning", "id": "rs_old"},
-            {"type": "reasoning", "id": None},
         ],
         tools=[
             {
@@ -239,7 +241,10 @@ def test_build_responses_plan_maps_all_supported_inputs() -> None:
     ("input_value", "message"),
     [
         ([{"type": "function_call_output", "call_id": "", "output": "x"}], "call_id"),
-        ([{"type": "reasoning", "id": None}], "at least one"),
+        ([], "at least one"),
+        ([{"type": "reasoning", "id": None}], "reasoning.id"),
+        ([{"type": "reasoning", "id": ""}], "reasoning.id"),
+        ([{"type": "reasoning", "id": 7}], "reasoning.id"),
         ([{"type": "unknown"}], "unsupported Responses input"),
         ([{"type": [], "role": "user", "content": "x"}], "unsupported Responses input"),
         ([{"type": "message", "role": [], "content": "x"}], "unsupported Responses input"),
@@ -528,6 +533,8 @@ def test_response_output_skips_invalid_calls_and_generates_missing_id() -> None:
             "tool_calls": [
                 7,
                 {"function": 7},
+                {"function": {"name": ""}},
+                {"function": {"arguments": "{}"}},
                 {"function": {"name": "weather"}},
             ],
         },
@@ -535,6 +542,7 @@ def test_response_output_skips_invalid_calls_and_generates_missing_id() -> None:
     )
 
     assert len(output) == 1
+    assert output[0]["name"] == "weather"
     assert output[0]["call_id"].startswith("call_")
     assert output[0]["arguments"] == "{}"
 
@@ -725,7 +733,7 @@ async def test_response_stream_appends_reasoning_and_late_details() -> None:
 
 
 @pytest.mark.asyncio
-async def test_response_stream_orders_late_encrypted_reasoning_first() -> None:
+async def test_response_stream_keeps_late_encrypted_reasoning_after_text() -> None:
     events = await _collect_stream(
         _request(stream=True),
         _events(
@@ -742,19 +750,17 @@ async def test_response_stream_orders_late_encrypted_reasoning_first() -> None:
     )
 
     # Encrypted reasoning arrives only with the terminal chunk, after message
-    # text already took output index 0; the final response still matches the
-    # non-streaming [reasoning, message] order.
+    # text already took index 0; allocation order keeps every output_index
+    # equal to its position in the terminal output array.
     assert events[-1]["type"] == "response.completed"
     assert events[-1]["response"]["completed_at"] is not None
-    assert [item["type"] for item in events[-1]["response"]["output"]] == [
-        "reasoning",
-        "message",
-    ]
-    assert events[-1]["response"]["output"][0]["encrypted_content"] == "state"
+    response_output = events[-1]["response"]["output"]
+    assert [item["type"] for item in response_output] == ["message", "reasoning"]
+    assert response_output[1]["encrypted_content"] == "state"
     done_items = [
         event["item"]["type"] for event in events if event["type"] == "response.output_item.done"
     ]
-    assert done_items == ["reasoning", "message"]
+    assert done_items == ["message", "reasoning"]
 
 
 @pytest.mark.asyncio

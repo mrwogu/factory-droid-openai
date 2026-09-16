@@ -1,0 +1,5 @@
+{"kind": "meta", "scenario": "reasoning_cache", "stream": false, "recorded_model": "factory-droid", "expect_verdict": "pass", "note": "hand-crafted fixture for the response-cache reasoning_details strip contract"}
+{"kind": "session_started"}
+{"kind": "reasoning_delta", "text": "thinking"}
+{"kind": "text_delta", "text": "OK"}
+{"kind": "run_complete", "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5, "prompt_tokens_details": {"cached_tokens": 0}}, "reasoning_details": [{"type": "reasoning.text", "text": "thinking", "signature": "signed-state", "id": "thinking-1", "format": "anthropic-claude-v1", "index": 0}]}

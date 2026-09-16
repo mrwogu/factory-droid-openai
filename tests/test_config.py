@@ -166,6 +166,14 @@ def test_settings_validate_auth_probe_options() -> None:
         Settings(auth_failure_threshold=0)
 
 
+def test_settings_validate_session_reference_bound() -> None:
+    assert Settings().max_session_references == 128
+    with pytest.raises(ValueError, match="max_session_references must be greater"):
+        Settings(max_session_references=0)
+    with pytest.raises(ValueError, match="max_session_references must be greater"):
+        Settings(max_session_references=-1)
+
+
 @pytest.mark.parametrize(
     ("value", "message"),
     [

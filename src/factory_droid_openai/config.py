@@ -152,6 +152,8 @@ class Settings:
             raise ValueError("response_cache_max_bytes must be greater than zero")
         if self.response_cache_max_entries <= 0:
             raise ValueError("response_cache_max_entries must be greater than zero")
+        if self.max_session_references <= 0:
+            raise ValueError("max_session_references must be greater than zero")
         if not math.isfinite(self.auth_probe_seconds) or self.auth_probe_seconds < 0:
             raise ValueError("auth_probe_seconds must be zero or greater and finite")
         if self.auth_failure_threshold < 1:

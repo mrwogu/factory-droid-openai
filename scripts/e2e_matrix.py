@@ -161,6 +161,12 @@ def _baseline_scenarios() -> list[Scenario]:
             name="hello",
             body={"messages": [{"role": "user", "content": "Reply with exactly: OK"}]},
         ),
+        # Hand-crafted replay fixture companion (reasoning_cache--factory-droid.jsonl):
+        # a signed-reasoning turn used by the response-cache strip contract.
+        Scenario(
+            name="reasoning_cache",
+            body={"messages": [{"role": "user", "content": "Reply with exactly: OK"}]},
+        ),
         Scenario(
             name="unicode",
             body={
