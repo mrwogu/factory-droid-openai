@@ -130,6 +130,8 @@ class Scenario:
     timeout_seconds: float = 120.0
 
 
+_OK_PROMPT = "Reply with exactly: OK"
+
 _SWITCH_PRIME = Scenario(
     name="model_switch_prime",
     body={"messages": [{"role": "user", "content": "Reply with exactly: READY"}]},
@@ -159,13 +161,13 @@ def _baseline_scenarios() -> list[Scenario]:
     return [
         Scenario(
             name="hello",
-            body={"messages": [{"role": "user", "content": "Reply with exactly: OK"}]},
+            body={"messages": [{"role": "user", "content": _OK_PROMPT}]},
         ),
         # Hand-crafted replay fixture companion (reasoning_cache--factory-droid.jsonl):
         # a signed-reasoning turn used by the response-cache strip contract.
         Scenario(
             name="reasoning_cache",
-            body={"messages": [{"role": "user", "content": "Reply with exactly: OK"}]},
+            body={"messages": [{"role": "user", "content": _OK_PROMPT}]},
         ),
         Scenario(
             name="unicode",
@@ -186,7 +188,7 @@ def _baseline_scenarios() -> list[Scenario]:
         Scenario(
             name="output_token_limit",
             body={
-                "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
+                "messages": [{"role": "user", "content": _OK_PROMPT}],
                 "max_tokens": 5,
             },
             expect_finish=("stop", "length"),
