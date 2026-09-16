@@ -45,7 +45,9 @@ _ENVIRONMENT_KEYS = (
     "FACTORY_DROID_OPENAI_MAX_CHOICES",
     "FACTORY_DROID_OPENAI_MAX_STOP_SEQUENCES",
     "FACTORY_DROID_OPENAI_SESSION_CONTINUITY",
+    "FACTORY_DROID_OPENAI_AUTO_REASONING_CONTINUITY",
     "FACTORY_DROID_OPENAI_MAX_TRACKED_SESSIONS",
+    "FACTORY_DROID_OPENAI_MAX_SESSION_REFERENCES",
     "FACTORY_DROID_OPENAI_WORKTREE",
     "FACTORY_DROID_OPENAI_APPEND_SYSTEM_PROMPT_FILE",
     "FACTORY_DROID_OPENAI_UVICORN_LIMIT_CONCURRENCY",
@@ -162,6 +164,14 @@ def test_settings_validate_auth_probe_options() -> None:
         Settings(auth_probe_seconds=float("inf"))
     with pytest.raises(ValueError, match="auth_failure_threshold must be at least 1"):
         Settings(auth_failure_threshold=0)
+
+
+def test_settings_validate_session_reference_bound() -> None:
+    assert Settings().max_session_references == 128
+    with pytest.raises(ValueError, match="max_session_references must be greater"):
+        Settings(max_session_references=0)
+    with pytest.raises(ValueError, match="max_session_references must be greater"):
+        Settings(max_session_references=-1)
 
 
 @pytest.mark.parametrize(
@@ -638,7 +648,9 @@ def test_settings_read_feature_limits_from_environment(
     monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_CHOICES", "2")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_STOP_SEQUENCES", "0")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_SESSION_CONTINUITY", "yes")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_AUTO_REASONING_CONTINUITY", "no")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_TRACKED_SESSIONS", "5")
+    monkeypatch.setenv("FACTORY_DROID_OPENAI_MAX_SESSION_REFERENCES", "7")
     monkeypatch.setenv("FACTORY_DROID_OPENAI_WORKTREE", "feature-branch")
     monkeypatch.setenv(
         "FACTORY_DROID_OPENAI_APPEND_SYSTEM_PROMPT_FILE",
@@ -654,7 +666,9 @@ def test_settings_read_feature_limits_from_environment(
     assert settings.max_choices == 2
     assert settings.max_stop_sequences == 0
     assert settings.session_continuity is True
+    assert settings.auto_reasoning_continuity is False
     assert settings.max_tracked_sessions == 5
+    assert settings.max_session_references == 7
     assert settings.worktree == "feature-branch"
     assert settings.append_system_prompt_file == prompt_file.resolve()
 

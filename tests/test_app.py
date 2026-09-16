@@ -13,6 +13,7 @@ import pytest
 from fastapi.exceptions import RequestValidationError
 from jsonschema.validators import validator_for
 
+from factory_droid_openai import app as app_module
 from factory_droid_openai import logs
 from factory_droid_openai import telemetry as telemetry_module
 from factory_droid_openai.app import (
@@ -62,6 +63,10 @@ from factory_droid_openai.protocol import (
     ToolCallStreamParser,
     build_prompt,
 )
+from factory_droid_openai.responses import (
+    ResponsesConversionError,
+    reasoning_details_digest,
+)
 from factory_droid_openai.runner import (
     DroidModel,
     ReasoningDelta,
@@ -85,11 +90,14 @@ if TYPE_CHECKING:
 
 
 def _recorded_usage(payload: dict[str, Any]) -> Usage:
-    details = payload.get("prompt_tokens_details") or {}
+    prompt_details = payload.get("prompt_tokens_details") or {}
+    completion_details = payload.get("completion_tokens_details") or {}
     return Usage(
         input_tokens=int(payload.get("prompt_tokens", 0)),
         output_tokens=int(payload.get("completion_tokens", 0)),
-        cache_read_tokens=int(details.get("cached_tokens", 0)),
+        cache_read_tokens=int(prompt_details.get("cached_tokens", 0)),
+        cache_write_tokens=int(prompt_details.get("cache_write_tokens", 0)),
+        thinking_tokens=int(completion_details.get("reasoning_tokens", 0)),
     )
 
 
@@ -102,7 +110,12 @@ def _recorded_event(record: dict[str, Any]) -> RunEvent:
     if kind == "usage":
         return UsageUpdate(_recorded_usage(record["usage"]))
     if kind == "run_complete":
-        return RunComplete(_recorded_usage(record["usage"]))
+        return RunComplete(
+            _recorded_usage(record["usage"]),
+            reasoning_details=tuple(
+                cast("list[dict[str, Any]]", record.get("reasoning_details") or ())
+            ),
+        )
     if kind == "status":
         return StatusUpdate(record["state"])
     if kind == "session_started":
@@ -1023,6 +1036,658 @@ async def test_non_streaming_chat_completion(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_chat_completion_returns_signed_reasoning_and_usage(tmp_path: Path) -> None:
+    details = (
+        {
+            "type": "reasoning.text",
+            "text": "brief thought",
+            "signature": "signed-state",
+            "id": "thinking-1",
+            "format": "anthropic-claude-v1",
+            "index": 0,
+        },
+    )
+    usage = Usage(10, 11, 2, 1, 7)
+    runner = FakeRunner(
+        [
+            ReasoningDelta("brief thought"),
+            TextDelta("answer"),
+            RunComplete(usage, reasoning_details=details),
+        ]
+    )
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=_payload())
+
+    assert response.status_code == 200
+    body = response.json()
+    message = body["choices"][0]["message"]
+    assert message["reasoning_details"] == list(details)
+    assert body["usage"] == {
+        "prompt_tokens": 10,
+        "completion_tokens": 11,
+        "total_tokens": 21,
+        "prompt_tokens_details": {
+            "cached_tokens": 2,
+            "cache_write_tokens": 1,
+        },
+        "completion_tokens_details": {"reasoning_tokens": 7},
+    }
+
+
+@pytest.mark.asyncio
+async def test_unsigned_reasoning_does_not_continue_droid_session(
+    tmp_path: Path,
+) -> None:
+    details = (
+        {
+            "type": "reasoning.text",
+            "text": "plain thought",
+            "signature": None,
+            "id": None,
+            "format": "unknown",
+            "index": 0,
+        },
+    )
+    runner = FakeRunner(
+        [
+            SessionStarted("session-unsigned"),
+            ReasoningDelta("plain thought"),
+            TextDelta("answer"),
+            RunComplete(Usage(), reasoning_details=details),
+        ]
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        first = await client.post("/v1/chat/completions", json=_payload())
+        message = first.json()["choices"][0]["message"]
+        second = await client.post(
+            "/v1/chat/completions",
+            json=_payload(
+                messages=[
+                    {"role": "user", "content": "First"},
+                    message,
+                    {"role": "user", "content": "Continue"},
+                ]
+            ),
+        )
+
+    assert second.status_code == 200
+    assert runner.requests[1].session_id is None
+
+
+@pytest.mark.asyncio
+async def test_tool_result_automatically_continues_droid_session(tmp_path: Path) -> None:
+    class ToolLoopRunner(FakeRunner):
+        async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                yield SessionStarted("session-auto")
+                yield TextDelta(
+                    f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Gdansk"}}}}'
+                    f"{TOOL_CALL_CLOSE}"
+                )
+            else:
+                session_id = "session-auto" if len(self.requests) == 2 else "session-model-b"
+                yield SessionStarted(session_id, 4)
+                yield TextDelta("It is sunny.")
+            yield RunComplete(Usage())
+
+    runner = ToolLoopRunner([])
+    payload = _payload(
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        first = await client.post("/v1/chat/completions", json=payload)
+        first_message = first.json()["choices"][0]["message"]
+        call_id = first_message["tool_calls"][0]["id"]
+        second = await client.post(
+            "/v1/chat/completions",
+            json={
+                **payload,
+                "messages": [
+                    {"role": "user", "content": "Weather?"},
+                    first_message,
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": '{"condition":"sunny"}',
+                    },
+                ],
+            },
+        )
+        third = await client.post(
+            "/v1/chat/completions",
+            json={
+                **payload,
+                "model": "model-b",
+                "messages": [
+                    {"role": "user", "content": "Weather?"},
+                    first_message,
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": '{"condition":"sunny"}',
+                    },
+                ],
+            },
+        )
+
+    assert second.status_code == 200
+    assert third.status_code == 200
+    assert second.json()["choices"][0]["message"]["content"] == "It is sunny."
+    assert runner.requests[1].session_id == "session-auto"
+    assert runner.requests[2].session_id is None
+    assert '"role":"tool"' in runner.requests[1].prompt
+    assert '"role":"user","content":"Weather?"' not in runner.requests[1].prompt
+
+
+@pytest.mark.asyncio
+async def test_signed_reasoning_automatically_continues_droid_session(
+    tmp_path: Path,
+) -> None:
+    details = (
+        {
+            "type": "reasoning.text",
+            "text": "thinking",
+            "signature": "signed-state",
+            "id": "thinking-1",
+            "format": "anthropic-claude-v1",
+            "index": 0,
+        },
+    )
+
+    class ReasoningLoopRunner(FakeRunner):
+        async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
+            self.requests.append(request)
+            yield SessionStarted("session-reasoning")
+            yield ReasoningDelta("thinking")
+            yield TextDelta("answer")
+            yield RunComplete(Usage(), reasoning_details=details)
+
+    runner = ReasoningLoopRunner([])
+    async with _client(_app(tmp_path, runner)) as client:
+        first = await client.post("/v1/chat/completions", json=_payload())
+        first_message = first.json()["choices"][0]["message"]
+        second = await client.post(
+            "/v1/chat/completions",
+            json=_payload(
+                messages=[
+                    {"role": "user", "content": "First"},
+                    first_message,
+                    {"role": "user", "content": "Continue"},
+                ]
+            ),
+        )
+
+    assert second.status_code == 200
+    assert runner.requests[1].session_id == "session-reasoning"
+    assert '"content":"Continue"' in runner.requests[1].prompt
+    assert '"content":"First"' not in runner.requests[1].prompt
+
+
+@pytest.mark.asyncio
+async def test_automatic_reasoning_continuity_can_be_disabled(tmp_path: Path) -> None:
+    class ToolLoopRunner(FakeRunner):
+        async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
+            self.requests.append(request)
+            yield SessionStarted(f"session-{len(self.requests)}")
+            yield TextDelta(
+                f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{}}}}{TOOL_CALL_CLOSE}'
+            )
+            yield RunComplete(Usage())
+
+    runner = ToolLoopRunner([])
+    settings = Settings(
+        droid_path="droid",
+        workdir=tmp_path,
+        timeout_seconds=30,
+        auto_reasoning_continuity=False,
+    )
+    app = create_app(settings, runner_factory=cast("RunnerFactory", lambda: runner))
+    payload = _payload(
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+    )
+    async with _client(app) as client:
+        first = await client.post("/v1/chat/completions", json=payload)
+        first_message = first.json()["choices"][0]["message"]
+        await client.post(
+            "/v1/chat/completions",
+            json={
+                **payload,
+                "messages": [
+                    {"role": "user", "content": "Weather?"},
+                    first_message,
+                    {
+                        "role": "tool",
+                        "tool_call_id": first_message["tool_calls"][0]["id"],
+                        "content": "sunny",
+                    },
+                ],
+            },
+        )
+
+    assert runner.requests[1].session_id is None
+
+
+@pytest.mark.asyncio
+async def test_disabled_automatic_continuity_does_not_index_stream_details(
+    tmp_path: Path,
+) -> None:
+    details = (
+        {
+            "type": "reasoning.encrypted",
+            "data": "signed-state",
+            "format": "openai-responses-v1",
+        },
+    )
+    runner = FakeRunner(
+        [
+            SessionStarted("session-stream"),
+            TextDelta("answer"),
+            RunComplete(Usage(), reasoning_details=details),
+        ]
+    )
+    settings = Settings(
+        droid_path="droid",
+        workdir=tmp_path,
+        timeout_seconds=30,
+        auto_reasoning_continuity=False,
+    )
+    app = create_app(settings, runner_factory=cast("RunnerFactory", lambda: runner))
+
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(stream=True),
+        )
+
+    digest = reasoning_details_digest(details)
+    assert response.status_code == 200
+    assert digest is not None
+    assert app.state.sessions.session_for_reference("reasoning", digest) is None
+
+
+@pytest.mark.asyncio
+async def test_automatic_continuity_rejects_mixed_session_references(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+    app = _app(tmp_path, runner)
+    key = SessionKey(None, None)
+    app.state.sessions.remember("session-a", key)
+    app.state.sessions.remember("session-b", key)
+    app.state.sessions.remember_reference("tool_call", "call_a", "session-a")
+    app.state.sessions.remember_reference("tool_call", "call_b", "session-b")
+
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(
+                messages=[
+                    {"role": "user", "content": "Run both."},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_a",
+                                "type": "function",
+                                "function": {"name": "a", "arguments": "{}"},
+                            },
+                            {
+                                "id": "call_b",
+                                "type": "function",
+                                "function": {"name": "b", "arguments": "{}"},
+                            },
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_a", "content": "a"},
+                    {"role": "tool", "tool_call_id": "call_b", "content": "b"},
+                ]
+            ),
+        )
+
+    assert response.status_code == 400
+    assert "different Droid sessions" in response.json()["error"]["message"]
+    assert runner.requests == []
+
+
+@pytest.mark.asyncio
+async def test_responses_api_returns_reasoning_text_and_usage(tmp_path: Path) -> None:
+    details = (
+        {
+            "type": "reasoning.encrypted",
+            "data": "encrypted-state",
+            "id": "reasoning-provider-1",
+            "format": "openai-responses-v1",
+            "index": 0,
+        },
+    )
+    runner = FakeRunner(
+        [
+            SessionStarted("session-responses"),
+            ReasoningDelta("short reasoning"),
+            TextDelta("final answer"),
+            RunComplete(
+                Usage(8, 9, 3, 2, 6),
+                reasoning_details=details,
+            ),
+        ]
+    )
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post(
+            "/v1/responses",
+            json={
+                "model": "factory-droid",
+                "input": "Question",
+                "reasoning": {"effort": "high", "summary": "auto"},
+                "include": ["reasoning.encrypted_content"],
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["object"] == "response"
+    assert body["status"] == "completed"
+    assert [item["type"] for item in body["output"]] == ["reasoning", "message"]
+    reasoning = body["output"][0]
+    assert reasoning["content"] == [{"type": "reasoning_text", "text": "short reasoning"}]
+    assert reasoning["encrypted_content"] == "encrypted-state"
+    assert reasoning["reasoning_details"] == list(details)
+    assert body["output"][1]["content"][0]["text"] == "final answer"
+    assert body["usage"] == {
+        "input_tokens": 8,
+        "input_tokens_details": {
+            "cached_tokens": 3,
+            "cache_write_tokens": 2,
+        },
+        "output_tokens": 9,
+        "output_tokens_details": {"reasoning_tokens": 6},
+        "total_tokens": 17,
+    }
+    assert runner.requests[0].reasoning_effort == "high"
+
+
+@pytest.mark.asyncio
+async def test_responses_previous_response_continues_session(tmp_path: Path) -> None:
+    class ResponsesToolLoopRunner(FakeRunner):
+        async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
+            self.requests.append(request)
+            yield SessionStarted("session-responses")
+            if len(self.requests) == 1:
+                yield TextDelta(
+                    f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Gdansk"}}}}'
+                    f"{TOOL_CALL_CLOSE}"
+                )
+            else:
+                yield TextDelta("It is sunny.")
+            yield RunComplete(Usage())
+
+    runner = ResponsesToolLoopRunner([])
+    tool = {
+        "type": "function",
+        "name": "weather",
+        "description": "Read weather.",
+        "parameters": {"type": "object"},
+        "strict": False,
+    }
+    async with _client(_app(tmp_path, runner)) as client:
+        first = await client.post(
+            "/v1/responses",
+            json={
+                "model": "factory-droid",
+                "input": "Weather?",
+                "tools": [tool],
+            },
+        )
+        first_body = first.json()
+        function_call = first_body["output"][0]
+        second = await client.post(
+            "/v1/responses",
+            json={
+                "model": "factory-droid",
+                "previous_response_id": first_body["id"],
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": function_call["call_id"],
+                        "output": '{"condition":"sunny"}',
+                    }
+                ],
+                "tools": [tool],
+            },
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["output"][0]["content"][0]["text"] == "It is sunny."
+    assert runner.requests[1].session_id == "session-responses"
+
+
+@pytest.mark.asyncio
+async def test_responses_rejects_unknown_previous_response(tmp_path: Path) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post(
+            "/v1/responses",
+            json={
+                "model": "factory-droid",
+                "previous_response_id": "resp_unknown",
+                "input": "Continue",
+            },
+        )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["type"] == "session_not_found"
+    assert runner.requests == []
+
+
+@pytest.mark.asyncio
+async def test_responses_previous_response_cannot_be_bypassed_by_tool_reference(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+    app = _app(tmp_path, runner)
+    app.state.sessions.remember("session-known", SessionKey(None, None))
+    app.state.sessions.remember_reference("tool_call", "call_known", "session-known")
+
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/responses",
+            json={
+                "model": "factory-droid",
+                "previous_response_id": "resp_unknown",
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_known",
+                        "output": "done",
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 404
+    assert runner.requests == []
+
+
+@pytest.mark.asyncio
+async def test_responses_previous_response_requires_matching_settings(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+    app = _app(tmp_path, runner)
+    app.state.sessions.remember("session-known", SessionKey(None, None))
+    app.state.sessions.remember_reference("response", "resp_known", "session-known")
+
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5.4",
+                "previous_response_id": "resp_known",
+                "input": "Continue",
+            },
+        )
+
+    assert response.status_code == 400
+    assert "settings do not match" in response.json()["error"]["message"]
+    assert runner.requests == []
+
+
+@pytest.mark.asyncio
+async def test_responses_rejects_references_from_different_sessions(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+    app = _app(tmp_path, runner)
+    key = SessionKey(None, None)
+    app.state.sessions.remember("session-response", key)
+    app.state.sessions.remember("session-tool", key)
+    app.state.sessions.remember_reference(
+        "response",
+        "resp_known",
+        "session-response",
+    )
+    app.state.sessions.remember_reference("tool_call", "call_other", "session-tool")
+
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/responses",
+            json={
+                "model": "factory-droid",
+                "previous_response_id": "resp_known",
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_other",
+                        "output": "done",
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 400
+    assert "different Droid sessions" in response.json()["error"]["message"]
+    assert runner.requests == []
+
+
+@pytest.mark.asyncio
+async def test_responses_previous_response_respects_disabled_continuity(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+    settings = Settings(
+        droid_path="droid",
+        workdir=tmp_path,
+        timeout_seconds=30,
+        auto_reasoning_continuity=False,
+    )
+    app = create_app(settings, runner_factory=cast("RunnerFactory", lambda: runner))
+    app.state.sessions.remember("session-known", SessionKey(None, None))
+    app.state.sessions.remember_reference("response", "resp_known", "session-known")
+
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/responses",
+            json={
+                "model": "factory-droid",
+                "previous_response_id": "resp_known",
+                "input": "Continue",
+            },
+        )
+
+    assert response.status_code == 404
+    assert runner.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "stream"),
+    [
+        (
+            {
+                "model": "factory-droid",
+                "input": "Question",
+                "tools": [{"type": "web_search"}],
+            },
+            False,
+        ),
+        (
+            {
+                "model": "factory-droid",
+                "input": "Question",
+                "reasoning": {"effort": "extreme"},
+            },
+            False,
+        ),
+        (
+            {
+                "model": "factory-droid",
+                "input": "Question",
+                "reasoning": {"effort": "extreme"},
+                "stream": True,
+            },
+            True,
+        ),
+    ],
+)
+async def test_responses_maps_request_errors(
+    tmp_path: Path,
+    payload: dict[str, Any],
+    stream: bool,
+) -> None:
+    runner = FakeRunner([RunComplete(Usage())])
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/responses", json=payload)
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert bool(payload.get("stream")) is stream
+    assert runner.requests == []
+
+
+@pytest.mark.asyncio
+async def test_responses_maps_internal_conversion_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = FakeRunner([TextDelta("answer"), RunComplete(Usage())])
+
+    def fail_conversion(*_args: object) -> dict[str, Any]:
+        raise ResponsesConversionError("bad response")
+
+    monkeypatch.setattr(app_module, "response_from_chat", fail_conversion)
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post(
+            "/v1/responses",
+            json={"model": "factory-droid", "input": "Question"},
+        )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "factory_protocol_error"
+
+
+@pytest.mark.asyncio
 async def test_non_streaming_tool_call(tmp_path: Path) -> None:
     runner = FakeRunner(
         [
@@ -1443,12 +2108,22 @@ async def test_truncated_payload_after_a_tool_call_keeps_tool_calls_finish(
 
 @pytest.mark.asyncio
 async def test_streaming_chat_completion_uses_openai_sse(tmp_path: Path) -> None:
-    usage = Usage(8, 3, 1, 0)
+    usage = Usage(8, 3, 1, 0, 2)
+    details = (
+        {
+            "type": "reasoning.text",
+            "text": "think",
+            "signature": "signed",
+            "id": "thinking-1",
+            "format": "anthropic-claude-v1",
+            "index": 0,
+        },
+    )
     runner = FakeRunner(
         [
             ReasoningDelta("think"),
             TextDelta("Hi"),
-            RunComplete(usage),
+            RunComplete(usage, reasoning_details=details),
         ]
     )
     async with _client(_app(tmp_path, runner)) as client:
@@ -1471,10 +2146,12 @@ async def test_streaming_chat_completion_uses_openai_sse(tmp_path: Path) -> None
     assert chunks[0]["choices"][0]["delta"]["role"] == "assistant"
     assert chunks[1]["choices"][0]["delta"]["reasoning"] == "think"
     assert chunks[2]["choices"][0]["delta"]["content"] == "Hi"
+    assert chunks[3]["choices"][0]["delta"]["reasoning_details"] == list(details)
     assert chunks[-2]["choices"][0]["finish_reason"] == "stop"
     assert all(chunk["usage"] is None for chunk in chunks[:-1])
     assert chunks[-1]["choices"] == []
     assert chunks[-1]["usage"]["total_tokens"] == 11
+    assert chunks[-1]["usage"]["completion_tokens_details"] == {"reasoning_tokens": 2}
 
 
 @pytest.mark.asyncio
@@ -2670,7 +3347,11 @@ async def test_non_streaming_malformed_tool_call_retries_same_session(tmp_path: 
         "prompt_tokens": 16,
         "completion_tokens": 8,
         "total_tokens": 24,
-        "prompt_tokens_details": {"cached_tokens": 0},
+        "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+        },
+        "completion_tokens_details": {"reasoning_tokens": 0},
     }
     assert len(runner.requests) == 2
     assert runner.requests[1].session_id == "replay-session"
@@ -5267,6 +5948,48 @@ async def test_multiple_choices_cannot_continue_a_session(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_multiple_choices_cannot_automatically_continue_a_session(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner(_recorded_events("tool-auto--factory-droid.jsonl"))
+    payload = _payload(
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        first = await client.post("/v1/chat/completions", json=payload)
+        first_message = first.json()["choices"][0]["message"]
+        rejected = await client.post(
+            "/v1/chat/completions",
+            json={
+                **payload,
+                "n": 2,
+                "messages": [
+                    {"role": "user", "content": "Weather?"},
+                    first_message,
+                    {
+                        "role": "tool",
+                        "tool_call_id": first_message["tool_calls"][0]["id"],
+                        "content": "sunny",
+                    },
+                ],
+            },
+        )
+
+    assert rejected.status_code == 400
+    assert "cannot continue" in rejected.json()["error"]["message"]
+    assert rejected.json()["error"]["type"] == "invalid_request_error"
+    assert len(runner.requests) == 1
+
+
+@pytest.mark.asyncio
 async def test_session_id_is_hidden_when_continuity_is_disabled(
     tmp_path: Path,
 ) -> None:
@@ -5977,7 +6700,7 @@ async def test_factory_session_operations_require_continuity(tmp_path: Path) -> 
 
 
 def test_session_registry_evicts_the_oldest_entries() -> None:
-    registry = SessionRegistry(2)
+    registry = SessionRegistry(2, 128)
 
     key_a = SessionKey("model-a", None)
     key_b = SessionKey("model-b", None)
@@ -5994,7 +6717,7 @@ def test_session_registry_evicts_the_oldest_entries() -> None:
 
 
 def test_session_registry_ignores_duplicate_entries() -> None:
-    registry = SessionRegistry(2)
+    registry = SessionRegistry(2, 128)
 
     key_a = SessionKey("model-a", None)
     key_b = SessionKey("model-b", None)
@@ -6007,8 +6730,37 @@ def test_session_registry_ignores_duplicate_entries() -> None:
     assert registry.key("missing") is None
 
 
+def test_session_registry_tracks_bounded_continuation_references() -> None:
+    registry = SessionRegistry(2, 2)
+    key = SessionKey("model-a", None)
+    registry.remember("a", key)
+    registry.remember("b", key)
+
+    registry.remember_reference("tool_call", "unknown", "missing")
+    registry.remember_reference("tool_call", "", "a")
+    registry.remember_reference("tool_call", "shared", "a")
+    registry.remember_reference("tool_call", "shared", "b")
+
+    assert registry.session_for_reference("tool_call", "shared") == "b"
+    assert not registry._session_references["a"]
+
+    registry.remember_reference("reasoning", "old", "b")
+    registry.remember_reference("reasoning", "shared", "b")
+    registry.remember_reference("reasoning", "new", "b")
+
+    # Trimming drops the oldest reference, never the one just added, and a
+    # reference that moved sessions leaves the previous session's set.
+    assert registry.session_for_reference("reasoning", "new") == "b"
+    assert registry.session_for_reference("reasoning", "shared") == "b"
+    assert registry.session_for_reference("reasoning", "old") is None
+    assert len(registry._session_references["b"]) == 2
+    registry.forget("b")
+    assert registry.session_for_reference("tool_call", "shared") is None
+    assert registry.session_for_reference("reasoning", "new") is None
+
+
 def test_session_registry_does_not_evict_a_session_in_use() -> None:
-    registry = SessionRegistry(2)
+    registry = SessionRegistry(2, 128)
     key_a = SessionKey("model-a", None)
     key_b = SessionKey("model-b", None)
     key_c = SessionKey("model-c", None)
@@ -6026,7 +6778,7 @@ def test_session_registry_does_not_evict_a_session_in_use() -> None:
 
 
 def test_session_registry_defers_eviction_until_a_busy_session_releases() -> None:
-    registry = SessionRegistry(2)
+    registry = SessionRegistry(2, 128)
     keys = {session_id: SessionKey(f"model-{session_id}", None) for session_id in ("a", "b", "c")}
     registry.remember("a", keys["a"])
     registry.remember("b", keys["b"])
@@ -6049,7 +6801,7 @@ def test_session_registry_defers_eviction_until_a_busy_session_releases() -> Non
 
 @pytest.mark.asyncio
 async def test_session_registry_lease_is_exclusive_and_idempotent() -> None:
-    registry = SessionRegistry(2)
+    registry = SessionRegistry(2, 128)
     registry.remember("a", SessionKey("model-a", None))
 
     first = registry.acquire("a")
@@ -7010,6 +7762,119 @@ async def test_stop_sequence_does_not_count_as_an_empty_completion(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_terminal_reasoning_details_are_not_empty_completions(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
+    details = (
+        {
+            "type": "reasoning.encrypted",
+            "data": "encrypted-state",
+            "id": "reasoning-provider-1",
+            "format": "openai-responses-v1",
+            "index": 0,
+        },
+    )
+    runner = FakeRunner(
+        [
+            SessionStarted("session-reasoning-only"),
+            RunComplete(Usage(), reasoning_details=details),
+        ]
+    )
+    app = create_app(
+        Settings(
+            workdir=tmp_path,
+            timeout_seconds=30.0,
+            warm_sessions=0,
+            telemetry=False,
+            auth_probe_seconds=60.0,
+            auth_failure_threshold=3,
+        ),
+        runner_factory=cast("RunnerFactory", lambda: runner),
+    )
+    probe = app.state.auth_probe
+    assert probe is not None
+
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(stream=stream),
+        )
+
+    assert response.status_code == 200
+    if stream:
+        assert '"reasoning_details"' in response.text
+    else:
+        message = response.json()["choices"][0]["message"]
+        assert message["content"] is None
+        assert message["reasoning_details"] == list(details)
+    empties = [
+        json.loads(line)
+        for line in log_stream.getvalue().splitlines()
+        if json.loads(line)["event"] == "chat.empty_completion"
+    ]
+    assert empties == []
+    assert "factory_droid_openai_empty_completions_total 0" in app.state.metrics.render()
+    assert probe._trigger.is_set() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_reasoning_text_is_not_an_empty_completion(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
+    runner = FakeRunner(
+        [
+            SessionStarted("session-reasoning-text"),
+            ReasoningDelta("private thought"),
+            RunComplete(Usage()),
+        ]
+    )
+    app = create_app(
+        Settings(
+            workdir=tmp_path,
+            timeout_seconds=30.0,
+            warm_sessions=0,
+            telemetry=False,
+            auth_probe_seconds=60.0,
+            auth_failure_threshold=3,
+        ),
+        runner_factory=cast("RunnerFactory", lambda: runner),
+    )
+    probe = app.state.auth_probe
+    assert probe is not None
+
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(stream=stream),
+        )
+
+    assert response.status_code == 200
+    if stream:
+        assert '"reasoning":"private thought"' in response.text
+    else:
+        message = response.json()["choices"][0]["message"]
+        assert message["content"] is None
+        assert message["reasoning"] == "private thought"
+        assert "reasoning_details" not in message
+    empties = [
+        json.loads(line)
+        for line in log_stream.getvalue().splitlines()
+        if json.loads(line)["event"] == "chat.empty_completion"
+    ]
+    assert empties == []
+    assert "factory_droid_openai_empty_completions_total 0" in app.state.metrics.render()
+    assert probe._trigger.is_set() is False
+
+
+@pytest.mark.asyncio
 async def test_collect_completion_ignores_unmapped_runner_events() -> None:
     runner = FakeRunner(
         [
@@ -7163,7 +8028,7 @@ async def test_stream_finalizer_accepts_a_stream_without_aclose() -> None:
     metrics = BridgeMetrics()
     admission = AdmissionController(max_concurrency=1, max_queue_size=1, metrics=metrics)
     lease = await admission.acquire(asyncio.get_running_loop().time() + 30)
-    registry = SessionRegistry(1)
+    registry = SessionRegistry(1, 128)
     registry.remember("session-1", SessionKey(None, None))
     session_use = registry.acquire("session-1")
     assert session_use is not None
@@ -7525,6 +8390,44 @@ async def test_response_cache_hit_replays_without_a_droid_turn(tmp_path: Path) -
     assert "factory_droid_openai_response_cache_misses_total 1" in render
     assert "factory_droid_openai_response_cache_entries 1" in render
     assert _cache_bytes(render) > 0
+
+
+@pytest.mark.asyncio
+async def test_response_cache_strips_continuation_references_from_entries(
+    tmp_path: Path,
+) -> None:
+    details = (
+        {
+            "type": "reasoning.text",
+            "text": "thinking",
+            "signature": "signed-state",
+            "id": "thinking-1",
+            "format": "anthropic-claude-v1",
+            "index": 0,
+        },
+    )
+    calls: list[int] = []
+    events = _recorded_events("reasoning_cache--factory-droid.jsonl")
+    app = create_app(
+        _cache_settings(tmp_path),
+        runner_factory=cast("RunnerFactory", _counting_factory(events, calls)),
+    )
+
+    async with _client(app) as client:
+        first = await client.post("/v1/chat/completions", json=_payload())
+        second = await client.post("/v1/chat/completions", json=_payload())
+
+    # The live turn still carries its signed reasoning_details, but the
+    # replayed entry must not hand them to a caller who never ran the turn.
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert calls == [1]
+    assert first.json()["choices"][0]["message"]["reasoning_details"] == list(details)
+    assert "reasoning_details" not in second.json()["choices"][0]["message"]
+    assert second.json()["choices"][0]["message"]["reasoning"] == "thinking"
+    digest = reasoning_details_digest(details)
+    assert digest is not None
+    assert app.state.sessions.session_for_reference("reasoning", digest) == "replay-session"
 
 
 class _OffsetClockLoop:

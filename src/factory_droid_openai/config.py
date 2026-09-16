@@ -67,7 +67,11 @@ class Settings:
     max_choices: int = 4
     max_stop_sequences: int = 4
     session_continuity: bool = False
+    auto_reasoning_continuity: bool = True
     max_tracked_sessions: int = 256
+    # Continuation references (tool-call ids, reasoning digests, response ids)
+    # remembered per tracked session before the oldest is dropped.
+    max_session_references: int = 128
     mcp_settle_seconds: float = 0.0
     model_cache_seconds: float = 300.0
     model_quarantine_seconds: float = 900.0
@@ -148,6 +152,8 @@ class Settings:
             raise ValueError("response_cache_max_bytes must be greater than zero")
         if self.response_cache_max_entries <= 0:
             raise ValueError("response_cache_max_entries must be greater than zero")
+        if self.max_session_references <= 0:
+            raise ValueError("max_session_references must be greater than zero")
         if not math.isfinite(self.auth_probe_seconds) or self.auth_probe_seconds < 0:
             raise ValueError("auth_probe_seconds must be zero or greater and finite")
         if self.auth_failure_threshold < 1:
@@ -328,9 +334,17 @@ class Settings:
             "FACTORY_DROID_OPENAI_SESSION_CONTINUITY",
             default=False,
         )
+        auto_reasoning_continuity = _boolean(
+            "FACTORY_DROID_OPENAI_AUTO_REASONING_CONTINUITY",
+            default=True,
+        )
         max_tracked_sessions = _positive_int(
             "FACTORY_DROID_OPENAI_MAX_TRACKED_SESSIONS",
             default=256,
+        )
+        max_session_references = _positive_int(
+            "FACTORY_DROID_OPENAI_MAX_SESSION_REFERENCES",
+            default=128,
         )
         mcp_settle_seconds = _non_negative_float(
             "FACTORY_DROID_OPENAI_MCP_SETTLE_SECONDS",
@@ -433,7 +447,9 @@ class Settings:
             max_choices=max_choices,
             max_stop_sequences=max_stop_sequences,
             session_continuity=session_continuity,
+            auto_reasoning_continuity=auto_reasoning_continuity,
             max_tracked_sessions=max_tracked_sessions,
+            max_session_references=max_session_references,
             mcp_settle_seconds=mcp_settle_seconds,
             model_cache_seconds=model_cache_seconds,
             model_quarantine_seconds=model_quarantine_seconds,

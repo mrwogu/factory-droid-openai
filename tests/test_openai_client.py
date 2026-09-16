@@ -17,6 +17,7 @@ from factory_droid_openai.runner import (
     RunEvent,
     RunnerError,
     RunRequest,
+    SessionStarted,
     TextDelta,
     Usage,
     UsageUpdate,
@@ -159,6 +160,79 @@ async def test_official_openai_client_parses_stream(
     assert chunks[-1].choices == []
     assert chunks[-1].usage is not None
     assert chunks[-1].usage.total_tokens == 6
+
+
+@pytest.mark.asyncio
+async def test_official_openai_client_parses_response(
+    tmp_path: Path,
+) -> None:
+    usage = Usage(
+        input_tokens=7,
+        output_tokens=8,
+        cache_read_tokens=2,
+        cache_write_tokens=1,
+        thinking_tokens=5,
+    )
+    runner = ScriptedRunner(
+        [
+            ReasoningDelta("brief reasoning"),
+            TextDelta("Hello from Responses"),
+            RunComplete(usage),
+        ]
+    )
+    client, http_client = _sdk_client(tmp_path, runner)
+    async with http_client:
+        response = await client.responses.create(
+            model="factory-droid",
+            input="Hello",
+            reasoning={"effort": "high"},
+        )
+
+    assert response.object == "response"
+    assert response.status == "completed"
+    assert response.output_text == "Hello from Responses"
+    assert response.output[0].type == "reasoning"
+    assert response.usage is not None
+    assert response.usage.output_tokens == 8
+    assert response.usage.output_tokens_details.reasoning_tokens == 5
+    assert runner.requests[0].reasoning_effort == "high"
+
+
+@pytest.mark.asyncio
+async def test_official_openai_client_parses_response_stream(
+    tmp_path: Path,
+) -> None:
+    usage = Usage(input_tokens=4, output_tokens=5, thinking_tokens=3)
+    runner = ScriptedRunner(
+        [
+            SessionStarted("responses-stream"),
+            ReasoningDelta("think"),
+            TextDelta("Hello"),
+            TextDelta(" response"),
+            RunComplete(usage),
+        ]
+    )
+    client, http_client = _sdk_client(tmp_path, runner)
+    async with http_client:
+        stream = await client.responses.create(
+            model="factory-droid",
+            input="Hello",
+            stream=True,
+        )
+        events = [event async for event in stream]
+
+    event_types = [event.type for event in events]
+    assert event_types[0] == "response.created"
+    assert "response.reasoning_text.delta" in event_types
+    assert "response.output_text.delta" in event_types
+    assert event_types[-1] == "response.completed"
+    text = "".join(event.delta for event in events if event.type == "response.output_text.delta")
+    assert text == "Hello response"
+    completed = events[-1]
+    assert completed.type == "response.completed"
+    assert completed.response.output_text == "Hello response"
+    assert completed.response.usage is not None
+    assert completed.response.usage.output_tokens_details.reasoning_tokens == 3
 
 
 @pytest.mark.asyncio

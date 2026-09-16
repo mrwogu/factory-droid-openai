@@ -71,11 +71,14 @@ class ReplayRunner:
 
 
 def _usage(payload: dict[str, Any]) -> Usage:
-    details = payload.get("prompt_tokens_details") or {}
+    prompt_details = payload.get("prompt_tokens_details") or {}
+    completion_details = payload.get("completion_tokens_details") or {}
     return Usage(
         input_tokens=int(payload.get("prompt_tokens", 0)),
         output_tokens=int(payload.get("completion_tokens", 0)),
-        cache_read_tokens=int(details.get("cached_tokens", 0)),
+        cache_read_tokens=int(prompt_details.get("cached_tokens", 0)),
+        cache_write_tokens=int(prompt_details.get("cache_write_tokens", 0)),
+        thinking_tokens=int(completion_details.get("reasoning_tokens", 0)),
     )
 
 
@@ -88,7 +91,12 @@ def _event(record: dict[str, Any]) -> RunEvent:
     if kind == "usage":
         return UsageUpdate(_usage(record["usage"]))
     if kind == "run_complete":
-        return RunComplete(_usage(record["usage"]))
+        return RunComplete(
+            _usage(record["usage"]),
+            reasoning_details=tuple(
+                cast("list[dict[str, Any]]", record.get("reasoning_details") or ())
+            ),
+        )
     if kind == "status":
         return StatusUpdate(record["state"])
     if kind == "session_started":

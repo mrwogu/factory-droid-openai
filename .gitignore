@@ -12,6 +12,8 @@ htmlcov/
 __pycache__/
 *.py[cod]
 dist/
+outputs/
+tmp/
 .wrangler/
 traces/
 .playwright-mcp/

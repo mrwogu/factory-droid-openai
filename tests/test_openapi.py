@@ -56,6 +56,7 @@ def test_openapi_contract_documents_compatibility_surface(tmp_path: Path) -> Non
         "/v1/models",
         "/v1/models/{model_id}",
         "/v1/chat/completions",
+        "/v1/responses",
         "/v1/factory/sessions/{session_id}",
         "/v1/factory/sessions/{session_id}/compact",
         "/v1/factory/sessions/{session_id}/context",
@@ -81,6 +82,12 @@ def test_openapi_contract_documents_compatibility_surface(tmp_path: Path) -> Non
     }
     assert "Retry-After" in chat["responses"]["429"]["headers"]
     assert set(chat["responses"]["200"]["content"]) == {
+        "application/json",
+        "text/event-stream",
+    }
+    responses = paths["/v1/responses"]["post"]
+    assert responses["security"] == [{"HTTPBearer": []}]
+    assert set(responses["responses"]["200"]["content"]) == {
         "application/json",
         "text/event-stream",
     }

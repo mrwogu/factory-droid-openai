@@ -30,6 +30,7 @@ class ChatMessage(BaseModel):
     tool_calls: list[ToolCall] | None = None
     reasoning: str | None = None
     reasoning_content: str | None = None
+    reasoning_details: list[dict[str, Any]] | None = None
 
 
 class ToolFunction(BaseModel):
@@ -86,6 +87,7 @@ class UsageResponse(BaseModel):
     completion_tokens: int
     total_tokens: int
     prompt_tokens_details: dict[str, int]
+    completion_tokens_details: dict[str, int]
 
 
 class AssistantMessageResponse(BaseModel):
@@ -93,6 +95,7 @@ class AssistantMessageResponse(BaseModel):
     content: str | None
     reasoning: str | None = None
     reasoning_content: str | None = None
+    reasoning_details: list[dict[str, Any]] | None = None
     tool_calls: list[ToolCall] | None = None
 
 
@@ -184,6 +187,62 @@ class ChatCompletionRequest(BaseModel):
             return ()
         values = [self.stop] if isinstance(self.stop, str) else self.stop
         return tuple(value for value in values if value)
+
+
+class ResponsesReasoning(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    effort: str | None = None
+    summary: str | None = None
+
+
+class ResponsesRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    model: str
+    input: str | list[dict[str, Any]]
+    instructions: str | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: Any = None
+    stream: bool = False
+    reasoning: ResponsesReasoning | None = None
+    factory_droid_reasoning_effort: str | None = None
+    max_output_tokens: int | None = Field(default=None, gt=0)
+    parallel_tool_calls: bool = True
+    previous_response_id: str | None = None
+    store: bool = True
+    text: dict[str, Any] | None = None
+    timeout: float | None = Field(default=None, gt=0)
+
+
+class ResponsesUsageResponse(BaseModel):
+    input_tokens: int
+    input_tokens_details: dict[str, int]
+    output_tokens: int
+    output_tokens_details: dict[str, int]
+    total_tokens: int
+
+
+class ResponsesResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    object: Literal["response"] = "response"
+    created_at: float
+    completed_at: float | None = None
+    status: Literal["completed", "incomplete", "failed", "in_progress"]
+    error: dict[str, Any] | None = None
+    incomplete_details: dict[str, Any] | None = None
+    instructions: str | None = None
+    model: str
+    output: list[dict[str, Any]]
+    parallel_tool_calls: bool
+    tool_choice: Any
+    tools: list[dict[str, Any]]
+    previous_response_id: str | None = None
+    reasoning: dict[str, Any] | None = None
+    store: bool
+    usage: ResponsesUsageResponse | None = None
 
 
 class ContextStatsResponse(BaseModel):

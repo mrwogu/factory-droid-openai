@@ -1,0 +1,10 @@
+{"expect": "droid.initialize_session", "result": {"sessionId": "session-1", "session": {"id": "session-1"}, "settings": {"modelId": "claude-sonnet-4-5", "reasoningEffort": "high"}}}
+{"expect": "droid.list_tools", "result": {"tools": [{"id": "read-cli", "currentlyAllowed": true}, {"id": "exit-spec-mode", "currentlyAllowed": true}]}}
+{"expect": "droid.update_session_settings", "result": {}}
+{"expect": "droid.list_tools", "result": {"tools": [{"id": "read-cli", "currentlyAllowed": false}, {"id": "exit-spec-mode", "currentlyAllowed": false}]}}
+{"expect": "droid.add_user_message", "result": {}}
+{"frame": {"jsonrpc": "2.0", "factoryApiVersion": "1.0.0", "type": "notification", "method": "droid.session_notification", "params": {"notification": {"type": "create_message"}}}}
+{"frame": {"jsonrpc": "2.0", "factoryApiVersion": "1.0.0", "type": "notification", "method": "droid.session_notification", "params": {"notification": {"type": "create_message", "message": {"id": "message-1", "role": "user", "content": [{"type": "text", "text": "question"}], "createdAt": 1, "updatedAt": 2}}}}}
+{"frame": {"jsonrpc": "2.0", "factoryApiVersion": "1.0.0", "type": "notification", "method": "droid.session_notification", "params": {"notification": {"type": "assistant_text_delta", "messageId": "message-2", "blockIndex": 0, "textDelta": "answer"}}}}
+{"frame": {"jsonrpc": "2.0", "factoryApiVersion": "1.0.0", "type": "notification", "method": "droid.session_notification", "params": {"notification": {"type": "droid_working_state_changed", "newState": "streaming_assistant_message"}}}}
+{"frame": {"jsonrpc": "2.0", "factoryApiVersion": "1.0.0", "type": "notification", "method": "droid.session_notification", "params": {"notification": {"type": "droid_working_state_changed", "newState": "idle"}}}}

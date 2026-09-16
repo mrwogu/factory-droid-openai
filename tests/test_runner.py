@@ -17,6 +17,7 @@ from droid_sdk import (
     DroidClient,
     DroidClientError,
     ErrorEvent,
+    StreamMessage,
     ThinkingTextDelta,
     TokenUsageUpdate,
     ToolProgress,
@@ -33,6 +34,7 @@ from droid_sdk.schemas.enums import (
     DroidWorkingState,
     ReasoningEffort,
 )
+from droid_sdk.schemas.messages import FactoryDroidMessage
 
 from factory_droid_openai import runner as runner_module
 from factory_droid_openai.droid_rpc import NativeToolUnavailableError
@@ -62,6 +64,8 @@ from factory_droid_openai.runner import (
     _build_exec_args,
     _create_client,
     _ManagedProcessTransport,
+    _reasoning_details,
+    _reasoning_format,
     _run_until,
     model_family,
     sdk_error,
@@ -73,7 +77,12 @@ if TYPE_CHECKING:
 
 
 class FakeClient:
-    def __init__(self, events: list[object], *, session_id: str | None = "session-1") -> None:
+    def __init__(
+        self,
+        events: list[object],
+        *,
+        session_id: str | None = "session-1",
+    ) -> None:
         self.events = events
         self.connected = False
         self.closed = False
@@ -91,6 +100,7 @@ class FakeClient:
         self.rpc_requests: list[tuple[str, dict[str, Any], float | None]] = []
         self.disabled_tool_ids: set[str] = set()
         self.output_format: dict[str, Any] | None = None
+        self.notification_callbacks: list[tuple[Any, Any]] = []
         self._protocol = self
 
     def set_permission_handler(self, handler: Any) -> None:
@@ -98,6 +108,20 @@ class FakeClient:
 
     def set_ask_user_handler(self, handler: Any) -> None:
         self.ask_user_handler = handler
+
+    def on_notification(
+        self,
+        callback: Any,
+        *,
+        notification_type: Any = None,
+    ) -> Any:
+        entry = (callback, notification_type)
+        self.notification_callbacks.append(entry)
+
+        def unsubscribe() -> None:
+            self.notification_callbacks.remove(entry)
+
+        return unsubscribe
 
     async def connect(self) -> None:
         self.connected = True
@@ -190,6 +214,86 @@ def _request(**overrides: object) -> RunRequest:
     return RunRequest(**values)
 
 
+_WIRE_FIXTURES = Path(__file__).parent / "fixtures" / "wire"
+
+
+def _wire_script(name: str) -> list[dict[str, Any]]:
+    """Load a recorded Droid JSON-RPC wire stream, one frame per line."""
+    with (_WIRE_FIXTURES / name).open(encoding="utf-8") as stream:
+        return [json.loads(line) for line in stream if line.strip()]
+
+
+class _WireReplayTransport:
+    """Replays a recorded Droid wire stream into the real SDK client.
+
+    The transport answers recorded RPC requests in recorded order and
+    emits recorded notification frames afterwards; parsing, correlation,
+    and notification dispatch all stay inside droid_sdk.
+    """
+
+    def __init__(self, script: list[dict[str, Any]]) -> None:
+        self._script = script
+        self._connected = False
+        self._stream_started = asyncio.Event()
+        self.sent: list[dict[str, Any]] = []
+        self._request_ids: dict[str, list[str]] = {}
+        self._arrivals: dict[str, asyncio.Event] = {}
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    def stream_started(self) -> None:
+        self._stream_started.set()
+
+    async def connect(self) -> None:
+        self._connected = True
+
+    async def send(self, message: str) -> None:
+        envelope = json.loads(message)
+        self.sent.append(envelope)
+        method = envelope.get("method")
+        if isinstance(method, str):
+            self._request_ids.setdefault(method, []).append(str(envelope["id"]))
+            self._arrivals.setdefault(method, asyncio.Event()).set()
+
+    async def read_messages(self) -> AsyncIterator[dict[str, Any]]:
+        for entry in self._script:
+            if "expect" in entry:
+                method = str(entry["expect"])
+                await self._arrivals.setdefault(method, asyncio.Event()).wait()
+                self._arrivals[method].clear()
+                yield {
+                    "jsonrpc": "2.0",
+                    "factoryApiVersion": "1.0.0",
+                    "type": "response",
+                    "id": self._request_ids[method].pop(0),
+                    "result": entry["result"],
+                }
+            else:
+                # A live droid emits turn notifications only once the turn is
+                # under way; the recorded frames wait for the stream to
+                # attach at the same point.
+                await self._stream_started.wait()
+                yield entry["frame"]
+
+    async def close(self) -> None:
+        self._connected = False
+
+
+class _WireReplayClient(DroidClient):
+    """SDK client that unlatches its replay transport when streaming starts."""
+
+    def __init__(self, transport: _WireReplayTransport) -> None:
+        super().__init__(transport=transport)
+        self._replay_transport = transport
+
+    async def receive_response(self) -> AsyncIterator[StreamMessage]:
+        self._replay_transport.stream_started()
+        async for message in super().receive_response():
+            yield message
+
+
 @pytest.mark.asyncio
 async def test_runner_maps_sdk_stream_and_usage(tmp_path: Path) -> None:
     usage = TokenUsageUpdate(
@@ -271,6 +375,155 @@ async def test_runner_reports_newest_usage_snapshot_without_summing(tmp_path: Pa
         Usage(2000, 25, 6, 8),
     ]
     assert events[-1] == RunComplete(Usage(2000, 25, 6, 8))
+
+
+@pytest.mark.asyncio
+async def test_runner_maps_thinking_usage_and_signed_blocks(tmp_path: Path) -> None:
+    # A recorded Droid wire stream drives the real SDK client, so the
+    # notification parsing and dispatch under test are the SDK's own.
+    transport = _WireReplayTransport(_wire_script("runner-notifications--factory-droid.jsonl"))
+    client = _WireReplayClient(transport)
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    events = [event async for event in runner.run(_request())]
+
+    # The SDK derives the terminal TurnComplete from the working-state
+    # transition, so the stream also carries the raw state changes.
+    assert [event for event in events if isinstance(event, UsageUpdate)] == [
+        UsageUpdate(Usage(12, 12, 3, 2, 7))
+    ]
+    assert events[-1] == RunComplete(
+        Usage(12, 12, 3, 2, 7),
+        reasoning_details=(
+            {
+                "type": "reasoning.text",
+                "text": "private summary",
+                "signature": "signed-state",
+                "id": "thinking-1",
+                "format": "anthropic-claude-v1",
+                "index": 0,
+            },
+            {
+                "type": "reasoning.encrypted",
+                "data": "encrypted-state",
+                "id": "thinking-2",
+                "format": "anthropic-claude-v1",
+                "index": 1,
+            },
+        ),
+    )
+    # The runner unsubscribes its notification callbacks when the run ends.
+    assert client._notification_listeners == []
+
+
+def test_reasoning_details_maps_provider_metadata() -> None:
+    message = FactoryDroidMessage.model_validate(
+        {
+            "id": "message-1",
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "answer"},
+                {
+                    "type": "tool_use",
+                    "id": "tool-1",
+                    "name": "weather",
+                    "input": {},
+                    "thoughtSignature": "gemini-tool-state",
+                },
+                {
+                    "type": "tool_use",
+                    "id": "tool-2",
+                    "name": "weather",
+                    "input": {},
+                    "thoughtSignature": "gemini-tool-state",
+                },
+                {
+                    "type": "thinking",
+                    "thinking": "thought",
+                    "signature": "",
+                    "signatureProvider": "google",
+                },
+            ],
+            "createdAt": 1,
+            "updatedAt": 2,
+            "openaiReasoningId": "openai-reasoning",
+            "openaiReasoningSummary": "summary",
+            "openaiEncryptedContent": "openai-state",
+            "geminiThoughtSignature": "gemini-message-state",
+        }
+    )
+
+    details = _reasoning_details(message)
+
+    assert _reasoning_details(None) == ()
+    assert [detail["type"] for detail in details] == [
+        "reasoning.summary",
+        "reasoning.encrypted",
+        "reasoning.encrypted",
+        "reasoning.text",
+        "reasoning.encrypted",
+    ]
+    assert details[2]["data"] == "gemini-tool-state"
+    assert details[3]["signature"] is None
+    assert details[3]["format"] == "google-gemini-v1"
+    assert details[4]["data"] == "gemini-message-state"
+    assert _reasoning_format("openai") == "openai-responses-v1"
+    assert _reasoning_format("other") == "unknown"
+
+
+def test_reasoning_details_preserves_chat_completion_metadata() -> None:
+    message = FactoryDroidMessage.model_validate(
+        {
+            "id": "message-1",
+            "role": "assistant",
+            "content": [],
+            "createdAt": 1,
+            "updatedAt": 2,
+            "openaiReasoningId": "reasoning-1",
+            "chatCompletionReasoningField": "reasoning_content",
+            "chatCompletionReasoningContent": "provider thought",
+        }
+    )
+
+    assert _reasoning_details(message) == (
+        {
+            "type": "reasoning.text",
+            "text": "provider thought",
+            "signature": None,
+            "id": "reasoning-1",
+            "format": "unknown",
+            "field": "reasoning_content",
+            "index": 0,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_ignores_invalid_and_non_assistant_notifications(
+    tmp_path: Path,
+) -> None:
+    # A recorded Droid wire stream drives the real SDK client: the invalid
+    # and user-role create_message frames are dropped by the SDK's own
+    # parsing and conversion path, and the runner's callback skips them too.
+    transport = _WireReplayTransport(
+        _wire_script("runner-notifications-ignored--factory-droid.jsonl")
+    )
+    client = _WireReplayClient(transport)
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    events = [event async for event in runner.run(_request())]
+
+    assert [event for event in events if isinstance(event, TextDelta)] == [TextDelta("answer")]
+    assert events[-1] == RunComplete(Usage())
+    assert client._notification_listeners == []
 
 
 @pytest.mark.asyncio

@@ -51,6 +51,8 @@ from factory_droid_openai.models import (
     ModelInfo,
     ModelListResponse,
     RenameSessionRequest,
+    ResponsesRequest,
+    ResponsesResponse,
     SessionContextResponse,
     SessionOperationResponse,
     VersionResponse,
@@ -72,6 +74,13 @@ from factory_droid_openai.protocol import (
     build_prompt,
     parse_strict_json,
 )
+from factory_droid_openai.responses import (
+    build_responses_plan,
+    continuation_references_from_chat,
+    reasoning_details_digest,
+    response_from_chat,
+    response_stream_from_chat,
+)
 from factory_droid_openai.runner import (
     DroidModel,
     DroidRunner,
@@ -90,6 +99,7 @@ from factory_droid_openai.runner import (
     model_family,
     normalize_reasoning_effort,
 )
+from factory_droid_openai.sse import sse as _sse
 from factory_droid_openai.strictjson import (
     DuplicateKeyError,
     JsonNestingError,
@@ -166,13 +176,14 @@ _FALLBACK_SAFETY_FACTOR = 2
 _OUTPUT_LIMIT_TRUNCATION = "output token limit reached"
 _CHAT_COMPLETED_EVENT = "chat.completed"
 _RESPONSE_CACHE_DISABLED_EVENT = "response_cache.disabled"
+_EVENT_STREAM_MEDIA_TYPE = "text/event-stream"
 
 CHAT_COMPLETION_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {
         "model": ChatCompletionResponse,
         "description": "A JSON completion or an SSE completion stream.",
         "content": {
-            "text/event-stream": {
+            _EVENT_STREAM_MEDIA_TYPE: {
                 "schema": {"type": "string"},
                 "example": 'data: {"object":"chat.completion.chunk",...}\n\ndata: [DONE]\n\n',
             }
@@ -216,6 +227,19 @@ CHAT_COMPLETION_RESPONSES: dict[int | str, dict[str, Any]] = {
         "model": ErrorResponse,
         "description": "Droid request timeout.",
     },
+}
+RESPONSES_API_RESPONSES: dict[int | str, dict[str, Any]] = {
+    200: {
+        "model": ResponsesResponse,
+        "description": "A JSON response or an SSE response event stream.",
+        "content": {
+            _EVENT_STREAM_MEDIA_TYPE: {
+                "schema": {"type": "string"},
+                "example": 'data: {"type":"response.output_text.delta",...}\n\n',
+            }
+        },
+    },
+    **{status: response for status, response in CHAT_COMPLETION_RESPONSES.items() if status != 200},
 }
 
 FACTORY_OPERATION_RESPONSES: dict[int | str, dict[str, Any]] = {
@@ -378,10 +402,13 @@ class SessionRegistry:
     and read their contents back out through the completion.
     """
 
-    def __init__(self, max_entries: int) -> None:
+    def __init__(self, max_entries: int, max_references: int) -> None:
         self._max_entries = max_entries
+        self._max_references = max_references
         self._sessions: OrderedDict[str, SessionKey] = OrderedDict()
         self._in_use: set[str] = set()
+        self._references: dict[tuple[str, str], str] = {}
+        self._session_references: dict[str, OrderedDict[tuple[str, str], None]] = {}
 
     def remember(self, session_id: str, key: SessionKey) -> None:
         self._sessions.pop(session_id, None)
@@ -400,7 +427,7 @@ class SessionRegistry:
             )
             if candidate is None:
                 return
-            self._sessions.pop(candidate)
+            self.forget(candidate)
 
     def key(self, session_id: str) -> SessionKey | None:
         key = self._sessions.get(session_id)
@@ -411,6 +438,41 @@ class SessionRegistry:
 
     def forget(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)
+        for reference in self._session_references.pop(session_id, ()):
+            self._references.pop(reference, None)
+
+    def remember_reference(
+        self,
+        kind: str,
+        value: str,
+        session_id: str,
+    ) -> None:
+        if session_id not in self._sessions or not value:
+            return
+        reference = (kind, value)
+        previous = self._references.get(reference)
+        if previous is not None and previous != session_id:
+            self._session_references[previous].pop(reference, None)
+        self._references[reference] = session_id
+        # Ordered like the session LRU itself: a refreshed reference moves
+        # to the MRU end, so trimming always drops the oldest entry instead
+        # of an arbitrary one.
+        session_references = self._session_references.setdefault(
+            session_id,
+            OrderedDict(),
+        )
+        session_references.pop(reference, None)
+        session_references[reference] = None
+        while len(session_references) > self._max_references:
+            stale, _ = session_references.popitem(last=False)
+            self._references.pop(stale, None)
+
+    def session_for_reference(self, kind: str, value: str) -> str | None:
+        session_id = self._references.get((kind, value))
+        if session_id is None or session_id not in self._sessions:
+            return None
+        self._sessions.move_to_end(session_id)
+        return session_id
 
     def acquire(self, session_id: str) -> SessionUseLease | None:
         if session_id in self._in_use:
@@ -792,6 +854,12 @@ class RequestSizeLimitMiddleware:
             )
 
 
+class CompletionJSONResponse(JSONResponse):
+    def __init__(self, content: dict[str, Any], *, headers: dict[str, str]) -> None:
+        self.json_body = content
+        super().__init__(content, headers=headers)
+
+
 class FinalizingStreamingResponse(StreamingResponse):
     def __init__(
         self,
@@ -851,7 +919,10 @@ def create_app(
         )
     )
     bridge_created = int(time.time())
-    sessions = SessionRegistry(resolved_settings.max_tracked_sessions)
+    sessions = SessionRegistry(
+        resolved_settings.max_tracked_sessions,
+        resolved_settings.max_session_references,
+    )
     quarantine = ModelQuarantine(ttl_seconds=resolved_settings.model_quarantine_seconds)
     admission = AdmissionController(
         max_concurrency=resolved_settings.max_concurrency,
@@ -1120,6 +1191,57 @@ def create_app(
                 error_type="session_not_found",
             )
         return key
+
+    def automatic_session(
+        references: Sequence[tuple[str, str]],
+        requested_key: SessionKey,
+    ) -> str | None:
+        if not resolved_settings.auto_reasoning_continuity:
+            return None
+        matched_session: str | None = None
+        for kind, value in references:
+            session_id = sessions.session_for_reference(kind, value)
+            if session_id is None or sessions.key(session_id) != requested_key:
+                continue
+            if matched_session is not None and matched_session != session_id:
+                raise BridgeHTTPError(
+                    "Continuation references belong to different Droid sessions.",
+                    status_code=400,
+                    error_type="invalid_request_error",
+                )
+            matched_session = session_id
+        return matched_session
+
+    def remember_automatic_references(
+        session_id: str,
+        message: dict[str, Any],
+        *,
+        response_id: str | None = None,
+        reasoning_item_id: str | None = None,
+    ) -> None:
+        if not resolved_settings.auto_reasoning_continuity:
+            return
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for call in cast("list[dict[str, Any]]", tool_calls):
+                sessions.remember_reference(
+                    "tool_call",
+                    cast("str", call["id"]),
+                    session_id,
+                )
+        details = message.get("reasoning_details")
+        if isinstance(details, list):
+            digest = reasoning_details_digest(cast("list[dict[str, Any]]", details))
+            if digest is not None:
+                sessions.remember_reference("reasoning", digest, session_id)
+        if response_id is not None:
+            sessions.remember_reference("response", response_id, session_id)
+        if reasoning_item_id is not None:
+            sessions.remember_reference(
+                "reasoning_item",
+                reasoning_item_id,
+                session_id,
+            )
 
     def acquire_session_use(session_id: str) -> SessionUseLease:
         lease = sessions.acquire(session_id)
@@ -1455,6 +1577,62 @@ def create_app(
                     400,
                     "invalid_request_error",
                 )
+        else:
+            references = list(continuation_references_from_chat(payload))
+            response_references = getattr(
+                request.state,
+                "responses_continuation_references",
+                (),
+            )
+            references.extend(cast("tuple[tuple[str, str], ...]", response_references))
+            previous_response_id = getattr(
+                request.state,
+                "responses_previous_response_id",
+                None,
+            )
+            if isinstance(previous_response_id, str):
+                session_id = (
+                    sessions.session_for_reference("response", previous_response_id)
+                    if resolved_settings.auto_reasoning_continuity
+                    else None
+                )
+                if session_id is None:
+                    request.state.telemetry_error_type = "session_not_found"
+                    return _error_response(
+                        "Unknown previous_response_id. Responses state is local to "
+                        "this bridge process.",
+                        404,
+                        "session_not_found",
+                    )
+                if sessions.key(session_id) != requested_key:
+                    request.state.telemetry_error_type = "invalid_request_error"
+                    return _error_response(
+                        "The previous response settings do not match the request. "
+                        "Start a new response to switch model or reasoning effort.",
+                        400,
+                        "invalid_request_error",
+                    )
+                for kind, value in references:
+                    referenced_session = sessions.session_for_reference(kind, value)
+                    if referenced_session is not None and referenced_session != session_id:
+                        request.state.telemetry_error_type = "invalid_request_error"
+                        return _error_response(
+                            "Continuation references belong to different Droid sessions.",
+                            400,
+                            "invalid_request_error",
+                        )
+            else:
+                session_id = automatic_session(references, requested_key)
+        if session_id is not None and payload.n > 1:
+            # _validate_options only guards the explicit factory_droid_session_id
+            # field, which is still None here when continuation was automatic.
+            request.state.telemetry_error_type = "invalid_request_error"
+            log_warning("chat.rejected", status=400, phase="session_settings")
+            return _error_response(
+                "n greater than 1 cannot continue an existing Factory Droid session.",
+                400,
+                "invalid_request_error",
+            )
 
         try:
             structured = _prepare_output_format(
@@ -1515,7 +1693,11 @@ def create_app(
         if reasoning_effort is not None:
             features.append("reasoning_effort")
         if session_id is not None:
-            features.append("session_continuity")
+            features.append(
+                "session_continuity"
+                if payload.factory_droid_session_id is not None
+                else "automatic_reasoning_continuity"
+            )
         if payload.n > 1:
             features.append("multiple_choices")
         metrics.record_features(tuple(features))
@@ -1524,10 +1706,17 @@ def create_app(
         # warm pool, admission, and the runner entirely. The response envelope
         # (id, created, headers) is regenerated per hit; only the choices and
         # usage are replayed. Continuation requests can never reach this
-        # lookup: continuity-on disables the cache entirely, and continuity-off
-        # rejects the session id upstream.
+        # lookup: explicit continuity disables the cache at startup, an
+        # automatically resolved session excludes the key here, and
+        # /v1/responses never caches.
         cache_key: str | None = None
-        if response_cache is not None and not payload.stream and payload.n == 1:
+        if (
+            response_cache is not None
+            and not payload.stream
+            and payload.n == 1
+            and session_id is None
+            and not hasattr(request.state, "responses_response_id")
+        ):
             cache_key = response_cache_key(
                 model=payload.model,
                 reasoning_effort=reasoning_effort,
@@ -1576,7 +1765,7 @@ def create_app(
                     output_tokens=replayed["usage"]["completion_tokens"],
                     **timeline.fields(),
                 )
-                return JSONResponse(
+                return CompletionJSONResponse(
                     {
                         "id": request_id,
                         "object": "chat.completion",
@@ -1773,6 +1962,36 @@ def create_app(
                 }:
                     sessions.remember(started_stream_session, requested_key)
 
+            def record_stream_references(
+                references: tuple[tuple[str, str], ...],
+            ) -> None:
+                if started_stream_session is None:
+                    return
+                for kind, value in references:
+                    sessions.remember_reference(
+                        kind,
+                        value,
+                        started_stream_session,
+                    )
+                response_id = getattr(request.state, "responses_response_id", None)
+                if isinstance(response_id, str):
+                    sessions.remember_reference(
+                        "response",
+                        response_id,
+                        started_stream_session,
+                    )
+                reasoning_item_id = getattr(
+                    request.state,
+                    "responses_reasoning_item_id",
+                    None,
+                )
+                if isinstance(reasoning_item_id, str):
+                    sessions.remember_reference(
+                        "reasoning_item",
+                        reasoning_item_id,
+                        started_stream_session,
+                    )
+
             def record_stream_completion(empty: bool) -> None:
                 if empty:
                     metrics.increment_empty_completions()
@@ -1811,10 +2030,15 @@ def create_app(
                 drain_seconds=resolved_settings.tool_call_drain_seconds,
                 trace_event=payload_tracer.trace,
                 output_token_limit=output_token_limit,
+                reference_callback=(
+                    record_stream_references
+                    if resolved_settings.auto_reasoning_continuity
+                    else None
+                ),
             )
             return FinalizingStreamingResponse(
                 event_stream,
-                media_type="text/event-stream",
+                media_type=_EVENT_STREAM_MEDIA_TYPE,
                 finalizer=lambda: _finalize_stream(
                     event_stream,
                     lease,
@@ -2043,9 +2267,26 @@ def create_app(
                     choice = _choice_dict(completed_result, index)
                     choices.append(choice)
                     choice_message = cast("dict[str, Any]", choice["message"])
+                    if completed_result.session_id is not None:
+                        remember_automatic_references(
+                            completed_result.session_id,
+                            choice_message,
+                            response_id=getattr(
+                                request.state,
+                                "responses_response_id",
+                                None,
+                            ),
+                            reasoning_item_id=getattr(
+                                request.state,
+                                "responses_reasoning_item_id",
+                                None,
+                            ),
+                        )
                     if (
                         choice_message["content"] is None
                         and not choice_message.get("tool_calls")
+                        and not completed_result.reasoning
+                        and not completed_result.reasoning_details
                         and not completed_result.stopped
                         and not completed_result.output_capped
                     ):
@@ -2140,12 +2381,15 @@ def create_app(
             headers["x-factory-droid-session-id"] = started_session
 
         if cache_key is not None and response_cache is not None and cacheable_result:
-            # Session continuity is off whenever the cache exists, so the
-            # stored payload can never carry a factory_droid_session_id.
+            # A hit is replayed to any caller with the same fingerprint, so
+            # signed reasoning_details must not survive into the cache: their
+            # digest is a live continuation reference into the original
+            # caller's Droid session. Continuity being off means the stored
+            # payload can never carry a factory_droid_session_id either.
             response_cache.put(
                 cache_key,
                 json.dumps(
-                    {"choices": choices, "usage": body["usage"]},
+                    {"choices": _cached_choices(choices), "usage": body["usage"]},
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ).encode("utf-8"),
@@ -2155,7 +2399,74 @@ def create_app(
                 entry_count=response_cache.entry_count,
             )
 
-        return JSONResponse(body, headers=headers)
+        return CompletionJSONResponse(body, headers=headers)
+
+    @application.post(
+        "/v1/responses",
+        dependencies=[Depends(require_auth)],
+        response_model=None,
+        responses=RESPONSES_API_RESPONSES,
+        tags=["OpenAI compatibility"],
+        summary="Create a model response",
+    )
+    async def create_response(
+        payload: ResponsesRequest,
+        request: Request,
+        priority_header: Annotated[str | None, Header(alias=_PRIORITY_HEADER)] = None,
+    ) -> JSONResponse | StreamingResponse:
+        try:
+            plan = build_responses_plan(payload)
+        except ValueError as exc:
+            request.state.telemetry_error_type = "invalid_request_error"
+            return _error_response(str(exc), 400, "invalid_request_error")
+
+        request.state.responses_continuation_references = plan.continuation_references
+        request.state.responses_previous_response_id = payload.previous_response_id
+        request.state.responses_response_id = plan.response_id
+        request.state.responses_reasoning_item_id = plan.reasoning_item_id
+
+        chat_response = await chat_completions(
+            plan.chat_request,
+            request,
+            priority_header,
+        )
+        if not payload.stream:
+            if not isinstance(chat_response, CompletionJSONResponse):
+                return cast("JSONResponse", chat_response)
+            try:
+                response_body = response_from_chat(payload, plan, chat_response.json_body)
+            except (TypeError, ValueError) as exc:
+                request.state.telemetry_error_type = "factory_protocol_error"
+                return _error_response(str(exc), 502, "factory_protocol_error")
+            return JSONResponse(
+                response_body,
+                headers={"x-request-id": chat_response.headers["x-request-id"]},
+            )
+
+        if isinstance(chat_response, JSONResponse):
+            return chat_response
+        chat_response = cast("FinalizingStreamingResponse", chat_response)
+        chat_stream = cast("AsyncIterator[str]", chat_response.body_iterator)
+        response_stream = response_stream_from_chat(
+            payload,
+            plan,
+            chat_stream,
+            created_at=time.time(),
+        )
+        return FinalizingStreamingResponse(
+            response_stream,
+            media_type=_EVENT_STREAM_MEDIA_TYPE,
+            finalizer=chat_response._finalizer,
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                **(
+                    {"x-request-id": chat_response.headers["x-request-id"]}
+                    if "x-request-id" in chat_response.headers
+                    else {}
+                ),
+            },
+        )
 
     return application
 
@@ -2250,6 +2561,7 @@ class CollectedCompletion:
     def __init__(self) -> None:
         self.text_parts: list[str] = []
         self.reasoning_parts: list[str] = []
+        self.reasoning_details: list[dict[str, Any]] = []
         self.tool_calls: list[dict[str, Any]] = []
         self.usage = Usage()
         self.completed = False
@@ -2634,6 +2946,7 @@ async def _collect_completion(
                     break
             elif isinstance(event, RunComplete):
                 result.usage = event.usage
+                result.reasoning_details = list(event.reasoning_details)
                 if token_cap.record_usage(event.usage):
                     # The turn ended on its own past the limit; the completion
                     # still reports length so the client can see the cap hit.
@@ -2768,8 +3081,10 @@ async def _stream_completion(
     drain_seconds: float = DEFAULT_TOOL_CALL_DRAIN_SECONDS,
     trace_event: Callable[..., None] | None = None,
     output_token_limit: int | None = None,
+    reference_callback: Callable[[tuple[tuple[str, str], ...]], None] | None = None,
 ) -> AsyncIterator[str]:
     usage = Usage()
+    reasoning_details: list[dict[str, Any]] = []
     warm_age_ms = _warm_session_age_ms(run_request)
     completed = False
     capped = False
@@ -2781,6 +3096,7 @@ async def _stream_completion(
     stop_buffer = StopSequenceBuffer(stop_sequences)
     token_cap = OutputTokenCap(output_token_limit)
     tool_call_index = 0
+    tool_call_ids: list[str] = []
     pending_tool_calls: list[ToolCallEmission] = []
     structured_buffer = (
         StructuredOutputBuffer(structured.max_bytes) if structured is not None else None
@@ -2790,6 +3106,7 @@ async def _stream_completion(
         nonlocal tool_call_index
         while pending_tool_calls:
             emission = pending_tool_calls.pop(0)
+            tool_call_ids.append(emission.id)
             yield _sse(
                 _chunk_for_emission(
                     request_id,
@@ -2928,6 +3245,7 @@ async def _stream_completion(
                             break
                     elif isinstance(event, RunComplete):
                         usage = event.usage
+                        reasoning_details = list(event.reasoning_details)
                         if token_cap.record_usage(event.usage):
                             # The turn ended on its own past the limit; the
                             # stream still finishes with length so the client
@@ -2991,6 +3309,16 @@ async def _stream_completion(
                     )
                 )
                 saw_output = saw_output or bool(structured_text)
+            if reasoning_details:
+                yield _sse(
+                    _chunk(
+                        request_id,
+                        created,
+                        model,
+                        delta={"reasoning_details": reasoning_details},
+                        include_usage=include_usage,
+                    )
+                )
             if capped:
                 if not saw_tool_call:
                     outcome = "truncated"
@@ -3147,11 +3475,22 @@ async def _stream_completion(
             raise
         if outcome_callback is not None:
             outcome_callback(outcome)
+        if reference_callback is not None and outcome in {
+            "success",
+            "truncated",
+            "malformed",
+        }:
+            references = [("tool_call", call_id) for call_id in tool_call_ids]
+            digest = reasoning_details_digest(reasoning_details)
+            if digest is not None:
+                references.append(("reasoning", digest))
+            reference_callback(tuple(references))
         if completion_callback is not None:
             if outcome == "success":
                 completion_callback(
-                    not saw_text
+                    not saw_output
                     and not saw_tool_call
+                    and not reasoning_details
                     and structured is None
                     and not stop_buffer.triggered
                 )
@@ -3510,6 +3849,8 @@ def _choice_dict(result: CollectedCompletion, index: int) -> dict[str, Any]:
     if result.reasoning:
         message["reasoning"] = result.reasoning
         message["reasoning_content"] = result.reasoning
+    if result.reasoning_details:
+        message["reasoning_details"] = result.reasoning_details
     if result.tool_calls:
         message["tool_calls"] = result.tool_calls
     finish_reason = "stop"
@@ -3533,7 +3874,25 @@ def _add_usage(left: Usage, right: Usage) -> Usage:
         output_tokens=left.output_tokens + right.output_tokens,
         cache_read_tokens=left.cache_read_tokens + right.cache_read_tokens,
         cache_write_tokens=left.cache_write_tokens + right.cache_write_tokens,
+        thinking_tokens=left.thinking_tokens + right.thinking_tokens,
     )
+
+
+def _cached_choices(choices: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # Cache entries are shared across callers, so continuity references must
+    # be removed before storing; see the response_cache.put call site.
+    sanitized: list[dict[str, Any]] = []
+    for choice in choices:
+        message = choice.get("message")
+        if not isinstance(message, dict) or "reasoning_details" not in message:
+            sanitized.append(choice)
+            continue
+        stripped = dict(choice)
+        stripped_message = dict(message)
+        stripped_message.pop("reasoning_details", None)
+        stripped["message"] = stripped_message
+        sanitized.append(stripped)
+    return sanitized
 
 
 def _usage_dict(usage: Usage) -> dict[str, Any]:
@@ -3543,12 +3902,12 @@ def _usage_dict(usage: Usage) -> dict[str, Any]:
         "total_tokens": usage.input_tokens + usage.output_tokens,
         "prompt_tokens_details": {
             "cached_tokens": usage.cache_read_tokens,
+            "cache_write_tokens": usage.cache_write_tokens,
+        },
+        "completion_tokens_details": {
+            "reasoning_tokens": usage.thinking_tokens,
         },
     }
-
-
-def _sse(data: dict[str, Any]) -> str:
-    return f"data: {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}\n\n"
 
 
 def _error_body(message: str, error_type: str) -> dict[str, Any]:
@@ -3711,6 +4070,8 @@ def _request_route(scope: Scope) -> str:
         return "models"
     if path == "/v1/chat/completions":
         return "chat_completions"
+    if path == "/v1/responses":
+        return "responses"
     if path.startswith("/v1/factory/sessions/"):
         return "session_operation"
     return "other"

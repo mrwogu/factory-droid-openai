@@ -8,7 +8,8 @@
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
 Use your [Factory Droid](https://www.factory.ai/) models in VS Code, Cursor,
-Continue, Aider, Zed - any tool that speaks the OpenAI Chat Completions API.
+Continue, Aider, Zed - any tool that speaks the OpenAI Chat Completions or
+Responses API.
 
 This bridge runs locally on your machine. It translates between OpenAI's
 API format and Factory Droid, so your tools talk to `http://127.0.0.1:8787/v1`
@@ -152,16 +153,17 @@ factory-droid-openai
 | OpenAI capability | Status | Bridge behavior |
 |---|---|---|
 | Text chat completions | ✅ | Returns one or more assistant choices |
+| Responses create API | ✅ | Text, function tools, reasoning items, `previous_response_id`, and streaming |
 | System and developer messages | ✅ | Serialized with the complete transcript |
 | Non-streaming responses | ✅ | OpenAI-compatible JSON completion |
-| Streaming responses | ✅ | SSE chunks followed by `[DONE]` |
+| Streaming responses | ✅ | Chat uses chunks plus `[DONE]`; Responses uses typed SSE events |
 | Function tool schemas | ✅ | Serialized into the strict Droid prompt |
 | Tool choice | ✅ | `auto`, `none`, `required`, or one named function |
-| Tool-result continuation | ✅ | Client resends the complete transcript on the next request |
+| Tool-result continuation | ✅ | Matching `tool_call_id` automatically resumes the Droid session |
 | Parallel tool calls | ✅ | Several sequential tool calls per turn, bounded by a configured cap |
 | Stop sequences | ✅ | `stop` truncates the reply and interrupts the Droid turn |
-| Reasoning output | ✅ | Emitted as `reasoning` and `reasoning_content` |
-| Token usage | ⚠️ | Cache read and write details included; counts are Droid's session counters, not per-request accounting |
+| Reasoning output | ✅ | Text plus signed or encrypted `reasoning_details` when Droid provides them |
+| Token usage | ⚠️ | Cache and `reasoning_tokens` details included; counts are Droid's session counters, not per-request accounting |
 | Model selection | ✅ | `/v1/models` discovers the authenticated account's current catalog |
 | Multimodal content | ⚠️ | Inline image and file data URIs use SDK attachments; remote URLs are rejected |
 | Structured outputs | ✅ | `json_schema` and `json_object` are enforced by Droid and validated by the bridge |
@@ -178,7 +180,7 @@ factory-droid-openai
 
 | API family | Status |
 |---|---|
-| Responses API | ❌ |
+| Responses retrieval, deletion, background mode, and conversations | ❌ |
 | Embeddings | ❌ |
 | Images | ❌ |
 | Audio | ❌ |
@@ -191,12 +193,13 @@ factory-droid-openai
 ## Features
 
 - OpenAI-compatible `POST /v1/chat/completions`
+- OpenAI-compatible `POST /v1/responses`
 - Dynamic OpenAI-compatible `GET /v1/models`
 - Non-streaming JSON responses
-- Streaming server-sent events with `[DONE]` termination
+- Streaming server-sent events: Chat chunks end with `[DONE]`, Responses with typed terminal events
 - System, developer, user, assistant, and tool message mapping
 - Function tool schemas and validated tool-call responses
-- Reasoning delta and token usage mapping
+- Signed reasoning blocks, reasoning deltas, and thinking-token usage
 - Optional constant-time bearer authentication
 - Bounded request timeout, payload size, and process concurrency
 - Queue-based admission control and Prometheus-style metrics
@@ -204,7 +207,7 @@ factory-droid-openai
 - Structured phase-timed logging in text or JSON
 - Inline image and document attachments over the native SDK channel
 - Stop sequences, `n` choices, and multiple tool calls per turn
-- Optional Droid session continuity across requests
+- Automatic reasoning and tool-loop continuity, plus explicit session continuity
 - Opt-in exact-match response cache for cyclic repeated completions
 - Guarded context, compaction, fork, rename, and close session extensions
 - Client disconnect cancellation
@@ -217,7 +220,7 @@ factory-droid-openai
 ```text
 OpenAI client
     |
-    | POST /v1/chat/completions
+    | POST /v1/chat/completions or /v1/responses
     v
 Factory Droid OpenAI Bridge
     |
@@ -231,10 +234,11 @@ Factory Droid
 ```
 
 Factory's SDK controls a complete Droid agent rather than exposing a raw model
-inference endpoint. The bridge uses a fresh Droid session for each completion,
-serializes the complete OpenAI transcript into one prompt, and maps Droid stream
-events back to OpenAI response objects. Sessions are started ahead of time and
-kept warm, so the startup cost stays off the request path; see
+inference endpoint. Independent requests use fresh Droid sessions and serialize
+the complete OpenAI transcript into one prompt. Tool results, signed reasoning,
+and known Responses IDs resume their originating session. Droid stream events
+map back to OpenAI response objects. Fresh sessions are started ahead of time
+and kept warm, so startup cost stays off the request path; see
 [Warm sessions](#warm-sessions).
 
 External tools use a strict text protocol. Droid emits:
@@ -245,7 +249,8 @@ External tools use a strict text protocol. Droid emits:
 
 The bridge validates the tool name and JSON arguments, then returns a standard
 OpenAI `tool_calls` object. The OpenAI client executes the tool and sends its
-result in the next request.
+result in the next request. The emitted call ID binds that follow-up to the
+same Droid session.
 
 Tool names follow the OpenAI constraint: 1 to 64 characters of `A-Z`, `a-z`,
 `0-9`, `_` or `-`. A name with a dot, a colon, or any other character is
@@ -1109,6 +1114,7 @@ ID from `GET /v1/models`.
 | `GET` | `/v1/models` | Bridge alias and dynamically discovered Droid models |
 | `GET` | `/v1/models/{model_id}` | One model, or `404 model_not_found` |
 | `POST` | `/v1/chat/completions` | Chat completions and streaming |
+| `POST` | `/v1/responses` | Responses create API and event streaming |
 | `GET` | `/v1/factory/sessions/{id}/context` | Context statistics and breakdown |
 | `POST` | `/v1/factory/sessions/{id}/compact` | Compact history into a new session |
 | `POST` | `/v1/factory/sessions/{id}/fork` | Fork a session with context preserved |
@@ -1133,8 +1139,8 @@ Tests compare the committed document with FastAPI's generated schema. CI also
 validates it independently with `openapi-spec-validator`, so malformed or
 stale API contracts fail automatically. The contract covers the implemented
 OpenAI-compatible subset, not the complete OpenAI platform. Separate contract
-tests exercise models, non-streaming chat, streaming chat, usage, and function
-tool calls through the official `openai` Python client.
+tests exercise models, Chat Completions, Responses, streaming, usage, and
+function tool calls through the official `openai` Python client.
 
 ### Request fields
 
@@ -1247,7 +1253,34 @@ Supported values follow `droid-sdk-python`:
 - `max`
 
 Reasoning text appears as both `reasoning` and `reasoning_content` for broad
-client compatibility.
+client compatibility. When Droid exposes provider metadata, the assistant
+message also contains OpenRouter-compatible `reasoning_details`. Supported
+detail formats include `anthropic-claude-v1`, `google-gemini-v1`, and
+`openai-responses-v1`. Signed and encrypted values stay opaque and unchanged.
+
+`usage.completion_tokens` includes visible output and thinking tokens.
+`usage.completion_tokens_details.reasoning_tokens` reports the thinking part.
+
+### Responses API
+
+`POST /v1/responses` uses the same bounded Droid execution and fail-closed tool
+parser as Chat Completions. It supports:
+
+- string and message-list input
+- inline image and file data URIs
+- function tools and `function_call_output`
+- `reasoning.effort` and `factory_droid_reasoning_effort`
+- `max_output_tokens`, parallel tool calls, and structured text formats
+- non-streaming responses and Responses SSE events
+- process-local continuation with `previous_response_id`
+
+Only function tools are supported. Built-in OpenAI tools, remote media,
+background responses, Conversations, prompt templates, retrieval, cancellation,
+and deletion are not implemented. `reasoning.summary` (`auto`, `concise`,
+`detailed`) is accepted and echoed but not forwarded to Droid. `store` is
+echoed and ignored; the bridge does not persist responses. `previous_response_id`
+works only while the same bridge process still tracks the Droid session.
+Unknown or expired IDs return `404 session_not_found`.
 
 ### Multimodal attachments
 
@@ -1282,9 +1315,22 @@ depends on the selected Droid model.
 
 ### Session continuity
 
-By default every request creates a new Droid session and serializes the whole
-transcript. Setting `FACTORY_DROID_OPENAI_SESSION_CONTINUITY=true` lets a
-client continue an existing session instead, so only the new turn is sent:
+Ordinary independent requests create a new Droid session. By default the
+bridge automatically resumes a tracked session when a request returns one of
+its tool results, echoes signed `reasoning_details`, or uses a known Responses
+`previous_response_id`. This lets the provider retain native reasoning and
+reuse KV-cache prefixes across tool loops without client-specific fields.
+
+Set `FACTORY_DROID_OPENAI_AUTO_REASONING_CONTINUITY=false` to disable this
+automatic behavior. References are bound to the original model and reasoning
+effort. Plain unsigned reasoning text never resumes a session.
+Treat returned tool call IDs, signed reasoning details, and response IDs as
+short-lived bearer references. Any client with bridge API access and one of
+these values can resume that tracked session. Do not place them in shared logs.
+
+Setting `FACTORY_DROID_OPENAI_SESSION_CONTINUITY=true` additionally lets a
+client explicitly continue any bridge-created session, so only the new turn is
+sent:
 
 ```python
 first = client.chat.completions.create(model="gpt-5.4", messages=messages)
@@ -1306,16 +1352,13 @@ rejected with HTTP `404`, so a client cannot read back conversations it does
 not own. A continuation must use the model and reasoning effort that created
 the session; changing either returns HTTP `400`. Start a new session and resend
 the transcript when switching settings. Restarting the bridge clears the set
-of continuable sessions.
+of continuable sessions and automatic references.
 
-Native tool calls have the same empty-history limitation in stateless mode:
-`tool_result_followup` may repeat a call that the transcript already answers.
-Do not deduplicate or suppress such calls, because retries and multi-step
-workflows are valid OpenAI behavior. For native tool loops, enable continuity,
-return the assistant tool call and client result with the bridge-issued session
-ID, and cap client iterations. The session-aware matrix check exercises this
-path with `--test-native-session-continuity`; a repeat remains model behavior,
-not a bridge-side duplicate-call decision.
+Native tool loops resume automatically when the client returns the emitted
+`tool_call_id`. Do not deduplicate or suppress other repeated calls, because
+retries and multi-step workflows are valid OpenAI behavior. Explicit session
+continuity remains useful for ordinary multi-turn chat without tool or signed
+reasoning references.
 
 The same guard applies to the Factory session extension endpoints. They are
 available only when continuity is enabled and only for IDs created by the
@@ -1388,8 +1431,9 @@ Non-streaming failures use the OpenAI error object:
 | `503` | Droid executable unavailable |
 | `504` | Request timeout |
 
-After streaming headers are sent, errors arrive as an SSE `error` object
-followed by `[DONE]`.
+After streaming headers are sent, Chat Completions errors arrive as an SSE
+`error` object followed by `[DONE]`. Responses streams emit `error` then
+`response.failed`.
 
 Droid lists every model its CLI knows about, including ones a provider or
 organization policy refuses to serve. Such a refusal becomes `404` with type
@@ -1440,7 +1484,9 @@ error types.
 | `FACTORY_DROID_OPENAI_MAX_CHOICES` | `4` | Upper bound for `n` |
 | `FACTORY_DROID_OPENAI_MAX_STOP_SEQUENCES` | `4` | Upper bound for `stop` entries |
 | `FACTORY_DROID_OPENAI_SESSION_CONTINUITY` | `false` | Allow continuing bridge-created sessions |
+| `FACTORY_DROID_OPENAI_AUTO_REASONING_CONTINUITY` | `true` | Resume tracked tool loops and signed reasoning automatically |
 | `FACTORY_DROID_OPENAI_MAX_TRACKED_SESSIONS` | `256` | Continuable sessions kept in memory |
+| `FACTORY_DROID_OPENAI_MAX_SESSION_REFERENCES` | `128` | Continuation references kept per tracked session |
 | `FACTORY_DROID_OPENAI_WORKTREE` | unset | Run Droid in a git worktree |
 | `FACTORY_DROID_OPENAI_APPEND_SYSTEM_PROMPT_FILE` | unset | File appended to the Droid system prompt |
 | `FACTORY_DROID_OPENAI_MODEL_ALIAS` | `factory-droid` | Alias using Droid default model |
@@ -1546,8 +1592,8 @@ queue contains a normal waiter, a high-priority request replaces the newest
 normal waiter - the one that has waited least. When the queue contains only
 high-priority waiters, the new high-priority request is rejected with `429`.
 A normal request that finds the queue full is rejected as before. An unknown
-header value fails closed with `400`. The header only affects
-`/v1/chat/completions`; session operations and model discovery always use the
+header value fails closed with `400`. The header affects `/v1/chat/completions`
+and `/v1/responses`; session operations and model discovery always use the
 normal lane.
 
 `GET /metrics` renders Prometheus-style text. It is excluded from the OpenAPI
@@ -1675,8 +1721,10 @@ responses are stored. Tool-call turns, malformed notices, truncated or
 capped output, and empty completions are never cached, and neither are
 streaming or session-continuation requests. A hit returns a fresh response
 envelope - a new `id`, `created`, and `x-request-id` - with the cached
-choices and usage replayed verbatim. The replayed `usage` describes the
-original generation, not the cost of the hit.
+choices and usage replayed verbatim, except that signed `reasoning_details`
+are removed before storing: their digest is a live continuation reference,
+and a replay must not hand it to a caller who never ran the turn. The
+replayed `usage` describes the original generation, not the cost of the hit.
 
 A hit skips admission, the warm pool, and the runner entirely, so cached
 traffic cannot occupy a Droid slot. When auth probing is enabled, its failure
