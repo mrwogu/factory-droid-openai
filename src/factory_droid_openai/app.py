@@ -75,7 +75,6 @@ from factory_droid_openai.protocol import (
     parse_strict_json,
 )
 from factory_droid_openai.responses import (
-    ResponsesConversionError,
     build_responses_plan,
     continuation_references_from_chat,
     reasoning_details_digest,
@@ -176,13 +175,14 @@ _FALLBACK_SAFETY_FACTOR = 2
 _OUTPUT_LIMIT_TRUNCATION = "output token limit reached"
 _CHAT_COMPLETED_EVENT = "chat.completed"
 _RESPONSE_CACHE_DISABLED_EVENT = "response_cache.disabled"
+_EVENT_STREAM_MEDIA_TYPE = "text/event-stream"
 
 CHAT_COMPLETION_RESPONSES: dict[int | str, dict[str, Any]] = {
     200: {
         "model": ChatCompletionResponse,
         "description": "A JSON completion or an SSE completion stream.",
         "content": {
-            "text/event-stream": {
+            _EVENT_STREAM_MEDIA_TYPE: {
                 "schema": {"type": "string"},
                 "example": 'data: {"object":"chat.completion.chunk",...}\n\ndata: [DONE]\n\n',
             }
@@ -232,7 +232,7 @@ RESPONSES_API_RESPONSES: dict[int | str, dict[str, Any]] = {
         "model": ResponsesResponse,
         "description": "A JSON response or an SSE response event stream.",
         "content": {
-            "text/event-stream": {
+            _EVENT_STREAM_MEDIA_TYPE: {
                 "schema": {"type": "string"},
                 "example": 'data: {"type":"response.output_text.delta",...}\n\n',
             }
@@ -2016,7 +2016,7 @@ def create_app(
             )
             return FinalizingStreamingResponse(
                 event_stream,
-                media_type="text/event-stream",
+                media_type=_EVENT_STREAM_MEDIA_TYPE,
                 finalizer=lambda: _finalize_stream(
                     event_stream,
                     lease,
@@ -2389,12 +2389,11 @@ def create_app(
     ) -> JSONResponse | StreamingResponse:
         try:
             plan = build_responses_plan(payload)
-        except (ResponsesConversionError, ValueError) as exc:
+        except ValueError as exc:
             request.state.telemetry_error_type = "invalid_request_error"
             return _error_response(str(exc), 400, "invalid_request_error")
 
-        references = list(plan.continuation_references)
-        request.state.responses_continuation_references = tuple(references)
+        request.state.responses_continuation_references = plan.continuation_references
         request.state.responses_previous_response_id = payload.previous_response_id
         request.state.responses_response_id = plan.response_id
         request.state.responses_reasoning_item_id = plan.reasoning_item_id
@@ -2409,7 +2408,7 @@ def create_app(
                 return cast("JSONResponse", chat_response)
             try:
                 response_body = response_from_chat(payload, plan, chat_response.json_body)
-            except (TypeError, ValueError, ResponsesConversionError) as exc:
+            except (TypeError, ValueError) as exc:
                 request.state.telemetry_error_type = "factory_protocol_error"
                 return _error_response(str(exc), 502, "factory_protocol_error")
             return JSONResponse(
@@ -2429,7 +2428,7 @@ def create_app(
         )
         return FinalizingStreamingResponse(
             response_stream,
-            media_type="text/event-stream",
+            media_type=_EVENT_STREAM_MEDIA_TYPE,
             finalizer=chat_response._finalizer,
             headers={
                 "Cache-Control": "no-cache",

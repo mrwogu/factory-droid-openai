@@ -109,6 +109,7 @@ _AUTH_FAILURE_PATTERN = re.compile(
 # Weaker models do exactly that before answering, which is worth tolerating;
 # every other native tool still fails the turn closed.
 _IGNORED_NATIVE_TOOLS = frozenset({"exitspecmode", "toolsearch"})
+_REASONING_ENCRYPTED = "reasoning.encrypted"
 _MODEL_FAMILY_PREFIXES = (
     (("gpt-", "o1", "o3", "o4"), "gpt"),
     (("gemini",), "gemini"),
@@ -1299,7 +1300,7 @@ def _reasoning_details(
         seen_encrypted.add(message.openai_encrypted_content)
         details.append(
             {
-                "type": "reasoning.encrypted",
+                "type": _REASONING_ENCRYPTED,
                 "data": message.openai_encrypted_content,
                 "id": message.openai_reasoning_id,
                 "format": "openai-responses-v1",
@@ -1335,7 +1336,7 @@ def _reasoning_details(
             seen_encrypted.add(block.data)
             details.append(
                 {
-                    "type": "reasoning.encrypted",
+                    "type": _REASONING_ENCRYPTED,
                     "data": block.data,
                     "id": block.id,
                     "format": "anthropic-claude-v1",
@@ -1350,7 +1351,7 @@ def _reasoning_details(
             seen_encrypted.add(block.thought_signature)
             details.append(
                 {
-                    "type": "reasoning.encrypted",
+                    "type": _REASONING_ENCRYPTED,
                     "data": block.thought_signature,
                     "id": block.id,
                     "format": "google-gemini-v1",
@@ -1361,7 +1362,7 @@ def _reasoning_details(
     if message.gemini_thought_signature and message.gemini_thought_signature not in seen_encrypted:
         details.append(
             {
-                "type": "reasoning.encrypted",
+                "type": _REASONING_ENCRYPTED,
                 "data": message.gemini_thought_signature,
                 "id": None,
                 "format": "google-gemini-v1",

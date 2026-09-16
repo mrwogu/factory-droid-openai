@@ -12,6 +12,7 @@ from factory_droid_openai.models import (
 from factory_droid_openai.responses import (
     ResponsesConversionError,
     _detail_int,
+    _drain_stream,
     _function_output,
     _reasoning_item,
     _response_output,
@@ -87,9 +88,10 @@ def test_response_from_chat_rejects_invalid_chat_shapes(
     message: str,
 ) -> None:
     payload = _request()
+    plan = build_responses_plan(payload)
 
     with pytest.raises(ResponsesConversionError, match=message):
-        response_from_chat(payload, build_responses_plan(payload), chat)
+        response_from_chat(payload, plan, chat)
 
 
 def test_response_from_chat_maps_length_and_empty_usage() -> None:
@@ -318,8 +320,10 @@ def test_build_responses_plan_rejects_invalid_inputs(
     input_value: list[dict[str, Any]],
     message: str,
 ) -> None:
+    payload = _request(input=input_value)
+
     with pytest.raises(ResponsesConversionError, match=message):
-        build_responses_plan(_request(input=input_value))
+        build_responses_plan(payload)
 
 
 @pytest.mark.parametrize(
@@ -337,8 +341,10 @@ def test_build_responses_plan_rejects_invalid_tools(
     tool: dict[str, Any],
     message: str,
 ) -> None:
+    payload = _request(tools=[tool])
+
     with pytest.raises(ResponsesConversionError, match=message):
-        build_responses_plan(_request(tools=[tool]))
+        build_responses_plan(payload)
 
 
 @pytest.mark.parametrize(
@@ -352,8 +358,10 @@ def test_build_responses_plan_rejects_invalid_tool_choice(
     choice: dict[str, Any],
     message: str,
 ) -> None:
+    payload = _request(tool_choice=choice)
+
     with pytest.raises(ResponsesConversionError, match=message):
-        build_responses_plan(_request(tool_choice=choice))
+        build_responses_plan(payload)
 
 
 @pytest.mark.parametrize(
@@ -367,8 +375,10 @@ def test_build_responses_plan_rejects_invalid_text_format(
     text: dict[str, Any],
     message: str,
 ) -> None:
+    payload = _request(text=text)
+
     with pytest.raises(ResponsesConversionError, match=message):
-        build_responses_plan(_request(text=text))
+        build_responses_plan(payload)
 
 
 @pytest.mark.parametrize(
@@ -573,6 +583,18 @@ def test_sse_parser_handles_done_comments_and_multiline_input() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "values",
+    [
+        [],
+        ["event: ping\n\n", "data: [DONE]\n\n"],
+    ],
+)
+async def test_drain_stream_handles_empty_and_pending_events(values: list[str]) -> None:
+    await _drain_stream(_events(values))
+
+
+@pytest.mark.asyncio
 async def test_response_stream_maps_errors_and_ignores_non_choice_data() -> None:
     payload = _request(stream=True)
     drained = False
@@ -587,10 +609,10 @@ async def test_response_stream_maps_errors_and_ignores_non_choice_data() -> None
             'data: {"usage":{"prompt_tokens":1,"completion_tokens":2}}\n\n',
             'data: {"choices":[7]}\n\n',
             'data: {"error":{"type":"backend","message":"","param":7}}\n\n',
-            "data: [DONE]\n\n",
         ]:
             yield value
         drained = True
+        yield "data: [DONE]\n\n"
 
     events = await _collect_stream(
         payload,

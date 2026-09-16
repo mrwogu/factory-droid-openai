@@ -12,7 +12,10 @@ from factory_droid_openai.models import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterable
+    from collections.abc import AsyncIterator, Iterable, Iterator
+
+_OUTPUT_ITEM_ADDED_EVENT = "response.output_item.added"
+_OUTPUT_ITEM_DONE_EVENT = "response.output_item.done"
 
 
 class ResponsesConversionError(ValueError):
@@ -113,44 +116,77 @@ async def response_stream_from_chat(
     yield state.event("response.in_progress", response=state.response("in_progress"))
     try:
         async for raw in chat_stream:
-            data = _sse_data(raw)
-            if data is None or data == "[DONE]":
+            data = _sse_object(raw)
+            if data is None:
                 continue
-            if not isinstance(data, dict):
-                continue
-            error = data.get("error")
-            if isinstance(error, dict):
-                yield state.event(
-                    "error",
-                    code=_optional_string(error.get("code") or error.get("type")),
-                    message=str(error.get("message") or "Factory Droid failed."),
-                    param=_optional_string(error.get("param")),
-                )
-                async for _ in chat_stream:
-                    pass
+            error_event = _stream_error_event(state, data)
+            if error_event is not None:
+                yield error_event
+                await _drain_stream(chat_stream)
                 return
-            usage = data.get("usage")
-            if isinstance(usage, dict):
-                state.usage = _responses_usage(usage)
-            choices = data.get("choices")
-            if not isinstance(choices, list) or not choices:
-                continue
-            choice = choices[0]
-            if not isinstance(choice, dict):
-                continue
-            delta = choice.get("delta")
-            if isinstance(delta, dict):
-                async for event in state.delta_events(delta):
-                    yield event
-            finish_reason = choice.get("finish_reason")
-            if isinstance(finish_reason, str):
-                state.finish_reason = finish_reason
+            for event in _stream_update_events(state, data):
+                yield event
         async for event in state.done_events():
             yield event
     finally:
         close = getattr(chat_stream, "aclose", None)
         if callable(close):
             await close()
+
+
+def _sse_object(raw: str) -> dict[str, Any] | None:
+    data = _sse_data(raw)
+    return data if isinstance(data, dict) else None
+
+
+def _stream_error_event(
+    state: _ResponsesStreamState,
+    data: dict[str, Any],
+) -> str | None:
+    error = data.get("error")
+    if not isinstance(error, dict):
+        return None
+    return state.event(
+        "error",
+        code=_optional_string(error.get("code") or error.get("type")),
+        message=str(error.get("message") or "Factory Droid failed."),
+        param=_optional_string(error.get("param")),
+    )
+
+
+def _stream_choice(
+    state: _ResponsesStreamState,
+    data: dict[str, Any],
+) -> dict[str, Any] | None:
+    usage = data.get("usage")
+    if isinstance(usage, dict):
+        state.usage = _responses_usage(usage)
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    choice = choices[0]
+    return choice if isinstance(choice, dict) else None
+
+
+def _stream_update_events(
+    state: _ResponsesStreamState,
+    data: dict[str, Any],
+) -> Iterator[str]:
+    choice = _stream_choice(state, data)
+    if choice is None:
+        return
+    delta = choice.get("delta")
+    if isinstance(delta, dict):
+        yield from state.delta_events(delta)
+    finish_reason = choice.get("finish_reason")
+    if isinstance(finish_reason, str):
+        state.finish_reason = finish_reason
+
+
+async def _drain_stream(chat_stream: AsyncIterator[str]) -> None:
+    async for raw in chat_stream:
+        if _sse_data(raw) == "[DONE]":
+            return
 
 
 def continuation_references_from_chat(
@@ -196,40 +232,64 @@ def _messages(payload: ResponsesRequest) -> tuple[list[dict[str, Any]], list[tup
         return messages, references
     pending_tool_calls: list[dict[str, Any]] = []
     for item in payload.input:
-        item_type = item.get("type")
-        if item_type in (None, "message") and isinstance(item.get("role"), str):
-            _flush_tool_calls(messages, pending_tool_calls)
-            messages.append(_input_message(item))
-            continue
-        if item_type == "function_call":
-            function_call = _function_call(item)
-            pending_tool_calls.append(function_call)
-            references.append(("tool_call", function_call["id"]))
-            continue
-        _flush_tool_calls(messages, pending_tool_calls)
-        if item_type == "function_call_output":
-            call_id = item.get("call_id")
-            if not isinstance(call_id, str) or not call_id:
-                raise ResponsesConversionError("function_call_output.call_id is required")
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "content": _function_output(item.get("output")),
-                }
-            )
-            references.append(("tool_call", call_id))
-            continue
-        if item_type == "reasoning":
-            item_id = item.get("id")
-            if isinstance(item_id, str) and item_id:
-                references.append(("reasoning_item", item_id))
-            continue
-        raise ResponsesConversionError(f"unsupported Responses input item type: {item_type!r}")
+        _append_input_item(messages, pending_tool_calls, references, item)
     _flush_tool_calls(messages, pending_tool_calls)
     if not messages:
         raise ResponsesConversionError("input must contain at least one message or tool output")
     return messages, references
+
+
+def _append_input_item(
+    messages: list[dict[str, Any]],
+    pending_tool_calls: list[dict[str, Any]],
+    references: list[tuple[str, str]],
+    item: dict[str, Any],
+) -> None:
+    item_type = item.get("type")
+    if item_type in (None, "message") and isinstance(item.get("role"), str):
+        _flush_tool_calls(messages, pending_tool_calls)
+        messages.append(_input_message(item))
+        return
+    if item_type == "function_call":
+        function_call = _function_call(item)
+        pending_tool_calls.append(function_call)
+        references.append(("tool_call", function_call["id"]))
+        return
+    _flush_tool_calls(messages, pending_tool_calls)
+    if item_type == "function_call_output":
+        message, reference = _function_output_message(item)
+        messages.append(message)
+        references.append(reference)
+        return
+    if item_type == "reasoning":
+        _append_reasoning_reference(references, item)
+        return
+    raise ResponsesConversionError(f"unsupported Responses input item type: {item_type!r}")
+
+
+def _function_output_message(
+    item: dict[str, Any],
+) -> tuple[dict[str, Any], tuple[str, str]]:
+    call_id = item.get("call_id")
+    if not isinstance(call_id, str) or not call_id:
+        raise ResponsesConversionError("function_call_output.call_id is required")
+    return (
+        {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": _function_output(item.get("output")),
+        },
+        ("tool_call", call_id),
+    )
+
+
+def _append_reasoning_reference(
+    references: list[tuple[str, str]],
+    item: dict[str, Any],
+) -> None:
+    item_id = item.get("id")
+    if isinstance(item_id, str) and item_id:
+        references.append(("reasoning_item", item_id))
 
 
 def _input_message(item: dict[str, Any]) -> dict[str, Any]:
@@ -241,49 +301,55 @@ def _input_message(item: dict[str, Any]) -> dict[str, Any]:
         return {"role": role, "content": content}
     if not isinstance(content, list):
         raise ResponsesConversionError("Responses message content must be text or a list")
-    parts: list[dict[str, Any]] = []
-    for part in content:
-        if not isinstance(part, dict):
-            raise ResponsesConversionError("Responses content parts must be objects")
-        part_type = part.get("type")
-        if part_type in ("input_text", "output_text"):
-            text = part.get("text")
-            if not isinstance(text, str):
-                raise ResponsesConversionError(f"{part_type}.text is required")
-            parts.append({"type": "text", "text": text})
-        elif part_type == "input_image":
-            image_url = part.get("image_url")
-            if not isinstance(image_url, str):
-                raise ResponsesConversionError(
-                    "input_image.image_url is required; file_id is unsupported"
-                )
-            parts.append(
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": image_url,
-                        "detail": part.get("detail", "auto"),
-                    },
-                }
-            )
-        elif part_type == "input_file":
-            file_data = part.get("file_data")
-            if not isinstance(file_data, str):
-                raise ResponsesConversionError(
-                    "input_file.file_data is required; file_id and file_url are unsupported"
-                )
-            parts.append(
-                {
-                    "type": "file",
-                    "file": {
-                        "file_data": file_data,
-                        "filename": part.get("filename"),
-                    },
-                }
-            )
-        else:
-            raise ResponsesConversionError(f"unsupported Responses content type: {part_type!r}")
-    return {"role": role, "content": parts}
+    return {"role": role, "content": [_input_content_part(part) for part in content]}
+
+
+def _input_content_part(part: Any) -> dict[str, Any]:
+    if not isinstance(part, dict):
+        raise ResponsesConversionError("Responses content parts must be objects")
+    part_type = part.get("type")
+    if part_type in ("input_text", "output_text"):
+        return _input_text_part(part, part_type)
+    if part_type == "input_image":
+        return _input_image_part(part)
+    if part_type == "input_file":
+        return _input_file_part(part)
+    raise ResponsesConversionError(f"unsupported Responses content type: {part_type!r}")
+
+
+def _input_text_part(part: dict[str, Any], part_type: Any) -> dict[str, Any]:
+    text = part.get("text")
+    if not isinstance(text, str):
+        raise ResponsesConversionError(f"{part_type}.text is required")
+    return {"type": "text", "text": text}
+
+
+def _input_image_part(part: dict[str, Any]) -> dict[str, Any]:
+    image_url = part.get("image_url")
+    if not isinstance(image_url, str):
+        raise ResponsesConversionError("input_image.image_url is required; file_id is unsupported")
+    return {
+        "type": "image_url",
+        "image_url": {
+            "url": image_url,
+            "detail": part.get("detail", "auto"),
+        },
+    }
+
+
+def _input_file_part(part: dict[str, Any]) -> dict[str, Any]:
+    file_data = part.get("file_data")
+    if not isinstance(file_data, str):
+        raise ResponsesConversionError(
+            "input_file.file_data is required; file_id and file_url are unsupported"
+        )
+    return {
+        "type": "file",
+        "file": {
+            "file_data": file_data,
+            "filename": part.get("filename"),
+        },
+    }
 
 
 def _function_call(item: dict[str, Any]) -> dict[str, Any]:
@@ -393,60 +459,74 @@ def _response_output(
     details = message.get("reasoning_details")
     if isinstance(reasoning, str) or isinstance(details, list):
         output.append(_reasoning_item(plan.reasoning_item_id, reasoning, details))
-    content = message.get("content")
-    if isinstance(content, str) and content:
-        output.append(
-            {
-                "id": plan.message_item_id,
-                "type": "message",
-                "role": "assistant",
-                "status": "incomplete" if finish_reason == "length" else "completed",
-                "content": [
-                    {
-                        "type": "output_text",
-                        "text": content,
-                        "annotations": [],
-                    }
-                ],
-            }
-        )
-    tool_calls = message.get("tool_calls")
-    if isinstance(tool_calls, list) and tool_calls:
-        for call in tool_calls:
-            if not isinstance(call, dict):
-                continue
-            function = call.get("function")
-            if not isinstance(function, dict):
-                continue
-            call_id = str(call.get("id") or f"call_{uuid.uuid4().hex[:24]}")
-            output.append(
-                {
-                    "id": f"fc_{call_id.removeprefix('call_')}",
-                    "call_id": call_id,
-                    "type": "function_call",
-                    "name": function.get("name"),
-                    "arguments": function.get("arguments", "{}"),
-                    "status": "completed",
-                }
-            )
+    message_item = _response_message_item(
+        plan.message_item_id,
+        message.get("content"),
+        finish_reason,
+    )
+    if message_item is not None:
+        output.append(message_item)
+    output.extend(_function_call_items(message.get("tool_calls")))
     return output
 
 
+def _response_message_item(
+    item_id: str,
+    content: Any,
+    finish_reason: Any,
+) -> dict[str, Any] | None:
+    if not isinstance(content, str) or not content:
+        return None
+    status = "incomplete" if finish_reason == "length" else "completed"
+    return _message_item(item_id, content, status)
+
+
+def _message_item(item_id: str, text: str, status: str) -> dict[str, Any]:
+    return {
+        "id": item_id,
+        "type": "message",
+        "role": "assistant",
+        "status": status,
+        "content": [
+            {
+                "type": "output_text",
+                "text": text,
+                "annotations": [],
+            }
+        ],
+    }
+
+
+def _function_call_items(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    items: list[dict[str, Any]] = []
+    for call in value:
+        item = _function_call_item(call)
+        if item is not None:
+            items.append(item)
+    return items
+
+
+def _function_call_item(call: Any) -> dict[str, Any] | None:
+    if not isinstance(call, dict):
+        return None
+    function = call.get("function")
+    if not isinstance(function, dict):
+        return None
+    call_id = str(call.get("id") or f"call_{uuid.uuid4().hex[:24]}")
+    return {
+        "id": f"fc_{call_id.removeprefix('call_')}",
+        "call_id": call_id,
+        "type": "function_call",
+        "name": function.get("name"),
+        "arguments": function.get("arguments", "{}"),
+        "status": "completed",
+    }
+
+
 def _reasoning_item(item_id: str, reasoning: Any, details: Any) -> dict[str, Any]:
-    summaries: list[dict[str, str]] = []
-    encrypted_content: str | None = None
-    if isinstance(details, list):
-        for detail in details:
-            if not isinstance(detail, dict):
-                continue
-            if detail.get("type") == "reasoning.summary" and isinstance(detail.get("summary"), str):
-                summaries.append({"type": "summary_text", "text": detail["summary"]})
-            if (
-                detail.get("type") == "reasoning.encrypted"
-                and detail.get("format") == "openai-responses-v1"
-                and isinstance(detail.get("data"), str)
-            ):
-                encrypted_content = detail["data"]
+    summaries, encrypted_content = _reasoning_metadata(details)
     item: dict[str, Any] = {
         "id": item_id,
         "type": "reasoning",
@@ -460,6 +540,41 @@ def _reasoning_item(item_id: str, reasoning: Any, details: Any) -> dict[str, Any
     if isinstance(details, list) and details:
         item["reasoning_details"] = details
     return item
+
+
+def _reasoning_metadata(
+    details: Any,
+) -> tuple[list[dict[str, str]], str | None]:
+    summaries: list[dict[str, str]] = []
+    encrypted_content: str | None = None
+    if not isinstance(details, list):
+        return summaries, encrypted_content
+    for detail in details:
+        summary = _reasoning_summary(detail)
+        if summary is not None:
+            summaries.append(summary)
+        encrypted = _openai_encrypted_content(detail)
+        if encrypted is not None:
+            encrypted_content = encrypted
+    return summaries, encrypted_content
+
+
+def _reasoning_summary(detail: Any) -> dict[str, str] | None:
+    if not isinstance(detail, dict) or detail.get("type") != "reasoning.summary":
+        return None
+    summary = detail.get("summary")
+    if not isinstance(summary, str):
+        return None
+    return {"type": "summary_text", "text": summary}
+
+
+def _openai_encrypted_content(detail: Any) -> str | None:
+    if not isinstance(detail, dict) or detail.get("type") != "reasoning.encrypted":
+        return None
+    if detail.get("format") != "openai-responses-v1":
+        return None
+    data = detail.get("data")
+    return data if isinstance(data, str) else None
 
 
 def _responses_usage(value: Any) -> dict[str, Any] | None:
@@ -556,21 +671,7 @@ class _ResponsesStreamState:
                     )
                 )
             elif kind == "message":
-                output.append(
-                    {
-                        "id": self.plan.message_item_id,
-                        "type": "message",
-                        "role": "assistant",
-                        "status": status,
-                        "content": [
-                            {
-                                "type": "output_text",
-                                "text": self.text,
-                                "annotations": [],
-                            }
-                        ],
-                    }
-                )
+                output.append(_message_item(self.plan.message_item_id, self.text, status))
             else:
                 output.append(self.tool_items[cast("int", tool_index)])
         completed = status in {"completed", "incomplete"}
@@ -600,143 +701,147 @@ class _ResponsesStreamState:
             "usage": self.usage,
         }
 
-    async def delta_events(self, delta: dict[str, Any]) -> AsyncIterator[str]:
+    def delta_events(self, delta: dict[str, Any]) -> Iterator[str]:
+        yield from self._reasoning_delta_events(delta)
+        yield from self._reasoning_details_events(delta)
+        yield from self._message_delta_events(delta)
+        yield from self._tool_call_delta_events(delta)
+
+    def _reasoning_delta_events(self, delta: dict[str, Any]) -> Iterator[str]:
         reasoning = delta.get("reasoning") or delta.get("reasoning_content")
-        if isinstance(reasoning, str) and reasoning:
-            if self.reasoning_index is None:
-                self.reasoning_index = self._next_output_index()
-                self.output_order.append(("reasoning", None))
-                added_item = _reasoning_item(
-                    self.plan.reasoning_item_id,
-                    "",
-                    [],
-                )
-                added_item["status"] = "in_progress"
-                yield self.event(
-                    "response.output_item.added",
-                    output_index=self.reasoning_index,
-                    item=added_item,
-                )
-            if not self.reasoning_content_started:
-                self.reasoning_content_started = True
-                yield self.event(
-                    "response.content_part.added",
-                    item_id=self.plan.reasoning_item_id,
-                    output_index=self.reasoning_index,
-                    content_index=0,
-                    part={"type": "reasoning_text", "text": ""},
-                )
-            self.reasoning_chunks.append(reasoning)
+        if not isinstance(reasoning, str) or not reasoning:
+            return
+        added = self._start_reasoning_item()
+        if added is not None:
+            yield added
+        if not self.reasoning_content_started:
+            self.reasoning_content_started = True
             yield self.event(
-                "response.reasoning_text.delta",
+                "response.content_part.added",
                 item_id=self.plan.reasoning_item_id,
                 output_index=self.reasoning_index,
                 content_index=0,
-                delta=reasoning,
+                part={"type": "reasoning_text", "text": ""},
             )
+        self.reasoning_chunks.append(reasoning)
+        yield self.event(
+            "response.reasoning_text.delta",
+            item_id=self.plan.reasoning_item_id,
+            output_index=self.reasoning_index,
+            content_index=0,
+            delta=reasoning,
+        )
+
+    def _reasoning_details_events(self, delta: dict[str, Any]) -> Iterator[str]:
         details = delta.get("reasoning_details")
-        if isinstance(details, list):
-            self.reasoning_details.extend(detail for detail in details if isinstance(detail, dict))
-            if self.reasoning_index is None:
-                self.reasoning_index = self._next_output_index()
-                self.output_order.append(("reasoning", None))
-                added_item = _reasoning_item(
-                    self.plan.reasoning_item_id,
-                    "",
-                    [],
-                )
-                added_item["status"] = "in_progress"
-                yield self.event(
-                    "response.output_item.added",
-                    output_index=self.reasoning_index,
-                    item=added_item,
-                )
+        if not isinstance(details, list):
+            return
+        self.reasoning_details.extend(detail for detail in details if isinstance(detail, dict))
+        added = self._start_reasoning_item()
+        if added is not None:
+            yield added
+
+    def _message_delta_events(self, delta: dict[str, Any]) -> Iterator[str]:
         content = delta.get("content")
-        if isinstance(content, str) and content:
-            if self.message_index is None:
-                self.message_index = self._next_output_index()
-                self.output_order.append(("message", None))
-                yield self.event(
-                    "response.output_item.added",
-                    output_index=self.message_index,
-                    item={
-                        "id": self.plan.message_item_id,
-                        "type": "message",
-                        "role": "assistant",
-                        "status": "in_progress",
-                        "content": [],
-                    },
-                )
-            if not self.message_content_started:
-                self.message_content_started = True
-                yield self.event(
-                    "response.content_part.added",
-                    item_id=self.plan.message_item_id,
-                    output_index=self.message_index,
-                    content_index=0,
-                    part={
-                        "type": "output_text",
-                        "text": "",
-                        "annotations": [],
-                        "logprobs": [],
-                    },
-                )
-            self.text_chunks.append(content)
+        if not isinstance(content, str) or not content:
+            return
+        added = self._start_message_item()
+        if added is not None:
+            yield added
+        if not self.message_content_started:
+            self.message_content_started = True
             yield self.event(
-                "response.output_text.delta",
+                "response.content_part.added",
                 item_id=self.plan.message_item_id,
                 output_index=self.message_index,
                 content_index=0,
-                delta=content,
-                logprobs=[],
+                part={
+                    "type": "output_text",
+                    "text": "",
+                    "annotations": [],
+                    "logprobs": [],
+                },
             )
+        self.text_chunks.append(content)
+        yield self.event(
+            "response.output_text.delta",
+            item_id=self.plan.message_item_id,
+            output_index=self.message_index,
+            content_index=0,
+            delta=content,
+            logprobs=[],
+        )
+
+    def _tool_call_delta_events(self, delta: dict[str, Any]) -> Iterator[str]:
         tool_calls = delta.get("tool_calls")
-        if isinstance(tool_calls, list):
-            for call in tool_calls:
-                if not isinstance(call, dict):
-                    continue
-                function = call.get("function")
-                if not isinstance(function, dict):
-                    continue
-                call_id = str(call.get("id") or f"call_{uuid.uuid4().hex[:24]}")
-                item = {
-                    "id": f"fc_{call_id.removeprefix('call_')}",
-                    "call_id": call_id,
-                    "type": "function_call",
-                    "name": function.get("name"),
-                    "arguments": function.get("arguments", "{}"),
-                    "status": "completed",
-                }
-                output_index = self._next_output_index()
-                self.tool_items.append(item)
-                self.output_order.append(("tool", len(self.tool_items) - 1))
-                added_item = item | {
-                    "arguments": "",
-                    "status": "in_progress",
-                }
-                yield self.event(
-                    "response.output_item.added",
-                    output_index=output_index,
-                    item=added_item,
-                )
-                yield self.event(
-                    "response.function_call_arguments.delta",
-                    item_id=item["id"],
-                    output_index=output_index,
-                    delta=item["arguments"],
-                )
-                yield self.event(
-                    "response.function_call_arguments.done",
-                    item_id=item["id"],
-                    output_index=output_index,
-                    name=item["name"],
-                    arguments=item["arguments"],
-                )
-                yield self.event(
-                    "response.output_item.done",
-                    output_index=output_index,
-                    item=item,
-                )
+        if not isinstance(tool_calls, list):
+            return
+        for call in tool_calls:
+            item = _function_call_item(call)
+            if item is not None:
+                yield from self._tool_call_events(item)
+
+    def _start_reasoning_item(self) -> str | None:
+        if self.reasoning_index is not None:
+            return None
+        self.reasoning_index = self._next_output_index()
+        self.output_order.append(("reasoning", None))
+        added_item = _reasoning_item(self.plan.reasoning_item_id, "", [])
+        added_item["status"] = "in_progress"
+        return self.event(
+            _OUTPUT_ITEM_ADDED_EVENT,
+            output_index=self.reasoning_index,
+            item=added_item,
+        )
+
+    def _start_message_item(self) -> str | None:
+        if self.message_index is not None:
+            return None
+        self.message_index = self._next_output_index()
+        self.output_order.append(("message", None))
+        return self.event(
+            _OUTPUT_ITEM_ADDED_EVENT,
+            output_index=self.message_index,
+            item={
+                "id": self.plan.message_item_id,
+                "type": "message",
+                "role": "assistant",
+                "status": "in_progress",
+                "content": [],
+            },
+        )
+
+    def _tool_call_events(self, item: dict[str, Any]) -> Iterator[str]:
+        output_index = self._next_output_index()
+        self.tool_items.append(item)
+        self.output_order.append(("tool", len(self.tool_items) - 1))
+        added_item = item | {
+            "arguments": "",
+            "status": "in_progress",
+        }
+        yield self.event(
+            _OUTPUT_ITEM_ADDED_EVENT,
+            output_index=output_index,
+            item=added_item,
+        )
+        yield self.event(
+            "response.function_call_arguments.delta",
+            item_id=item["id"],
+            output_index=output_index,
+            delta=item["arguments"],
+        )
+        yield self.event(
+            "response.function_call_arguments.done",
+            item_id=item["id"],
+            output_index=output_index,
+            name=item["name"],
+            arguments=item["arguments"],
+        )
+        yield self.event(
+            _OUTPUT_ITEM_DONE_EVENT,
+            output_index=output_index,
+            item=item,
+        )
 
     async def done_events(self) -> AsyncIterator[str]:
         status = "incomplete" if self.finish_reason == "length" else "completed"
@@ -765,24 +870,12 @@ class _ResponsesStreamState:
                     },
                 )
             yield self.event(
-                "response.output_item.done",
+                _OUTPUT_ITEM_DONE_EVENT,
                 output_index=self.reasoning_index,
                 item=item,
             )
         if self.message_index is not None:
-            item = {
-                "id": self.plan.message_item_id,
-                "type": "message",
-                "role": "assistant",
-                "status": status,
-                "content": [
-                    {
-                        "type": "output_text",
-                        "text": self.text,
-                        "annotations": [],
-                    }
-                ],
-            }
+            item = _message_item(self.plan.message_item_id, self.text, status)
             yield self.event(
                 "response.output_text.done",
                 item_id=self.plan.message_item_id,
@@ -804,7 +897,7 @@ class _ResponsesStreamState:
                 },
             )
             yield self.event(
-                "response.output_item.done",
+                _OUTPUT_ITEM_DONE_EVENT,
                 output_index=self.message_index,
                 item=item,
             )
