@@ -5943,6 +5943,61 @@ async def test_multiple_choices_cannot_continue_a_session(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_multiple_choices_cannot_automatically_continue_a_session(
+    tmp_path: Path,
+) -> None:
+    class ToolLoopRunner(FakeRunner):
+        async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                yield SessionStarted("session-auto")
+                yield TextDelta(
+                    f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{}}}}{TOOL_CALL_CLOSE}'
+                )
+            else:
+                yield SessionStarted("session-other")
+                yield TextDelta("It is sunny.")
+            yield RunComplete(Usage())
+
+    runner = ToolLoopRunner([])
+    payload = _payload(
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+    )
+    async with _client(_app(tmp_path, runner)) as client:
+        first = await client.post("/v1/chat/completions", json=payload)
+        first_message = first.json()["choices"][0]["message"]
+        rejected = await client.post(
+            "/v1/chat/completions",
+            json={
+                **payload,
+                "n": 2,
+                "messages": [
+                    {"role": "user", "content": "Weather?"},
+                    first_message,
+                    {
+                        "role": "tool",
+                        "tool_call_id": first_message["tool_calls"][0]["id"],
+                        "content": "sunny",
+                    },
+                ],
+            },
+        )
+
+    assert rejected.status_code == 400
+    assert "cannot continue" in rejected.json()["error"]["message"]
+    assert rejected.json()["error"]["type"] == "invalid_request_error"
+    assert len(runner.requests) == 1
+
+
+@pytest.mark.asyncio
 async def test_session_id_is_hidden_when_continuity_is_disabled(
     tmp_path: Path,
 ) -> None:
@@ -6653,7 +6708,7 @@ async def test_factory_session_operations_require_continuity(tmp_path: Path) -> 
 
 
 def test_session_registry_evicts_the_oldest_entries() -> None:
-    registry = SessionRegistry(2)
+    registry = SessionRegistry(2, 128)
 
     key_a = SessionKey("model-a", None)
     key_b = SessionKey("model-b", None)
@@ -6670,7 +6725,7 @@ def test_session_registry_evicts_the_oldest_entries() -> None:
 
 
 def test_session_registry_ignores_duplicate_entries() -> None:
-    registry = SessionRegistry(2)
+    registry = SessionRegistry(2, 128)
 
     key_a = SessionKey("model-a", None)
     key_b = SessionKey("model-b", None)
@@ -6684,7 +6739,7 @@ def test_session_registry_ignores_duplicate_entries() -> None:
 
 
 def test_session_registry_tracks_bounded_continuation_references() -> None:
-    registry = SessionRegistry(2)
+    registry = SessionRegistry(2, 2)
     key = SessionKey("model-a", None)
     registry.remember("a", key)
     registry.remember("b", key)
@@ -6693,17 +6748,27 @@ def test_session_registry_tracks_bounded_continuation_references() -> None:
     registry.remember_reference("tool_call", "", "a")
     registry.remember_reference("tool_call", "shared", "a")
     registry.remember_reference("tool_call", "shared", "b")
-    for index in range(129):
-        registry.remember_reference("reasoning", str(index), "b")
 
     assert registry.session_for_reference("tool_call", "shared") == "b"
-    assert len(registry._session_references["b"]) == 128
+    assert not registry._session_references["a"]
+
+    registry.remember_reference("reasoning", "old", "b")
+    registry.remember_reference("reasoning", "shared", "b")
+    registry.remember_reference("reasoning", "new", "b")
+
+    # Trimming drops the oldest reference, never the one just added, and a
+    # reference that moved sessions leaves the previous session's set.
+    assert registry.session_for_reference("reasoning", "new") == "b"
+    assert registry.session_for_reference("reasoning", "shared") == "b"
+    assert registry.session_for_reference("reasoning", "old") is None
+    assert len(registry._session_references["b"]) == 2
     registry.forget("b")
     assert registry.session_for_reference("tool_call", "shared") is None
+    assert registry.session_for_reference("reasoning", "new") is None
 
 
 def test_session_registry_does_not_evict_a_session_in_use() -> None:
-    registry = SessionRegistry(2)
+    registry = SessionRegistry(2, 128)
     key_a = SessionKey("model-a", None)
     key_b = SessionKey("model-b", None)
     key_c = SessionKey("model-c", None)
@@ -6721,7 +6786,7 @@ def test_session_registry_does_not_evict_a_session_in_use() -> None:
 
 
 def test_session_registry_defers_eviction_until_a_busy_session_releases() -> None:
-    registry = SessionRegistry(2)
+    registry = SessionRegistry(2, 128)
     keys = {session_id: SessionKey(f"model-{session_id}", None) for session_id in ("a", "b", "c")}
     registry.remember("a", keys["a"])
     registry.remember("b", keys["b"])
@@ -6744,7 +6809,7 @@ def test_session_registry_defers_eviction_until_a_busy_session_releases() -> Non
 
 @pytest.mark.asyncio
 async def test_session_registry_lease_is_exclusive_and_idempotent() -> None:
-    registry = SessionRegistry(2)
+    registry = SessionRegistry(2, 128)
     registry.remember("a", SessionKey("model-a", None))
 
     first = registry.acquire("a")
@@ -7858,7 +7923,7 @@ async def test_stream_finalizer_accepts_a_stream_without_aclose() -> None:
     metrics = BridgeMetrics()
     admission = AdmissionController(max_concurrency=1, max_queue_size=1, metrics=metrics)
     lease = await admission.acquire(asyncio.get_running_loop().time() + 30)
-    registry = SessionRegistry(1)
+    registry = SessionRegistry(1, 128)
     registry.remember("session-1", SessionKey(None, None))
     session_use = registry.acquire("session-1")
     assert session_use is not None
@@ -8220,6 +8285,49 @@ async def test_response_cache_hit_replays_without_a_droid_turn(tmp_path: Path) -
     assert "factory_droid_openai_response_cache_misses_total 1" in render
     assert "factory_droid_openai_response_cache_entries 1" in render
     assert _cache_bytes(render) > 0
+
+
+@pytest.mark.asyncio
+async def test_response_cache_strips_continuation_references_from_entries(
+    tmp_path: Path,
+) -> None:
+    details = (
+        {
+            "type": "reasoning.text",
+            "text": "thinking",
+            "signature": "signed-state",
+            "id": "thinking-1",
+            "format": "anthropic-claude-v1",
+            "index": 0,
+        },
+    )
+    calls: list[int] = []
+    events: list[RunEvent] = [
+        SessionStarted("session-cache"),
+        ReasoningDelta("thinking"),
+        TextDelta("Hello there"),
+        RunComplete(Usage(input_tokens=3, output_tokens=2), reasoning_details=details),
+    ]
+    app = create_app(
+        _cache_settings(tmp_path),
+        runner_factory=cast("RunnerFactory", _counting_factory(events, calls)),
+    )
+
+    async with _client(app) as client:
+        first = await client.post("/v1/chat/completions", json=_payload())
+        second = await client.post("/v1/chat/completions", json=_payload())
+
+    # The live turn still carries its signed reasoning_details, but the
+    # replayed entry must not hand them to a caller who never ran the turn.
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert calls == [1]
+    assert first.json()["choices"][0]["message"]["reasoning_details"] == list(details)
+    assert "reasoning_details" not in second.json()["choices"][0]["message"]
+    assert second.json()["choices"][0]["message"]["reasoning"] == "thinking"
+    digest = reasoning_details_digest(details)
+    assert digest is not None
+    assert app.state.sessions.session_for_reference("reasoning", digest) == "session-cache"
 
 
 class _OffsetClockLoop:

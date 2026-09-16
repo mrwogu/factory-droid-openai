@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -17,13 +18,14 @@ from factory_droid_openai.responses import (
     _reasoning_item,
     _response_output,
     _responses_usage,
-    _sse_data,
     build_responses_plan,
     continuation_references_from_chat,
     reasoning_details_digest,
     response_from_chat,
     response_stream_from_chat,
 )
+from factory_droid_openai.sse import sse
+from factory_droid_openai.sse import sse_data as _sse_data
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -110,9 +112,25 @@ def test_response_from_chat_maps_length_and_empty_usage() -> None:
 
     assert response["status"] == "incomplete"
     assert response["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert response["completed_at"] is None
     assert response["usage"] is None
     assert response["reasoning"] == {"effort": "low"}
     assert response["tool_choice"] == "auto"
+
+
+def test_response_from_chat_records_completion_time() -> None:
+    payload = _request()
+    before = time.time()
+    response = response_from_chat(
+        payload,
+        build_responses_plan(payload),
+        _chat({"content": "done"}),
+    )
+    after = time.time()
+
+    assert response["status"] == "completed"
+    assert response["created_at"] == 10.0
+    assert before <= response["completed_at"] <= after
 
 
 def test_build_responses_plan_maps_all_supported_inputs() -> None:
@@ -582,6 +600,15 @@ def test_sse_parser_handles_done_comments_and_multiline_input() -> None:
     assert _sse_data('event: message\ndata: {"ok":true}\n\n') == {"ok": True}
 
 
+@pytest.mark.parametrize("character", ["\u0085", "\u2028", "\u2029"])
+def test_sse_roundtrip_preserves_unicode_line_separators(character: str) -> None:
+    # splitlines() would treat these as line breaks and truncate the JSON
+    # payload mid-string; the shared parser must split on "\n" only.
+    raw = sse({"choices": [{"delta": {"content": f"a{character}b"}}]})
+
+    assert _sse_data(raw) == {"choices": [{"delta": {"content": f"a{character}b"}}]}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "values",
@@ -659,6 +686,7 @@ async def test_response_stream_maps_details_tools_and_incomplete_output() -> Non
     assert events[-1]["type"] == "response.incomplete"
     response = events[-1]["response"]
     assert response["status"] == "incomplete"
+    assert response["completed_at"] is None
     assert [item["type"] for item in response["output"]] == [
         "reasoning",
         "message",
@@ -694,6 +722,39 @@ async def test_response_stream_appends_reasoning_and_late_details() -> None:
         {"type": "reasoning_text", "text": "onetwo"}
     ]
     assert events[-1]["response"]["output"][0]["reasoning_details"][0]["signature"] == "signed"
+
+
+@pytest.mark.asyncio
+async def test_response_stream_orders_late_encrypted_reasoning_first() -> None:
+    events = await _collect_stream(
+        _request(stream=True),
+        _events(
+            [
+                'data: {"choices":[{"delta":{"content":"answer"}}]}\n\n',
+                (
+                    'data: {"choices":[{"delta":{"reasoning_details":'
+                    '[{"type":"reasoning.encrypted","data":"state",'
+                    '"format":"openai-responses-v1"}]}}]}\n\n'
+                ),
+                'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+            ]
+        ),
+    )
+
+    # Encrypted reasoning arrives only with the terminal chunk, after message
+    # text already took output index 0; the final response still matches the
+    # non-streaming [reasoning, message] order.
+    assert events[-1]["type"] == "response.completed"
+    assert events[-1]["response"]["completed_at"] is not None
+    assert [item["type"] for item in events[-1]["response"]["output"]] == [
+        "reasoning",
+        "message",
+    ]
+    assert events[-1]["response"]["output"][0]["encrypted_content"] == "state"
+    done_items = [
+        event["item"]["type"] for event in events if event["type"] == "response.output_item.done"
+    ]
+    assert done_items == ["reasoning", "message"]
 
 
 @pytest.mark.asyncio

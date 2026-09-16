@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from factory_droid_openai.models import (
     ChatCompletionRequest,
     ResponsesRequest,
 )
+from factory_droid_openai.sse import sse as _sse
+from factory_droid_openai.sse import sse_data as _sse_data
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterable, Iterator
@@ -83,7 +86,7 @@ def response_from_chat(
         "id": plan.response_id,
         "object": "response",
         "created_at": now,
-        "completed_at": now,
+        "completed_at": time.time() if status == "completed" else None,
         "status": status,
         "error": None,
         "incomplete_details": ({"reason": "max_output_tokens"} if status == "incomplete" else None),
@@ -605,22 +608,8 @@ def _detail_int(value: Any, key: str) -> int:
     return int(raw) if isinstance(raw, int | float) else 0
 
 
-def _sse_data(raw: str) -> Any:
-    for line in raw.splitlines():
-        if line.startswith("data: "):
-            value = line[6:]
-            if value == "[DONE]":
-                return value
-            return json.loads(value)
-    return None
-
-
 def _optional_string(value: Any) -> str | None:
     return value if isinstance(value, str) else None
-
-
-def _sse(payload: dict[str, Any]) -> str:
-    return f"data: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
 
 
 class _ResponsesStreamState:
@@ -644,7 +633,7 @@ class _ResponsesStreamState:
         self.reasoning_content_started = False
         self.message_content_started = False
         self.tool_items: list[dict[str, Any]] = []
-        self.output_order: list[tuple[str, int | None]] = []
+        self._output_count = 0
 
     @property
     def reasoning_text(self) -> str:
@@ -660,26 +649,26 @@ class _ResponsesStreamState:
         return _sse(payload)
 
     def response(self, status: str) -> dict[str, Any]:
+        # Canonical order matches the non-streaming shape (reasoning, message,
+        # function calls) even when encrypted reasoning only arrives with the
+        # terminal chunk, after message text already took an output index.
         output: list[dict[str, Any]] = []
-        for kind, tool_index in self.output_order:
-            if kind == "reasoning":
-                output.append(
-                    _reasoning_item(
-                        self.plan.reasoning_item_id,
-                        self.reasoning_text,
-                        self.reasoning_details,
-                    )
+        if self.reasoning_index is not None:
+            output.append(
+                _reasoning_item(
+                    self.plan.reasoning_item_id,
+                    self.reasoning_text,
+                    self.reasoning_details,
                 )
-            elif kind == "message":
-                output.append(_message_item(self.plan.message_item_id, self.text, status))
-            else:
-                output.append(self.tool_items[cast("int", tool_index)])
-        completed = status in {"completed", "incomplete"}
+            )
+        if self.message_index is not None:
+            output.append(_message_item(self.plan.message_item_id, self.text, status))
+        output.extend(self.tool_items)
         return {
             "id": self.plan.response_id,
             "object": "response",
             "created_at": self.created_at,
-            "completed_at": self.created_at if completed else None,
+            "completed_at": time.time() if status == "completed" else None,
             "status": status,
             "error": None,
             "incomplete_details": (
@@ -785,7 +774,6 @@ class _ResponsesStreamState:
         if self.reasoning_index is not None:
             return None
         self.reasoning_index = self._next_output_index()
-        self.output_order.append(("reasoning", None))
         added_item = _reasoning_item(self.plan.reasoning_item_id, "", [])
         added_item["status"] = "in_progress"
         return self.event(
@@ -798,7 +786,6 @@ class _ResponsesStreamState:
         if self.message_index is not None:
             return None
         self.message_index = self._next_output_index()
-        self.output_order.append(("message", None))
         return self.event(
             _OUTPUT_ITEM_ADDED_EVENT,
             output_index=self.message_index,
@@ -814,7 +801,6 @@ class _ResponsesStreamState:
     def _tool_call_events(self, item: dict[str, Any]) -> Iterator[str]:
         output_index = self._next_output_index()
         self.tool_items.append(item)
-        self.output_order.append(("tool", len(self.tool_items) - 1))
         added_item = item | {
             "arguments": "",
             "status": "in_progress",
@@ -907,4 +893,6 @@ class _ResponsesStreamState:
         )
 
     def _next_output_index(self) -> int:
-        return len(self.output_order)
+        value = self._output_count
+        self._output_count += 1
+        return value

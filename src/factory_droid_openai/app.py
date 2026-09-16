@@ -99,6 +99,7 @@ from factory_droid_openai.runner import (
     model_family,
     normalize_reasoning_effort,
 )
+from factory_droid_openai.sse import sse as _sse
 from factory_droid_openai.strictjson import (
     DuplicateKeyError,
     JsonNestingError,
@@ -401,12 +402,13 @@ class SessionRegistry:
     and read their contents back out through the completion.
     """
 
-    def __init__(self, max_entries: int) -> None:
+    def __init__(self, max_entries: int, max_references: int) -> None:
         self._max_entries = max_entries
+        self._max_references = max_references
         self._sessions: OrderedDict[str, SessionKey] = OrderedDict()
         self._in_use: set[str] = set()
         self._references: dict[tuple[str, str], str] = {}
-        self._session_references: dict[str, set[tuple[str, str]]] = {}
+        self._session_references: dict[str, OrderedDict[tuple[str, str], None]] = {}
 
     def remember(self, session_id: str, key: SessionKey) -> None:
         self._sessions.pop(session_id, None)
@@ -450,13 +452,19 @@ class SessionRegistry:
         reference = (kind, value)
         previous = self._references.get(reference)
         if previous is not None and previous != session_id:
-            self._session_references[previous].discard(reference)
+            self._session_references[previous].pop(reference, None)
         self._references[reference] = session_id
-        session_references = self._session_references.setdefault(session_id, set())
-        session_references.add(reference)
-        while len(session_references) > 128:
-            stale = next(iter(session_references))
-            session_references.remove(stale)
+        # Ordered like the session LRU itself: a refreshed reference moves
+        # to the MRU end, so trimming always drops the oldest entry instead
+        # of an arbitrary one.
+        session_references = self._session_references.setdefault(
+            session_id,
+            OrderedDict(),
+        )
+        session_references.pop(reference, None)
+        session_references[reference] = None
+        while len(session_references) > self._max_references:
+            stale, _ = session_references.popitem(last=False)
             self._references.pop(stale, None)
 
     def session_for_reference(self, kind: str, value: str) -> str | None:
@@ -911,7 +919,10 @@ def create_app(
         )
     )
     bridge_created = int(time.time())
-    sessions = SessionRegistry(resolved_settings.max_tracked_sessions)
+    sessions = SessionRegistry(
+        resolved_settings.max_tracked_sessions,
+        resolved_settings.max_session_references,
+    )
     quarantine = ModelQuarantine(ttl_seconds=resolved_settings.model_quarantine_seconds)
     admission = AdmissionController(
         max_concurrency=resolved_settings.max_concurrency,
@@ -1612,6 +1623,16 @@ def create_app(
                         )
             else:
                 session_id = automatic_session(references, requested_key)
+        if session_id is not None and payload.n > 1:
+            # _validate_options only guards the explicit factory_droid_session_id
+            # field, which is still None here when continuation was automatic.
+            request.state.telemetry_error_type = "invalid_request_error"
+            log_warning("chat.rejected", status=400, phase="session_settings")
+            return _error_response(
+                "n greater than 1 cannot continue an existing Factory Droid session.",
+                400,
+                "invalid_request_error",
+            )
 
         try:
             structured = _prepare_output_format(
@@ -1685,8 +1706,9 @@ def create_app(
         # warm pool, admission, and the runner entirely. The response envelope
         # (id, created, headers) is regenerated per hit; only the choices and
         # usage are replayed. Continuation requests can never reach this
-        # lookup: continuity-on disables the cache entirely, and continuity-off
-        # rejects the session id upstream.
+        # lookup: explicit continuity disables the cache at startup, an
+        # automatically resolved session excludes the key here, and
+        # /v1/responses never caches.
         cache_key: str | None = None
         if (
             response_cache is not None
@@ -2357,12 +2379,15 @@ def create_app(
             headers["x-factory-droid-session-id"] = started_session
 
         if cache_key is not None and response_cache is not None and cacheable_result:
-            # Session continuity is off whenever the cache exists, so the
-            # stored payload can never carry a factory_droid_session_id.
+            # A hit is replayed to any caller with the same fingerprint, so
+            # signed reasoning_details must not survive into the cache: their
+            # digest is a live continuation reference into the original
+            # caller's Droid session. Continuity being off means the stored
+            # payload can never carry a factory_droid_session_id either.
             response_cache.put(
                 cache_key,
                 json.dumps(
-                    {"choices": choices, "usage": body["usage"]},
+                    {"choices": _cached_choices(choices), "usage": body["usage"]},
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ).encode("utf-8"),
@@ -3850,6 +3875,23 @@ def _add_usage(left: Usage, right: Usage) -> Usage:
     )
 
 
+def _cached_choices(choices: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # Cache entries are shared across callers, so continuity references must
+    # be removed before storing; see the response_cache.put call site.
+    sanitized: list[dict[str, Any]] = []
+    for choice in choices:
+        message = choice.get("message")
+        if not isinstance(message, dict) or "reasoning_details" not in message:
+            sanitized.append(choice)
+            continue
+        stripped = dict(choice)
+        stripped_message = dict(message)
+        stripped_message.pop("reasoning_details", None)
+        stripped["message"] = stripped_message
+        sanitized.append(stripped)
+    return sanitized
+
+
 def _usage_dict(usage: Usage) -> dict[str, Any]:
     return {
         "prompt_tokens": usage.input_tokens,
@@ -3863,10 +3905,6 @@ def _usage_dict(usage: Usage) -> dict[str, Any]:
             "reasoning_tokens": usage.thinking_tokens,
         },
     }
-
-
-def _sse(data: dict[str, Any]) -> str:
-    return f"data: {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}\n\n"
 
 
 def _error_body(message: str, error_type: str) -> dict[str, Any]:

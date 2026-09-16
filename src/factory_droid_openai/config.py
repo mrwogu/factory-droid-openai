@@ -69,6 +69,9 @@ class Settings:
     session_continuity: bool = False
     auto_reasoning_continuity: bool = True
     max_tracked_sessions: int = 256
+    # Continuation references (tool-call ids, reasoning digests, response ids)
+    # remembered per tracked session before the oldest is dropped.
+    max_session_references: int = 128
     mcp_settle_seconds: float = 0.0
     model_cache_seconds: float = 300.0
     model_quarantine_seconds: float = 900.0
@@ -337,6 +340,10 @@ class Settings:
             "FACTORY_DROID_OPENAI_MAX_TRACKED_SESSIONS",
             default=256,
         )
+        max_session_references = _positive_int(
+            "FACTORY_DROID_OPENAI_MAX_SESSION_REFERENCES",
+            default=128,
+        )
         mcp_settle_seconds = _non_negative_float(
             "FACTORY_DROID_OPENAI_MCP_SETTLE_SECONDS",
             default=0.0,
@@ -440,6 +447,7 @@ class Settings:
             session_continuity=session_continuity,
             auto_reasoning_continuity=auto_reasoning_continuity,
             max_tracked_sessions=max_tracked_sessions,
+            max_session_references=max_session_references,
             mcp_settle_seconds=mcp_settle_seconds,
             model_cache_seconds=model_cache_seconds,
             model_quarantine_seconds=model_quarantine_seconds,

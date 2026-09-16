@@ -1483,6 +1483,7 @@ error types.
 | `FACTORY_DROID_OPENAI_SESSION_CONTINUITY` | `false` | Allow continuing bridge-created sessions |
 | `FACTORY_DROID_OPENAI_AUTO_REASONING_CONTINUITY` | `true` | Resume tracked tool loops and signed reasoning automatically |
 | `FACTORY_DROID_OPENAI_MAX_TRACKED_SESSIONS` | `256` | Continuable sessions kept in memory |
+| `FACTORY_DROID_OPENAI_MAX_SESSION_REFERENCES` | `128` | Continuation references kept per tracked session |
 | `FACTORY_DROID_OPENAI_WORKTREE` | unset | Run Droid in a git worktree |
 | `FACTORY_DROID_OPENAI_APPEND_SYSTEM_PROMPT_FILE` | unset | File appended to the Droid system prompt |
 | `FACTORY_DROID_OPENAI_MODEL_ALIAS` | `factory-droid` | Alias using Droid default model |
@@ -1717,8 +1718,10 @@ responses are stored. Tool-call turns, malformed notices, truncated or
 capped output, and empty completions are never cached, and neither are
 streaming or session-continuation requests. A hit returns a fresh response
 envelope - a new `id`, `created`, and `x-request-id` - with the cached
-choices and usage replayed verbatim. The replayed `usage` describes the
-original generation, not the cost of the hit.
+choices and usage replayed verbatim, except that signed `reasoning_details`
+are removed before storing: their digest is a live continuation reference,
+and a replay must not hand it to a caller who never ran the turn. The
+replayed `usage` describes the original generation, not the cost of the hit.
 
 A hit skips admission, the warm pool, and the runner entirely, so cached
 traffic cannot occupy a Droid slot. When auth probing is enabled, its failure
