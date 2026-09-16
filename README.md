@@ -1276,9 +1276,11 @@ parser as Chat Completions. It supports:
 
 Only function tools are supported. Built-in OpenAI tools, remote media,
 background responses, Conversations, prompt templates, retrieval, cancellation,
-and deletion are not implemented. `previous_response_id` works only while the
-same bridge process still tracks the Droid session. Unknown or expired IDs
-return `404 session_not_found`.
+and deletion are not implemented. `reasoning.summary` (`auto`, `concise`,
+`detailed`) is accepted and echoed but not forwarded to Droid. `store` is
+echoed and ignored; the bridge does not persist responses. `previous_response_id`
+works only while the same bridge process still tracks the Droid session.
+Unknown or expired IDs return `404 session_not_found`.
 
 ### Multimodal attachments
 
@@ -1429,8 +1431,9 @@ Non-streaming failures use the OpenAI error object:
 | `503` | Droid executable unavailable |
 | `504` | Request timeout |
 
-After streaming headers are sent, errors arrive as an SSE `error` object
-followed by `[DONE]`.
+After streaming headers are sent, Chat Completions errors arrive as an SSE
+`error` object followed by `[DONE]`. Responses streams emit `error` then
+`response.failed`.
 
 Droid lists every model its CLI knows about, including ones a provider or
 organization policy refuses to serve. Such a refusal becomes `404` with type

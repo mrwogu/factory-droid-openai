@@ -795,6 +795,7 @@ async def test_response_stream_keeps_late_encrypted_reasoning_after_text() -> No
         event["item"]["type"] for event in events if event["type"] == "response.output_item.done"
     ]
     assert done_items == ["message", "reasoning"]
+    assert [event["sequence_number"] for event in events] == list(range(len(events)))
 
 
 @pytest.mark.asyncio

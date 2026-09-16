@@ -860,13 +860,20 @@ class _ResponsesStreamState:
         status = "incomplete" if self.finish_reason == "length" else "completed"
         # Done blocks follow allocation order too, so the emitted
         # output_index values match the final response.output array even
-        # when encrypted reasoning arrived after message text.
-        blocks: list[tuple[int, list[str]]] = []
+        # when encrypted reasoning arrived after message text. Sequence
+        # numbers are assigned at yield, not at construction, so a late
+        # reasoning item cannot rewind the stream.
+        blocks: list[tuple[int, str]] = []
         if self.reasoning_index is not None:
-            blocks.append((self.reasoning_index, self._reasoning_done_events()))
+            blocks.append((self.reasoning_index, "reasoning"))
         if self.message_index is not None:
-            blocks.append((self.message_index, self._message_done_events(status)))
-        for _, events in sorted(blocks, key=lambda block: block[0]):
+            blocks.append((self.message_index, "message"))
+        for _, kind in sorted(blocks, key=lambda block: block[0]):
+            events = (
+                self._reasoning_done_events()
+                if kind == "reasoning"
+                else self._message_done_events(status)
+            )
             for event in events:
                 yield event
         yield self.event(
@@ -874,73 +881,63 @@ class _ResponsesStreamState:
             response=self.response(status),
         )
 
-    def _reasoning_done_events(self) -> list[str]:
+    def _reasoning_done_events(self) -> Iterator[str]:
         item = _reasoning_item(
             self.plan.reasoning_item_id,
             self.reasoning_text,
             self.reasoning_details,
         )
-        events: list[str] = []
         if self.reasoning_text:
-            events.append(
-                self.event(
-                    "response.reasoning_text.done",
-                    item_id=self.plan.reasoning_item_id,
-                    output_index=self.reasoning_index,
-                    content_index=0,
-                    text=self.reasoning_text,
-                )
-            )
-            events.append(
-                self.event(
-                    "response.content_part.done",
-                    item_id=self.plan.reasoning_item_id,
-                    output_index=self.reasoning_index,
-                    content_index=0,
-                    part={
-                        "type": "reasoning_text",
-                        "text": self.reasoning_text,
-                    },
-                )
-            )
-        events.append(
-            self.event(
-                _OUTPUT_ITEM_DONE_EVENT,
+            yield self.event(
+                "response.reasoning_text.done",
+                item_id=self.plan.reasoning_item_id,
                 output_index=self.reasoning_index,
-                item=item,
-            )
-        )
-        return events
-
-    def _message_done_events(self, status: str) -> list[str]:
-        item = _message_item(self.plan.message_item_id, self.text, status)
-        return [
-            self.event(
-                "response.output_text.done",
-                item_id=self.plan.message_item_id,
-                output_index=self.message_index,
                 content_index=0,
-                text=self.text,
-                logprobs=[],
-            ),
-            self.event(
+                text=self.reasoning_text,
+            )
+            yield self.event(
                 "response.content_part.done",
-                item_id=self.plan.message_item_id,
-                output_index=self.message_index,
+                item_id=self.plan.reasoning_item_id,
+                output_index=self.reasoning_index,
                 content_index=0,
                 part={
-                    "type": "output_text",
-                    "text": self.text,
-                    "annotations": [],
-                    "logprobs": [],
+                    "type": "reasoning_text",
+                    "text": self.reasoning_text,
                 },
-            ),
-            self.event(
-                _OUTPUT_ITEM_DONE_EVENT,
-                output_index=self.message_index,
-                item=item,
-            ),
-        ]
+            )
+        yield self.event(
+            _OUTPUT_ITEM_DONE_EVENT,
+            output_index=self.reasoning_index,
+            item=item,
+        )
+
+    def _message_done_events(self, status: str) -> Iterator[str]:
+        item = _message_item(self.plan.message_item_id, self.text, status)
+        yield self.event(
+            "response.output_text.done",
+            item_id=self.plan.message_item_id,
+            output_index=self.message_index,
+            content_index=0,
+            text=self.text,
+            logprobs=[],
+        )
+        yield self.event(
+            "response.content_part.done",
+            item_id=self.plan.message_item_id,
+            output_index=self.message_index,
+            content_index=0,
+            part={
+                "type": "output_text",
+                "text": self.text,
+                "annotations": [],
+                "logprobs": [],
+            },
+        )
+        yield self.event(
+            _OUTPUT_ITEM_DONE_EVENT,
+            output_index=self.message_index,
+            item=item,
+        )
 
     def _next_output_index(self) -> int:
         return len(self.output_order)
