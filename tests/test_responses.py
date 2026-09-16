@@ -17,6 +17,7 @@ from factory_droid_openai.responses import (
     _reasoning_item,
     _response_output,
     _responses_usage,
+    _stream_error_fields,
     build_responses_plan,
     continuation_references_from_chat,
     reasoning_details_digest,
@@ -656,13 +657,46 @@ async def test_response_stream_maps_errors_and_ignores_non_choice_data() -> None
 
     assert drained is True
     assert events[0]["type"] == "response.created"
-    assert events[-1] == {
+    assert events[-2] == {
         "type": "error",
         "sequence_number": 2,
         "code": "backend",
         "message": "Factory Droid failed.",
         "param": None,
     }
+    failed = events[-1]
+    assert failed["type"] == "response.failed"
+    assert failed["sequence_number"] == 3
+    assert failed["response"]["status"] == "failed"
+    assert failed["response"]["completed_at"] is None
+    assert failed["response"]["error"] == {
+        "code": "backend",
+        "message": "Factory Droid failed.",
+    }
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            {"type": "backend", "message": "", "param": 7},
+            {
+                "code": "backend",
+                "message": "Factory Droid failed.",
+                "param": None,
+            },
+        ),
+        (
+            {"code": "overloaded", "message": "busy", "param": "model"},
+            {"code": "overloaded", "message": "busy", "param": "model"},
+        ),
+    ],
+)
+def test_stream_error_fields_normalize_backend_errors(
+    error: dict[str, object],
+    expected: dict[str, str | None],
+) -> None:
+    assert _stream_error_fields(error) == expected
 
 
 @pytest.mark.asyncio

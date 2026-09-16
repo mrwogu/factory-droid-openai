@@ -7762,6 +7762,66 @@ async def test_stop_sequence_does_not_count_as_an_empty_completion(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_terminal_reasoning_details_are_not_empty_completions(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
+    details = (
+        {
+            "type": "reasoning.encrypted",
+            "data": "encrypted-state",
+            "id": "reasoning-provider-1",
+            "format": "openai-responses-v1",
+            "index": 0,
+        },
+    )
+    runner = FakeRunner(
+        [
+            SessionStarted("session-reasoning-only"),
+            RunComplete(Usage(), reasoning_details=details),
+        ]
+    )
+    app = create_app(
+        Settings(
+            workdir=tmp_path,
+            timeout_seconds=30.0,
+            warm_sessions=0,
+            telemetry=False,
+            auth_probe_seconds=60.0,
+            auth_failure_threshold=3,
+        ),
+        runner_factory=cast("RunnerFactory", lambda: runner),
+    )
+    probe = app.state.auth_probe
+    assert probe is not None
+
+    async with _client(app) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json=_payload(stream=stream),
+        )
+
+    assert response.status_code == 200
+    if stream:
+        assert '"reasoning_details"' in response.text
+    else:
+        message = response.json()["choices"][0]["message"]
+        assert message["content"] is None
+        assert message["reasoning_details"] == list(details)
+    empties = [
+        json.loads(line)
+        for line in log_stream.getvalue().splitlines()
+        if json.loads(line)["event"] == "chat.empty_completion"
+    ]
+    assert empties == []
+    assert "factory_droid_openai_empty_completions_total 0" in app.state.metrics.render()
+    assert probe._trigger.is_set() is False
+
+
+@pytest.mark.asyncio
 async def test_collect_completion_ignores_unmapped_runner_events() -> None:
     runner = FakeRunner(
         [

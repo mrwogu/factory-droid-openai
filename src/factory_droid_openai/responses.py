@@ -122,10 +122,21 @@ async def response_stream_from_chat(
             data = _sse_object(raw)
             if data is None:
                 continue
-            error_event = _stream_error_event(state, data)
-            if error_event is not None:
-                yield error_event
+            error = data.get("error")
+            if isinstance(error, dict):
+                fields = _stream_error_fields(error)
+                yield state.event("error", **fields)
                 await _drain_stream(chat_stream)
+                yield state.event(
+                    "response.failed",
+                    response=state.response(
+                        "failed",
+                        error={
+                            "code": fields["code"],
+                            "message": fields["message"],
+                        },
+                    ),
+                )
                 return
             for event in _stream_update_events(state, data):
                 yield event
@@ -142,19 +153,12 @@ def _sse_object(raw: str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def _stream_error_event(
-    state: _ResponsesStreamState,
-    data: dict[str, Any],
-) -> str | None:
-    error = data.get("error")
-    if not isinstance(error, dict):
-        return None
-    return state.event(
-        "error",
-        code=_optional_string(error.get("code") or error.get("type")),
-        message=str(error.get("message") or "Factory Droid failed."),
-        param=_optional_string(error.get("param")),
-    )
+def _stream_error_fields(error: dict[str, Any]) -> dict[str, str | None]:
+    return {
+        "code": _optional_string(error.get("code") or error.get("type")),
+        "message": str(error.get("message") or "Factory Droid failed."),
+        "param": _optional_string(error.get("param")),
+    }
 
 
 def _stream_choice(
@@ -657,7 +661,12 @@ class _ResponsesStreamState:
         self.sequence += 1
         return _sse(payload)
 
-    def response(self, status: str) -> dict[str, Any]:
+    def response(
+        self,
+        status: str,
+        *,
+        error: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         # Output follows allocation order so every output_index emitted in an
         # event matches its position in this array. Encrypted reasoning can
         # only arrive with the terminal chunk, after text already started, so
@@ -685,7 +694,7 @@ class _ResponsesStreamState:
             "created_at": self.created_at,
             "completed_at": time.time() if status == "completed" else None,
             "status": status,
-            "error": None,
+            "error": error,
             "incomplete_details": (
                 {"reason": "max_output_tokens"} if status == "incomplete" else None
             ),

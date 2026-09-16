@@ -2285,6 +2285,7 @@ def create_app(
                     if (
                         choice_message["content"] is None
                         and not choice_message.get("tool_calls")
+                        and not completed_result.reasoning_details
                         and not completed_result.stopped
                         and not completed_result.output_capped
                     ):
@@ -3488,6 +3489,7 @@ async def _stream_completion(
                 completion_callback(
                     not saw_text
                     and not saw_tool_call
+                    and not reasoning_details
                     and structured is None
                     and not stop_buffer.triggered
                 )
