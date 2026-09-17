@@ -2104,6 +2104,10 @@ def create_app(
                     retry_attempt_in_flight = 0
                     while True:
                         attempt_session_id: str | None = None
+                        # A failed attempt must not leak the previous
+                        # completion's truncation or malformed note into the
+                        # logging that follows the escalation branch.
+                        result = None
 
                         def record_attempt_session(started_id: str) -> None:
                             nonlocal attempt_session_id

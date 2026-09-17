@@ -4160,6 +4160,34 @@ async def test_tool_less_malformed_repeat_escalates_before_the_notice(
 
 
 @pytest.mark.asyncio
+async def test_truncated_phantom_retry_does_not_relog_stale_truncation(
+    tmp_path: Path,
+) -> None:
+    log_stream = _retry_log_stream()
+    runner = RetryRunner(
+        ["retry/truncated-tool.jsonl", "retry/valid-tool.jsonl", "retry/plain-answer.jsonl"]
+    )
+
+    response = await _post_completion(_app(tmp_path, runner), _payload())
+
+    # The truncated first attempt retries tool-less, the phantom repeat
+    # escalates, and the stale attempt-0 truncation must not re-enter the
+    # truncation log under the escalation's attempt number.
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "Direct answer"
+    assert len(runner.requests) == 3
+    assert runner.requests[1].session_id is None
+    assert runner.requests[2].session_id is None
+    records = _warning_records(log_stream)
+    truncations = [record for record in records if record["event"] == "chat.attempt_truncated"]
+    assert [record["attempt"] for record in truncations] == [0]
+    outcome = _single_retry_outcome(records)
+    assert outcome["reason"] == "tool_without_catalog_escalated"
+    assert outcome["outcome"] == "recovered"
+    assert outcome["attempt"] == 2
+
+
+@pytest.mark.asyncio
 async def test_non_streaming_trailing_output_without_session_logs_not_attempted(
     tmp_path: Path,
 ) -> None:
