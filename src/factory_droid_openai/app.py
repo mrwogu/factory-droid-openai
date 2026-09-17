@@ -2513,7 +2513,7 @@ class OutputTokenCap:
     per-token estimate only has to judge the text no snapshot has claimed.
     One early snapshot no longer disarms that fallback, so turns whose
     snapshots stop arriving still hit the cap instead of running free
-    (issues #130 and #139).
+    (issues #130, #139 and #149).
     """
 
     def __init__(self, limit: int | None) -> None:
