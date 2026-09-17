@@ -4256,6 +4256,154 @@ async def test_output_limit_keeps_fallback_after_snapshots_stop_arriving(
     assert choice["message"]["content"] == "x" * 300
 
 
+def _monster_argument_events(
+    argument_chars: int,
+    *,
+    baseline: int | None = 0,
+    early_snapshot: bool = True,
+    chunk_size: int = 512,
+) -> list[RunEvent]:
+    """The issue #149 burst shape: a monster tool-call argument in deltas.
+
+    The argument arrives as many small deltas with no RunComplete behind
+    them, mirroring a single long generation whose usage snapshot never
+    fires because the call never completes.
+    """
+    head = f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"'
+    monster = head + ("x" * argument_chars)
+    events: list[RunEvent] = [SessionStarted("replay-session", baseline)]
+    if early_snapshot:
+        events.append(UsageUpdate(Usage(output_tokens=5)))
+    events.extend(
+        TextDelta(monster[start : start + chunk_size])
+        for start in range(0, len(monster), chunk_size)
+    )
+    return events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_output_limit_caps_a_chunked_monster_argument_mid_stream(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    # Issue #149: the mid-turn text fallback must cut the turn while the
+    # monster argument is still streaming, not only judge it once the turn
+    # ends. No usage snapshot ever arrives behind these deltas.
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
+    runner = FakeRunner(_monster_argument_events(18338))
+    payload = _weather_payload(stream=stream, max_tokens=32)
+
+    response = await _post_completion(_app(tmp_path, runner), payload)
+
+    assert response.status_code == 200
+    records = _warning_records(log_stream)
+    truncated = next(record for record in records if record["event"] == "chat.truncated")
+    assert truncated["reason"] == "output token limit reached"
+    assert truncated["payload_bytes"] == 0
+    assert truncated["will_retry"] is False
+    assert truncated["has_tool_calls"] is False
+    assert len(runner.requests) == 1
+    if stream:
+        # The cut interrupts the Droid turn, so no argument byte reaches the
+        # wire in any form.
+        chunks = _sse_json_events(response)
+        assert not any(
+            choice["delta"].get("tool_calls") or choice["delta"].get("content")
+            for chunk in chunks
+            for choice in chunk["choices"]
+        )
+        assert '"finish_reason":"length"' in response.text
+    else:
+        choice = response.json()["choices"][0]
+        assert "tool_calls" not in choice["message"]
+        assert choice["message"]["content"] is None
+        assert choice["finish_reason"] == "length"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_output_limit_caps_a_single_flush_monster_delta(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    # The same monster arriving as one giant delta (a stream flush) still has
+    # to end the turn at the cap instead of draining on.
+    runner = FakeRunner(_monster_argument_events(71170, early_snapshot=True, chunk_size=71170))
+    payload = _weather_payload(stream=stream, max_tokens=32)
+
+    response = await _post_completion(_app(tmp_path, runner), payload)
+
+    assert response.status_code == 200
+    if stream:
+        assert '"finish_reason":"length"' in response.text
+        assert '"tool_calls"' not in response.text
+    else:
+        choice = response.json()["choices"][0]
+        assert "tool_calls" not in choice["message"]
+        assert choice["finish_reason"] == "length"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_output_limit_caps_a_monster_argument_without_a_baseline(
+    tmp_path: Path,
+    stream: bool,
+) -> None:
+    # A continuation whose loaded session carries no usage never learns a
+    # baseline; the text fallback still has to cut the monster on its own.
+    runner = FakeRunner(_monster_argument_events(18338, baseline=None, early_snapshot=False))
+    payload = _weather_payload(stream=stream, max_tokens=32)
+
+    response = await _post_completion(_app(tmp_path, runner), payload)
+
+    assert response.status_code == 200
+    if stream:
+        assert '"finish_reason":"length"' in response.text
+        assert '"tool_calls"' not in response.text
+    else:
+        choice = response.json()["choices"][0]
+        assert "tool_calls" not in choice["message"]
+        assert choice["finish_reason"] == "length"
+
+
+@pytest.mark.asyncio
+async def test_output_limit_keeps_a_completed_call_when_a_drain_phase_monster_is_capped(
+    tmp_path: Path,
+) -> None:
+    # A healthy call settles the turn, then a second in-flight call turns
+    # monstrous during the drain. The cap cuts the monster while the already
+    # completed call survives for the client to run.
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
+    good_call = (
+        f'{TOOL_CALL_OPEN}{{"name":"weather","arguments":{{"city":"Gdansk"}}}}{TOOL_CALL_CLOSE}'
+    )
+    runner = FakeRunner(
+        _output_cap_events(
+            TextDelta(good_call),
+            UsageUpdate(Usage(output_tokens=3)),
+            *(_monster_argument_events(18338, baseline=None, early_snapshot=False)[1:]),
+        )
+    )
+    payload = _weather_payload(max_tokens=32)
+
+    async with _client(_app(tmp_path, runner)) as client:
+        response = await client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert [call["function"]["name"] for call in choice["message"]["tool_calls"]] == ["weather"]
+    assert choice["finish_reason"] == "tool_calls"
+    assert len(runner.requests) == 1
+    records = _warning_records(log_stream)
+    truncated = next(record for record in records if record["event"] == "chat.attempt_truncated")
+    assert truncated["reason"] == "output token limit reached"
+    assert truncated["payload_bytes"] == 0
+    assert truncated["has_tool_calls"] is True
+
+
 @pytest.mark.asyncio
 async def test_output_limit_keeps_fallback_after_unchanged_usage_snapshot(
     tmp_path: Path,
