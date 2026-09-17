@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.12.0](https://github.com/mrwogu/factory-droid-openai/compare/v1.11.1...v1.12.0) (2026-09-17)
+
+
+### Features
+
+* **api:** add Responses API reasoning continuity ([#148](https://github.com/mrwogu/factory-droid-openai/issues/148)) ([04695ea](https://github.com/mrwogu/factory-droid-openai/commit/04695ead7ed82f2c84ffc04c42a6f7cde6d9d63c))
+
+
+### Bug Fixes
+
+* **api:** escalate a repeated phantom-tool or trailing-prose retry ([#153](https://github.com/mrwogu/factory-droid-openai/issues/153)) ([88c59ff](https://github.com/mrwogu/factory-droid-openai/commit/88c59ff266c08e71da3eada249fbbded075b8d1f))
+
 ## [1.11.1](https://github.com/mrwogu/factory-droid-openai/compare/v1.11.0...v1.11.1) (2026-09-14)
 
 
