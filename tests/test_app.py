@@ -516,11 +516,16 @@ def _continuation_app(tmp_path: Path, runner: FakeRunner) -> Any:
     return app
 
 
-def _assert_retry_refailed(log_stream: io.StringIO, reason: str) -> None:
+def _assert_retry_refailed(
+    log_stream: io.StringIO,
+    reason: str,
+    *,
+    attempt: int = 1,
+) -> None:
     outcome = _single_retry_outcome(_warning_records(log_stream))
     assert outcome["reason"] == reason
     assert outcome["outcome"] == "refailed"
-    assert outcome["attempt"] == 1
+    assert outcome["attempt"] == attempt
 
 
 def _assert_same_session_retry_recovered(
@@ -3737,15 +3742,51 @@ async def test_non_streaming_tool_without_catalog_retries_fresh_session(tmp_path
 @pytest.mark.asyncio
 async def test_non_streaming_tool_without_catalog_retry_is_bounded(tmp_path: Path) -> None:
     log_stream = _retry_log_stream()
-    runner = RetryRunner(["retry/valid-tool.jsonl", "retry/valid-tool.jsonl"])
+    runner = RetryRunner(
+        ["retry/valid-tool.jsonl", "retry/valid-tool.jsonl", "retry/valid-tool.jsonl"]
+    )
 
     response = await _post_completion(_app(tmp_path, runner), _payload())
 
     assert response.status_code == 502
-    assert len(runner.requests) == 2
+    assert len(runner.requests) == 3
     assert runner.requests[1].session_id is None
+    assert runner.requests[2].session_id is None
     assert "no tools are available" in runner.requests[1].prompt
-    _assert_retry_refailed(log_stream, "tool_without_catalog")
+    # The second correction carries the escalated note before the turn fails.
+    assert "previous two responses" in runner.requests[2].prompt
+    assert runner.requests[0].prompt in runner.requests[2].prompt
+    _assert_retry_refailed(log_stream, "tool_without_catalog_escalated", attempt=2)
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_tool_without_catalog_escalated_retry_recovers(
+    tmp_path: Path,
+) -> None:
+    log_stream = _retry_log_stream()
+    runner = RetryRunner(
+        ["retry/valid-tool.jsonl", "retry/valid-tool.jsonl", "retry/plain-answer.jsonl"]
+    )
+
+    response = await _post_completion(_app(tmp_path, runner), _payload())
+
+    # The issue #150 burst shape: the corrected attempt repeats the
+    # hallucination, and only the escalated second retry recovers.
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "Direct answer"
+    assert len(runner.requests) == 3
+    assert runner.requests[1].session_id is None
+    assert runner.requests[2].session_id is None
+    assert "no tools are available" in runner.requests[1].prompt
+    assert "previous two responses" in runner.requests[2].prompt
+    assert runner.requests[0].prompt in runner.requests[2].prompt
+    records = _warning_records(log_stream)
+    retries = [record for record in records if record["event"] == "chat.retry"]
+    assert [retry["attempt"] for retry in retries] == [1, 2]
+    outcome = _single_retry_outcome(records)
+    assert outcome["reason"] == "tool_without_catalog_escalated"
+    assert outcome["outcome"] == "recovered"
+    assert outcome["attempt"] == 2
 
 
 @pytest.mark.asyncio
@@ -3812,16 +3853,24 @@ async def test_non_streaming_message_shaped_phantom_retry_is_bounded(
     tmp_path: Path,
 ) -> None:
     log_stream = _retry_log_stream()
-    runner = RetryRunner(["retry/message-shaped-tool.jsonl", "retry/message-shaped-tool.jsonl"])
+    runner = RetryRunner(
+        [
+            "retry/message-shaped-tool.jsonl",
+            "retry/message-shaped-tool.jsonl",
+            "retry/message-shaped-tool.jsonl",
+        ]
+    )
 
     response = await _post_completion(_app(tmp_path, runner), _payload())
 
     assert response.status_code == 502
-    assert len(runner.requests) == 2
+    assert len(runner.requests) == 3
     assert runner.requests[1].session_id is None
+    assert runner.requests[2].session_id is None
     assert runner.requests[1].warm_session is None
     assert "no tools are available" in runner.requests[1].prompt
-    _assert_retry_refailed(log_stream, "tool_without_catalog")
+    assert "previous two responses" in runner.requests[2].prompt
+    _assert_retry_refailed(log_stream, "tool_without_catalog_escalated", attempt=2)
 
 
 @pytest.mark.asyncio
@@ -3995,14 +4044,147 @@ async def test_non_streaming_trailing_output_retries_same_session(tmp_path: Path
 @pytest.mark.asyncio
 async def test_non_streaming_trailing_output_retry_is_bounded(tmp_path: Path) -> None:
     log_stream = _retry_log_stream()
-    runner = RetryRunner(["retry/trailing-tool.jsonl", "retry/trailing-tool.jsonl"])
+    runner = RetryRunner(
+        ["retry/trailing-tool.jsonl", "retry/trailing-tool.jsonl", "retry/trailing-tool.jsonl"]
+    )
 
     response = await _post_completion(_app(tmp_path, runner), _weather_payload())
 
     assert response.status_code == 502
-    assert len(runner.requests) == 2
+    assert len(runner.requests) == 3
     assert runner.requests[1].session_id == "replay-session"
-    _assert_retry_refailed(log_stream, "trailing_output")
+    assert runner.requests[2].session_id == "replay-session"
+    assert "previous two responses" in runner.requests[2].prompt
+    _assert_retry_refailed(log_stream, "trailing_output_escalated", attempt=2)
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_trailing_output_escalated_retry_recovers(
+    tmp_path: Path,
+) -> None:
+    log_stream = _retry_log_stream()
+    runner = RetryRunner(
+        ["retry/trailing-tool.jsonl", "retry/trailing-tool.jsonl", "retry/valid-tool.jsonl"]
+    )
+
+    response = await _post_completion(_app(tmp_path, runner), _weather_payload())
+
+    assert response.status_code == 200
+    tool_calls = response.json()["choices"][0]["message"]["tool_calls"]
+    assert tool_calls is not None
+    assert tool_calls[0]["function"]["name"] == "weather"
+    assert len(runner.requests) == 3
+    assert runner.requests[1].session_id == "replay-session"
+    assert runner.requests[2].session_id == "replay-session"
+    assert runner.requests[2].prompt == (
+        "Your previous two responses contained text after the tool call. Return the "
+        "required tool call as one complete valid tool call and stop immediately. Output "
+        "absolutely nothing after it."
+    )
+    outcome = _single_retry_outcome(_warning_records(log_stream))
+    assert outcome["reason"] == "trailing_output_escalated"
+    assert outcome["outcome"] == "recovered"
+    assert outcome["attempt"] == 2
+
+
+@pytest.mark.asyncio
+async def test_continuation_tool_without_catalog_escalated_retry_keeps_session(
+    tmp_path: Path,
+) -> None:
+    runner = RetryRunner(
+        ["retry/valid-tool.jsonl", "retry/valid-tool.jsonl", "retry/plain-answer.jsonl"]
+    )
+    app = _continuation_app(tmp_path, runner)
+    payload = _payload(factory_droid_session_id="session-9")
+
+    response = await _post_completion(app, payload)
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "Direct answer"
+    assert len(runner.requests) == 3
+    assert runner.requests[1].session_id == "replay-session"
+    assert runner.requests[2].session_id == "replay-session"
+    # Same-session retries resend only the correction note, escalated the
+    # second time.
+    assert runner.requests[2].prompt == (
+        "Your previous two responses attempted a tool call, but this conversation has no "
+        "tools. Emit no tool call, no tool-call markers, and no function syntax of any "
+        "kind. Answer the original request directly with plain text only."
+    )
+
+
+@pytest.mark.asyncio
+async def test_retry_does_not_escalate_when_the_correction_changes_the_defect(
+    tmp_path: Path,
+) -> None:
+    log_stream = _retry_log_stream()
+    runner = RetryRunner(["retry/malformed-tool.jsonl", "retry/trailing-tool.jsonl"])
+
+    response = await _post_completion(_app(tmp_path, runner), _weather_payload())
+
+    # The first correction traded a malformed call for trailing prose, which
+    # is not the repeat the escalation is reserved for, so the turn fails.
+    assert response.status_code == 502
+    assert len(runner.requests) == 2
+    _assert_retry_refailed(log_stream, "malformed_tool_call")
+
+
+@pytest.mark.asyncio
+async def test_tool_less_malformed_repeat_escalates_before_the_notice(
+    tmp_path: Path,
+) -> None:
+    log_stream = _retry_log_stream()
+    mangled = (
+        'safe answer (reset|", '
+        '"tool_calls":"id":"call_1","type":"function","function":'
+        '("name":"weather","arguments":("city":"Gdansk"))'
+    )
+    runner = FakeRunner([TextDelta(mangled), RunComplete(Usage())])
+
+    response = await _post_completion(_app(tmp_path, runner), _payload())
+
+    # A malformed transcript fragment on a tool-less request carries the
+    # tool_without_catalog retry reason too, so its repeat escalates the
+    # same way before the turn settles on the malformed notice.
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "stop"
+    assert choice["message"]["content"].startswith("safe answer (reset|")
+    assert "[bridge notice: dropped a malformed tool call" in choice["message"]["content"]
+    assert len(runner.requests) == 3
+    assert runner.requests[1].session_id is None
+    assert runner.requests[2].session_id is None
+    assert "no tools are available" in runner.requests[1].prompt
+    assert "previous two responses" in runner.requests[2].prompt
+    _assert_retry_refailed(log_stream, "tool_without_catalog_escalated", attempt=2)
+
+
+@pytest.mark.asyncio
+async def test_truncated_phantom_retry_does_not_relog_stale_truncation(
+    tmp_path: Path,
+) -> None:
+    log_stream = _retry_log_stream()
+    runner = RetryRunner(
+        ["retry/truncated-tool.jsonl", "retry/valid-tool.jsonl", "retry/plain-answer.jsonl"]
+    )
+
+    response = await _post_completion(_app(tmp_path, runner), _payload())
+
+    # The truncated first attempt retries tool-less, the phantom repeat
+    # escalates, and the stale attempt-0 truncation must not re-enter the
+    # truncation log under the escalation's attempt number.
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "Direct answer"
+    assert len(runner.requests) == 3
+    assert runner.requests[1].session_id is None
+    assert runner.requests[2].session_id is None
+    records = _warning_records(log_stream)
+    truncations = [record for record in records if record["event"] == "chat.attempt_truncated"]
+    assert [record["attempt"] for record in truncations] == [0]
+    outcome = _single_retry_outcome(records)
+    assert outcome["reason"] == "tool_without_catalog_escalated"
+    assert outcome["outcome"] == "recovered"
+    assert outcome["attempt"] == 2
 
 
 @pytest.mark.asyncio

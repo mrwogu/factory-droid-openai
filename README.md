@@ -308,8 +308,11 @@ the client. The notice names no tool-call format, because anything it named
 would itself be tool-call-shaped text in assistant content.
 
 **Retries.** Streaming requests are never retried, because response bytes
-may already have reached the client. Every retry below runs once, on a
-non-streaming request, and keeps the original request deadline.
+may already have reached the client. Every retry below runs on a
+non-streaming request and keeps the original request deadline. Most reasons
+retry once; a repeated phantom tool call on a tool-less request and repeated
+prose after a tool call earn one further retry with an escalated correction
+note before the turn fails (issue #150).
 
 - Before returning the stop notice, the bridge retries one malformed or
   incomplete call when no valid call was already produced. Explicit
@@ -338,8 +341,10 @@ Never retried:
 When the retry hits the same problem again, a repeated malformed call
 still returns the notice, a repeated truncated call fails with a `502`
 `truncated_tool_call` error envelope instead of a half-written body
-(issue #139), and a repeated tool call on a
-tool-less request or repeated prose after a tool call fails the turn.
+(issue #139), and a repeated tool call on a tool-less request or repeated
+prose after a tool call runs the escalated second retry first and fails the
+turn only when that correction repeats too. A corrected attempt that fails
+with a different defect gets no escalation and fails immediately.
 
 **Token caps.** `max_tokens` and `max_completion_tokens` stop the Droid
 turn once the limit is reached, and the completion ends with
@@ -369,8 +374,9 @@ client can retry or split the request itself.
   after a valid call, and `has_tool_calls` makes clear why that partial
   call cannot be retried regardless of its size.
 - `chat.truncated` is reserved for the final request outcome.
-- `chat.retry` names the reason, model, warm state, and warm age of the
-  attempt that will be retried.
+- `chat.retry` names the reason, retry number, model, warm state, and warm
+  age of the attempt that will be retried. The retry number distinguishes
+  the first correction from the escalated second retry.
 - `chat.retry_outcome` closes the loop with `recovered`, `refailed`, or
   `not_attempted` plus the retry's attempt number on the same
   `request_id`. `not_attempted` marks a same-session retry reason that had

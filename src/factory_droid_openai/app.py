@@ -117,7 +117,9 @@ ModelOutputRetryReason = Literal[
     "malformed_tool_call",
     "structured_output",
     "tool_without_catalog",
+    "tool_without_catalog_escalated",
     "trailing_output",
+    "trailing_output_escalated",
     "truncated_tool_call",
 ]
 RetryOutcome = Literal["recovered", "refailed", "not_attempted"]
@@ -155,9 +157,19 @@ _MODEL_OUTPUT_RETRY_PROMPTS: dict[ModelOutputRetryReason, str] = {
         "Your previous response attempted a tool call, but no tools are available. Answer "
         "the original request directly without any tool call or explanation about this correction."
     ),
+    "tool_without_catalog_escalated": (
+        "Your previous two responses attempted a tool call, but this conversation has no "
+        "tools. Emit no tool call, no tool-call markers, and no function syntax of any kind. "
+        "Answer the original request directly with plain text only."
+    ),
     "trailing_output": (
         "Your previous response contained text after the tool call. Return the required "
         "tool call again as one complete valid tool call. Output no explanation."
+    ),
+    "trailing_output_escalated": (
+        "Your previous two responses contained text after the tool call. Return the "
+        "required tool call as one complete valid tool call and stop immediately. Output "
+        "absolutely nothing after it."
     ),
     "truncated_tool_call": (
         "A previous tool call attempt was incomplete. Return the required tool call as one "
@@ -165,6 +177,16 @@ _MODEL_OUTPUT_RETRY_PROMPTS: dict[ModelOutputRetryReason, str] = {
     ),
 }
 _TRAILING_OUTPUT_ERROR_PREFIX = "unexpected text after tool call"
+# Burst traffic can repeat a phantom tool call or trailing prose after the
+# correction, so those two shapes earn one escalated second retry before the
+# turn fails; every other retry reason stays single-shot (issue #150).
+_ESCALATABLE_RETRY_REASONS = frozenset(("tool_without_catalog", "trailing_output"))
+# Isolated requests retry these reasons in a fresh session with the full
+# original prompt; everything else reuses the attempt's session with the
+# correction note alone.
+_FRESH_SESSION_RETRY_REASONS = frozenset(
+    ("tool_without_catalog", "tool_without_catalog_escalated", "truncated_tool_call")
+)
 # The bridge ships no tokenizer, so the text-length fallback in OutputTokenCap
 # counts roughly 4 characters per output token; Droid's own usage snapshots
 # stay authoritative for the text they cover. The fallback only judges text no
@@ -2060,6 +2082,7 @@ def create_app(
         total_usage = Usage()
         started_session: str | None = None
         retry_reason_in_flight: ModelOutputRetryReason | None = None
+        retry_attempt_in_flight = 0
         empty_choices = 0
         cacheable_result = False
         try:
@@ -2078,8 +2101,13 @@ def create_app(
                     attempt = 0
                     retry_in_flight = False
                     retry_reason_in_flight = None
+                    retry_attempt_in_flight = 0
                     while True:
                         attempt_session_id: str | None = None
+                        # A failed attempt must not leak the previous
+                        # completion's truncation or malformed note into the
+                        # logging that follows the escalation branch.
+                        result = None
 
                         def record_attempt_session(started_id: str) -> None:
                             nonlocal attempt_session_id
@@ -2108,7 +2136,10 @@ def create_app(
                             # A tool call on a tool-less request and prose after
                             # a tool call are transient model behavior, so they
                             # retry once instead of failing the turn with a
-                            # hard 502 (issues #124 and #128).
+                            # hard 502 (issues #124 and #128). Burst traffic
+                            # can repeat the defect after the correction, so
+                            # a repeated shape earns one escalated retry
+                            # before the turn fails (issue #150).
                             shape = _retryable_protocol_error(exc)
                             retry_reason = _protocol_error_retry_reason(
                                 shape,
@@ -2119,6 +2150,11 @@ def create_app(
                             if retry_reason is None:
                                 if shape is not None and attempt == 0:
                                     _log_retry_outcome(shape, "not_attempted", attempt=attempt)
+                                raise
+                            if attempt == 1 and retry_reason != retry_reason_in_flight:
+                                # The corrected attempt failed with a different
+                                # defect, so the escalation reserved for a
+                                # repeat does not apply and the turn fails.
                                 raise
                         else:
                             if result is None:
@@ -2172,15 +2208,28 @@ def create_app(
                                     else:
                                         raise
 
-                        retry_request = (
-                            _model_output_retry_request(
-                                choice_request,
-                                session_id=attempt_session_id,
-                                reason=retry_reason,
-                            )
-                            if attempt == 0 and retry_reason is not None
-                            else None
-                        )
+                        retry_request = None
+                        if retry_reason is not None:
+                            if attempt == 0:
+                                retry_request = _model_output_retry_request(
+                                    choice_request,
+                                    session_id=attempt_session_id,
+                                    reason=retry_reason,
+                                )
+                            elif (
+                                attempt == 1
+                                and retry_reason == retry_reason_in_flight
+                                and retry_reason in _ESCALATABLE_RETRY_REASONS
+                            ):
+                                # The first corrected attempt repeated the same
+                                # defect, so one escalated retry runs before the
+                                # turn fails (issue #150).
+                                retry_reason = _escalated_retry_reason(retry_reason)
+                                retry_request = _model_output_retry_request(
+                                    choice_request,
+                                    session_id=attempt_session_id,
+                                    reason=retry_reason,
+                                )
                         if result is not None and result.truncation is not None:
                             _log_truncated_tool_call(
                                 result.truncation,
@@ -2216,10 +2265,14 @@ def create_app(
                         retry_reason = cast("ModelOutputRetryReason", retry_reason)
                         retry_in_flight = True
                         retry_reason_in_flight = retry_reason
+                        retry_attempt_in_flight = attempt + 1
+                        # The retry number tells censuses apart from the
+                        # escalated second retry of a repeated defect.
                         log_warning(
                             "chat.retry",
                             stream=False,
                             reason=retry_reason,
+                            attempt=attempt + 1,
                             model=payload.model,
                             warm=attempt_request.warm_session is not None,
                             warm_age_ms=(
@@ -2235,7 +2288,7 @@ def create_app(
                                 timeout_seconds=timeout_seconds,
                             )
                         attempt_request = retry_request
-                        attempt = 1
+                        attempt += 1
 
                     completed_result = cast("CollectedCompletion", result)
                     if completed_result.truncation is not None and not completed_result.tool_calls:
@@ -2315,7 +2368,9 @@ def create_app(
         except ProtocolError as exc:
             request.state.telemetry_error_type = "factory_protocol_error"
             if retry_reason_in_flight is not None:
-                _log_retry_outcome(retry_reason_in_flight, "refailed", attempt=1)
+                _log_retry_outcome(
+                    retry_reason_in_flight, "refailed", attempt=retry_attempt_in_flight
+                )
             log_warning(
                 "chat.failed",
                 status=502,
@@ -2327,7 +2382,9 @@ def create_app(
         except RunnerError as exc:
             request.state.telemetry_error_type = exc.error_type
             if retry_reason_in_flight is not None:
-                _log_retry_outcome(retry_reason_in_flight, "refailed", attempt=1)
+                _log_retry_outcome(
+                    retry_reason_in_flight, "refailed", attempt=retry_attempt_in_flight
+                )
             log_warning(
                 "chat.failed",
                 status=exc.status_code,
@@ -2643,20 +2700,28 @@ def _protocol_error_retry_reason(
     request_session_id: str | None,
     attempt_session_id: str | None,
 ) -> ModelOutputRetryReason | None:
-    """One bounded retry for the retryable protocol-error shapes.
+    """Bounded retry for the retryable protocol-error shapes.
 
     A tool call on a tool-less request retries in a fresh session, which an
     isolated request can always start. Prose after a tool call keeps the same
-    session, so that session id has to be known. A repeated shape fails the
-    turn as before.
+    session, so that session id has to be known. Both shapes pass at the
+    first corrected attempt too, where the caller escalates a repeat once;
+    a shape that survives the second correction fails the turn (issue #150).
     """
-    if shape is None or attempt != 0:
+    if shape is None or attempt > 1:
         return None
     if shape == "tool_without_catalog" and request_session_id is None:
         return shape
     if attempt_session_id is None:
         return None
     return shape
+
+
+def _escalated_retry_reason(reason: ModelOutputRetryReason) -> ModelOutputRetryReason:
+    """The second-correction variant of an escalatable retry reason."""
+    if reason == "tool_without_catalog":
+        return "tool_without_catalog_escalated"
+    return "trailing_output_escalated"
 
 
 def _log_retry_outcome(
@@ -2679,22 +2744,13 @@ def _model_output_retry_request(
     session_id: str | None,
     reason: ModelOutputRetryReason,
 ) -> RunRequest | None:
-    if reason == "truncated_tool_call" and request.session_id is None:
+    if reason in _FRESH_SESSION_RETRY_REASONS and request.session_id is None:
+        # A phantom or truncated tool call poisons the session it arrived in,
+        # so an isolated request retries fresh with the full original prompt
+        # (issues #128 and #130). Continuations keep their session, like
+        # malformed output, because the bridge no longer holds their earlier
+        # history.
         # Sonar cannot infer that dataclasses.replace preserves the input type.
-        return cast(  # type: ignore[redundant-cast]
-            "RunRequest",
-            replace(
-                request,
-                prompt=f"{request.prompt}\n\n{_MODEL_OUTPUT_RETRY_PROMPTS[reason]}",
-                session_id=None,
-                warm_session=None,
-            ),
-        )
-    if reason == "tool_without_catalog" and request.session_id is None:
-        # A phantom tool call poisons the session it arrived in, so an
-        # isolated request retries fresh with the full original prompt
-        # (issue #128). Continuations keep their session, like malformed
-        # output, because the bridge no longer holds their earlier history.
         return cast(  # type: ignore[redundant-cast]
             "RunRequest",
             replace(
