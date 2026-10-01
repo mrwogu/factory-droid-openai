@@ -335,12 +335,17 @@ class DroidRpcExtension:
                 ):
                     raise
                 await cache.invalidate()
-                cache_revision, tool_ids, _ = await cache.get(
+                cache_revision, tool_ids, cache_hit = await cache.get(
                     discover,
                     dynamic_prefix=keep_tool_prefix,
                 )
                 rediscovered = True
                 if expected_tool_ids is not None:
+                    # A concurrent request can refill the snapshot between
+                    # invalidate() and get(); that hit lacks this call's
+                    # bridge tools, so restore them before verifying.
+                    if cache_hit:
+                        tool_ids.update(expected_tool_ids)
                     self._verify_native_tool_ids(tool_ids, expected_tool_ids)
                 continue
             verification = await self._list_tools(client)
