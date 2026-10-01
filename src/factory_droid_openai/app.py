@@ -1558,15 +1558,25 @@ def create_app(
             # so the probe gate turns an auth outage into one cheap rejection.
             auth_probe.suspect()
             request.state.telemetry_error_type = "factory_auth_error"
+            probe_reason = auth_probe.last_failure_reason
             log_warning(
                 "chat.rejected",
                 status=503,
                 phase="auth_probe",
                 consecutive=auth_probe.consecutive_failures,
+                reason=probe_reason,
+            )
+            # A failing probe is not always a dead key (#157: a server-side
+            # tool rename failed every probe), so the gate surfaces the
+            # probe's own reason instead of assuming a rotation.
+            suffix = "" if probe_reason is None else f": {probe_reason}"
+            message = (
+                f"The bridge's Factory auth probes are failing "
+                f"({auth_probe.consecutive_failures} in a row){suffix}. "
+                "See the auth field on /health."
             )
             return _error_response(
-                "The bridge's Factory key is failing auth probes. "
-                "Retry after the key is rotated; see the auth field on /health.",
+                message,
                 503,
                 "factory_auth_error",
             )

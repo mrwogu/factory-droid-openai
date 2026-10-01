@@ -575,6 +575,198 @@ async def test_tool_catalog_cache_merges_concurrent_verifications(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_tool_catalog_cache_invalidate_forces_rediscovery(tmp_path: Path) -> None:
+    cache, _, _ = _tool_catalog_cache(tmp_path)
+    discoveries = 0
+
+    async def discover() -> list[dict[str, Any]]:
+        nonlocal discoveries
+        discoveries += 1
+        return [{"id": "read-cli", "currentlyAllowed": True}]
+
+    _, tool_ids, _ = await cache.get(discover, dynamic_prefix=None)
+    assert tool_ids == {"read-cli"}
+    await cache.invalidate()
+    _, tool_ids, cache_hit = await cache.get(discover, dynamic_prefix=None)
+
+    assert discoveries == 2
+    assert cache_hit is False
+    assert tool_ids == {"read-cli"}
+
+
+def _renamed_tool_protocol(
+    tool_ids: list[str],
+    *,
+    fail_updates: int,
+    message: str = "Unknown tool identifier(s), code=-32603",
+) -> FakeProtocol:
+    disabled: set[str] = set()
+    updates = 0
+
+    def handler(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        nonlocal updates
+        if method == "droid.list_mcp_servers":
+            return {"result": {"servers": [{"name": "openai-bridge", "status": "connected"}]}}
+        if method == "droid.list_tools":
+            return {
+                "result": {
+                    "tools": [
+                        {
+                            "id": tool_id,
+                            "currentlyAllowed": (
+                                tool_id not in disabled or tool_id == "exit-spec-mode"
+                            ),
+                        }
+                        for tool_id in tool_ids
+                    ]
+                }
+            }
+        if method == "droid.update_session_settings":
+            updates += 1
+            if updates <= fail_updates:
+                raise DroidClientError(message)
+            disabled.update(params["disabledToolIds"])
+            return {"result": {}}
+        raise AssertionError(method)
+
+    return FakeProtocol(handler)
+
+
+@pytest.mark.asyncio
+async def test_cached_discovery_rediscovers_after_a_server_side_tool_rename(
+    tmp_path: Path,
+) -> None:
+    cache, _, _ = _tool_catalog_cache(tmp_path)
+    extension = DroidRpcExtension(tool_catalog_cache=cache)
+    await extension.disable_native_tools(
+        _client(_tool_catalog_protocol(["read-cli", "exit-spec-mode"]))
+    )
+    renamed = _renamed_tool_protocol(["read-cli-2", "exit-spec-mode"], fail_updates=1)
+
+    await extension.disable_native_tools(_client(renamed))
+
+    assert [method for method, _, _ in renamed.calls] == [
+        "droid.update_session_settings",
+        "droid.list_tools",
+        "droid.update_session_settings",
+        "droid.list_tools",
+    ]
+    assert renamed.calls[2][1]["disabledToolIds"] == ["exit-spec-mode", "read-cli-2"]
+    healed = _tool_catalog_protocol(["read-cli-2", "exit-spec-mode"])
+    await extension.disable_native_tools(_client(healed))
+    assert [method for method, _, _ in healed.calls] == [
+        "droid.update_session_settings",
+        "droid.list_tools",
+    ]
+    assert healed.calls[0][1]["disabledToolIds"] == ["exit-spec-mode", "read-cli-2"]
+
+
+@pytest.mark.asyncio
+async def test_cached_discovery_fails_closed_when_the_renamed_catalog_drops_a_bridge_tool(
+    tmp_path: Path,
+) -> None:
+    cache, _, _ = _tool_catalog_cache(tmp_path)
+    extension = DroidRpcExtension(tool_catalog_cache=cache)
+    weather = f"{MCP_TOOL_ID_PREFIX}get_weather"
+    await extension.disable_native_tools(
+        _client(_tool_catalog_protocol(["read-cli", weather])),
+        keep_tool_prefix=MCP_TOOL_ID_PREFIX,
+        expected_tool_ids=frozenset({weather}),
+    )
+    renamed = _renamed_tool_protocol(["read-cli-2"], fail_updates=1)
+
+    with pytest.raises(NativeToolUnavailableError, match="does not match bridge tools"):
+        await extension.disable_native_tools(
+            _client(renamed),
+            keep_tool_prefix=MCP_TOOL_ID_PREFIX,
+            expected_tool_ids=frozenset({weather}),
+        )
+
+
+@pytest.mark.asyncio
+async def test_cached_discovery_heals_a_rename_that_keeps_bridge_tools(
+    tmp_path: Path,
+) -> None:
+    cache, _, _ = _tool_catalog_cache(tmp_path)
+    extension = DroidRpcExtension(tool_catalog_cache=cache)
+    weather = f"{MCP_TOOL_ID_PREFIX}get_weather"
+    await extension.disable_native_tools(
+        _client(_tool_catalog_protocol(["read-cli", weather])),
+        keep_tool_prefix=MCP_TOOL_ID_PREFIX,
+        expected_tool_ids=frozenset({weather}),
+    )
+    renamed = _renamed_tool_protocol(["read-cli-2", weather], fail_updates=1)
+
+    await extension.disable_native_tools(
+        _client(renamed),
+        keep_tool_prefix=MCP_TOOL_ID_PREFIX,
+        expected_tool_ids=frozenset({weather}),
+    )
+
+    assert [method for method, _, _ in renamed.calls] == [
+        "droid.list_mcp_servers",
+        "droid.update_session_settings",
+        "droid.list_tools",
+        "droid.update_session_settings",
+        "droid.list_tools",
+    ]
+    assert renamed.calls[3][1]["enabledToolIds"] == [weather]
+    assert renamed.calls[3][1]["disabledToolIds"] == ["read-cli-2"]
+
+
+@pytest.mark.asyncio
+async def test_cached_discovery_raises_when_a_rename_survives_rediscovery(
+    tmp_path: Path,
+) -> None:
+    cache, _, _ = _tool_catalog_cache(tmp_path)
+    extension = DroidRpcExtension(tool_catalog_cache=cache)
+    await extension.disable_native_tools(
+        _client(_tool_catalog_protocol(["read-cli", "exit-spec-mode"]))
+    )
+    renamed = _renamed_tool_protocol(
+        ["read-cli-2", "exit-spec-mode"],
+        fail_updates=rpc_module._TOOL_DISABLE_RETRIES,
+    )
+
+    with pytest.raises(DroidClientError, match="Unknown tool identifier"):
+        await extension.disable_native_tools(_client(renamed))
+
+    assert [method for method, _, _ in renamed.calls].count("droid.update_session_settings") == 2
+    assert [method for method, _, _ in renamed.calls].count("droid.list_tools") == 1
+
+
+@pytest.mark.asyncio
+async def test_cached_discovery_fails_closed_on_unrelated_update_errors(
+    tmp_path: Path,
+) -> None:
+    cache, _, _ = _tool_catalog_cache(tmp_path)
+    extension = DroidRpcExtension(tool_catalog_cache=cache)
+    await extension.disable_native_tools(
+        _client(_tool_catalog_protocol(["read-cli", "exit-spec-mode"]))
+    )
+    renamed = _renamed_tool_protocol(
+        ["read-cli-2", "exit-spec-mode"],
+        fail_updates=rpc_module._TOOL_DISABLE_RETRIES,
+        message="session exploded",
+    )
+
+    with pytest.raises(DroidClientError, match="session exploded"):
+        await extension.disable_native_tools(_client(renamed))
+
+    assert [method for method, _, _ in renamed.calls].count("droid.list_tools") == 0
+
+
+@pytest.mark.asyncio
+async def test_uncached_catalogs_fail_on_unknown_tool_identifiers() -> None:
+    protocol = _renamed_tool_protocol(["read-cli", "exit-spec-mode"], fail_updates=1)
+
+    with pytest.raises(DroidClientError, match="Unknown tool identifier"):
+        await DroidRpcExtension().disable_native_tools(_client(protocol))
+
+    assert [method for method, _, _ in protocol.calls].count("droid.list_tools") == 1
+
+
+@pytest.mark.asyncio
 async def test_disable_native_tools_rejects_an_empty_verification() -> None:
     catalog_reads = 0
 
