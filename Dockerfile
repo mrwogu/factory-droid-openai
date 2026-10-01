@@ -13,7 +13,8 @@
 #   DROID_MIN_VERSION  Minimum acceptable CLI version (default 0.231.0; older
 #                      builds predate the current server-side tool catalog and
 #                      lack newer models, so the build fails instead of
-#                      shipping them - issue #157).
+#                      shipping them - issue #157). An empty value fails the
+#                      build; 0 disables the floor.
 #   DROID_AUTO_UPDATE  Enable runtime CLI updates (default: true).
 #   BRIDGE_VERSION     factory-droid-openai PyPI version (default: install from source).
 #
@@ -67,6 +68,10 @@ RUN set -e; \
         exit 1; \
       fi; \
       echo "Resolved latest Droid CLI: ${_droid_version}"; \
+    fi; \
+    if [ -z "${DROID_MIN_VERSION}" ]; then \
+      echo "DROID_MIN_VERSION must be set (use 0 to disable the floor)" >&2; \
+      exit 1; \
     fi; \
     if [ "$(printf '%s\n' "${DROID_MIN_VERSION}" "${_droid_version}" | sort -V | head -n1)" \
         != "${DROID_MIN_VERSION}" ]; then \
