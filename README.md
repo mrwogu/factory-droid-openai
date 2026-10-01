@@ -656,7 +656,9 @@ docker build \
 The resolved CLI version - pinned or latest - must satisfy the
 `DROID_MIN_VERSION` build arg (default `0.231.0`); the build fails instead of
 shipping a CLI that predates the current server-side tool catalog. An empty
-value fails the build; set `DROID_MIN_VERSION=0` to drop the floor.
+value fails the build; set `DROID_MIN_VERSION=0` to drop the floor. A
+prerelease of the floor version (for example `0.231.0-beta`) does not satisfy
+the floor.
 
 Override the image default in a running container with
 `FACTORY_DROID_AUTO_UPDATE_ENABLED=false`. The compose file forwards that

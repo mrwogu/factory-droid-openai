@@ -14,7 +14,8 @@
 #                      builds predate the current server-side tool catalog and
 #                      lack newer models, so the build fails instead of
 #                      shipping them - issue #157). An empty value fails the
-#                      build; 0 disables the floor.
+#                      build; 0 disables the floor. A prerelease of the floor
+#                      version does not satisfy it.
 #   DROID_AUTO_UPDATE  Enable runtime CLI updates (default: true).
 #   BRIDGE_VERSION     factory-droid-openai PyPI version (default: install from source).
 #
@@ -78,6 +79,14 @@ RUN set -e; \
       echo "Droid CLI ${_droid_version} is older than the required minimum ${DROID_MIN_VERSION}" >&2; \
       exit 1; \
     fi; \
+    # GNU sort -V ranks 0.231.0-beta equal to 0.231.0, so the check above
+    # alone lets a prerelease pin through; semver puts it below the release.
+    case "${_droid_version}" in \
+      "${DROID_MIN_VERSION}"-*) \
+        echo "Droid CLI ${_droid_version} is a prerelease of the required minimum ${DROID_MIN_VERSION}" >&2; \
+        exit 1; \
+      ;; \
+    esac; \
     case "$(uname -m)" in \
       x86_64) arch=x64 ;; \
       aarch64) arch=arm64 ;; \
