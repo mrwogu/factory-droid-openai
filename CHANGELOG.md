@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.12.1](https://github.com/mrwogu/factory-droid-openai/compare/v1.12.0...v1.12.1) (2026-10-06)
+
+
+### Bug Fixes
+
+* **session:** self-heal the tool catalog on server-side renames ([#158](https://github.com/mrwogu/factory-droid-openai/issues/158)) ([4d425e3](https://github.com/mrwogu/factory-droid-openai/commit/4d425e3dda215bafd287c54819c20f421c5562bd))
+
 ## [1.12.0](https://github.com/mrwogu/factory-droid-openai/compare/v1.11.1...v1.12.0) (2026-09-17)
 
 
