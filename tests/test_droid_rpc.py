@@ -858,9 +858,10 @@ async def test_cached_discovery_names_the_rename_error_when_recovery_has_no_atte
         }
 
     late = FakeProtocol(handler)
+    late_client = _client(late)
 
     with pytest.raises(DroidClientError, match="Unknown tool identifier"):
-        await extension.disable_native_tools(_client(late))
+        await extension.disable_native_tools(late_client)
 
     assert updates == 3
     assert reads == 3
