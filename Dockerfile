@@ -10,6 +10,12 @@
 # Build args:
 #   PYTHON_VERSION     Python base image tag (default 3.13-slim).
 #   DROID_VERSION      Factory Droid CLI version (default: latest from npm registry).
+#   DROID_MIN_VERSION  Minimum acceptable CLI version (default 0.231.0; older
+#                      builds predate the current server-side tool catalog and
+#                      lack newer models, so the build fails instead of
+#                      shipping them - issue #157). An empty value fails the
+#                      build; 0 disables the floor. A prerelease of the floor
+#                      version does not satisfy it.
 #   DROID_AUTO_UPDATE  Enable runtime CLI updates (default: true).
 #   BRIDGE_VERSION     factory-droid-openai PyPI version (default: install from source).
 #
@@ -18,15 +24,18 @@
 # DROID_AUTO_UPDATE=false when the running CLI must match the image digest, or
 # when the container has no writable home directory or no egress to
 # downloads.factory.ai. Omit DROID_VERSION to resolve the latest release at
-# build time; set it to pin the initial release.
+# build time; set it to pin the initial release. Either way the resolved
+# version must satisfy DROID_MIN_VERSION or the build fails.
 
 ARG PYTHON_VERSION=3.13-slim
 ARG DROID_VERSION
+ARG DROID_MIN_VERSION=0.231.0
 ARG DROID_AUTO_UPDATE=true
 
 FROM python:${PYTHON_VERSION} AS base
 
 ARG DROID_VERSION
+ARG DROID_MIN_VERSION
 ARG BRIDGE_VERSION
 
 # FACTORY_DROID_AUTO_UPDATE_ENABLED is false here so no build step can swap the
@@ -61,6 +70,23 @@ RUN set -e; \
       fi; \
       echo "Resolved latest Droid CLI: ${_droid_version}"; \
     fi; \
+    if [ -z "${DROID_MIN_VERSION}" ]; then \
+      echo "DROID_MIN_VERSION must be set (use 0 to disable the floor)" >&2; \
+      exit 1; \
+    fi; \
+    if [ "$(printf '%s\n' "${DROID_MIN_VERSION}" "${_droid_version}" | sort -V | head -n1)" \
+        != "${DROID_MIN_VERSION}" ]; then \
+      echo "Droid CLI ${_droid_version} is older than the required minimum ${DROID_MIN_VERSION}" >&2; \
+      exit 1; \
+    fi; \
+    # GNU sort -V ranks 0.231.0-beta equal to 0.231.0, so the check above
+    # alone lets a prerelease pin through; semver puts it below the release.
+    case "${_droid_version}" in \
+      "${DROID_MIN_VERSION}"-*) \
+        echo "Droid CLI ${_droid_version} is a prerelease of the required minimum ${DROID_MIN_VERSION}" >&2; \
+        exit 1; \
+      ;; \
+    esac; \
     case "$(uname -m)" in \
       x86_64) arch=x64 ;; \
       aarch64) arch=arm64 ;; \

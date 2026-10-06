@@ -53,6 +53,10 @@ _MCP_POLICY_PATTERN = re.compile(
     r"(?:mcp\s*policy|allowlist|allow\s+list|organization\s+policy)",
     re.IGNORECASE,
 )
+# Factory renames tool identifiers server-side with no bridge-visible signal
+# (issue #157); a stale cached catalog then fails every session setup with
+# this JSON-RPC message until the snapshot is dropped and discovery re-runs.
+_UNKNOWN_TOOL_IDENTIFIER_PATTERN = re.compile(r"unknown tool identifier", re.IGNORECASE)
 
 
 class NativeToolUnavailableError(DroidClientError):
@@ -112,6 +116,7 @@ class ToolCatalogCache:
         self._identity: _ToolCatalogIdentity | None = None
         self._tool_ids: frozenset[str] | None = None
         self._generation = 0
+        self._generation_floor = 0
 
     async def get(
         self,
@@ -131,6 +136,18 @@ class ToolCatalogCache:
             self._generation += 1
             return _ToolCatalogRevision(identity, self._generation), tool_ids, False
 
+    async def invalidate(self) -> None:
+        """Drop the snapshot so the next lookup re-runs discovery (#157).
+
+        Revisions captured before this call are fenced: remember() discards
+        them instead of merging their ids back into the healed snapshot.
+        """
+        async with self._lock:
+            self._identity = None
+            self._tool_ids = None
+            self._generation += 1
+            self._generation_floor = self._generation
+
     async def remember(
         self,
         revision: _ToolCatalogRevision,
@@ -140,6 +157,10 @@ class ToolCatalogCache:
     ) -> None:
         async with self._lock:
             if revision.identity != self._identity:
+                return
+            if revision.generation <= self._generation_floor:
+                # A rename recovery fences pre-invalidation revisions; merging
+                # one would resurrect ids the server renamed away (#157).
                 return
             remembered = tool_ids - _matching(tool_ids, dynamic_prefix)
             if revision.generation != self._generation:
@@ -295,22 +316,54 @@ class DroidRpcExtension:
         tolerated = _UNAVOIDABLE_TOOL_IDS | _DEFERRED_TOOL_LOADER_IDS
         unexpected: set[str] = set()
         missing_expected: set[str] = set()
+        rediscovered = False
         for attempt in range(_TOOL_DISABLE_RETRIES):
             kept = (
                 set(expected_tool_ids)
                 if expected_tool_ids is not None
                 else _matching(tool_ids, keep_tool_prefix)
             )
-            await self._request(
-                client,
-                DroidServerMethod.UPDATE_SESSION_SETTINGS.value,
-                {
-                    "interactionMode": DroidInteractionMode.Auto.value,
-                    "autonomyLevel": AutonomyLevel.Off.value,
-                    "enabledToolIds": sorted(kept),
-                    "disabledToolIds": sorted(tool_ids - kept),
-                },
-            )
+            try:
+                await self._request(
+                    client,
+                    DroidServerMethod.UPDATE_SESSION_SETTINGS.value,
+                    {
+                        "interactionMode": DroidInteractionMode.Auto.value,
+                        "autonomyLevel": AutonomyLevel.Off.value,
+                        "enabledToolIds": sorted(kept),
+                        "disabledToolIds": sorted(tool_ids - kept),
+                    },
+                )
+            except DroidClientError as exc:
+                # The server renamed identifiers under a cache hit (#157);
+                # drop the snapshot, rediscover once, and retry with the
+                # fresh catalog instead of echoing the stale ids again.
+                if (
+                    cache is None
+                    or rediscovered
+                    or not _UNKNOWN_TOOL_IDENTIFIER_PATTERN.search(str(exc))
+                ):
+                    raise
+                await cache.invalidate()
+                cache_revision, tool_ids, cache_hit = await cache.get(
+                    discover,
+                    dynamic_prefix=keep_tool_prefix,
+                )
+                rediscovered = True
+                if expected_tool_ids is not None:
+                    # A concurrent request can refill the snapshot between
+                    # invalidate() and get(); that hit lacks this call's
+                    # bridge tools, so restore them before verifying.
+                    if cache_hit:
+                        tool_ids.update(expected_tool_ids)
+                    self._verify_native_tool_ids(tool_ids, expected_tool_ids)
+                if attempt + 1 >= _TOOL_DISABLE_RETRIES:
+                    # Recovery consumed the last attempt, so the fresh catalog
+                    # cannot be applied in this call; re-raise the real cause
+                    # instead of a stale verification failure. The snapshot is
+                    # healed either way, so the next session succeeds.
+                    raise
+                continue
             verification = await self._list_tools(client)
             if not verification:
                 raise DroidClientError("Droid returned an empty native tool catalog")

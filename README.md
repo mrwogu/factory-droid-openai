@@ -648,10 +648,17 @@ To build the image locally instead of pulling it:
 docker build -t factory-droid-openai .
 # Pin the initial CLI release and disable runtime updates:
 docker build \
-  --build-arg DROID_VERSION=0.174.0 \
+  --build-arg DROID_VERSION=0.231.0 \
   --build-arg DROID_AUTO_UPDATE=false \
   -t factory-droid-openai .
 ```
+
+The resolved CLI version - pinned or latest - must satisfy the
+`DROID_MIN_VERSION` build arg (default `0.231.0`); the build fails instead of
+shipping a CLI that predates the current server-side tool catalog. An empty
+value fails the build; set `DROID_MIN_VERSION=0` to drop the floor. A
+prerelease of the floor version (for example `0.231.0-beta`) does not satisfy
+the floor.
 
 Override the image default in a running container with
 `FACTORY_DROID_AUTO_UPDATE_ENABLED=false`. The compose file forwards that
@@ -1936,7 +1943,10 @@ For every Droid session, the bridge:
    The bridge caches this snapshot for the resolved Droid executable and the
    active user and project settings and MCP files. A CLI replacement or
    profile change invalidates it. Per-request `openai-bridge` IDs are never
-   cached.
+   cached. If Factory renames identifiers server-side, the session rejects
+   the stale list with "Unknown tool identifier(s)"; the bridge then drops the
+   snapshot, rediscovers once, and retries, so a server-side rename heals on
+   its next session instead of wedging every one.
 6. Applies the discovered or cached disabled set, then calls
    `droid.list_tools` once to verify no unexpected tool remains. The two meta
    tools Droid pins callable, `exit-spec-mode` and the deferred-tool loader,
@@ -2008,7 +2018,11 @@ Droid exec with that key every five minutes: a failing probe logs
 `auth.probe_failed` and flips the `auth` field on `/health` to `degraded`,
 and after `FACTORY_DROID_OPENAI_AUTH_FAILURE_THRESHOLD` consecutive failures
 chat requests fail fast with `503` instead of each paying for a Droid spawn
-that cannot answer. Rotate the key; any request that completes with content
+that cannot answer. The probe can fail for reasons other than the key itself -
+for example a server-side tool rename rejected every probe in issue #157 - so
+the `503` message and the `auth.probe_failed` events carry the probe's own
+failure reason; read it before rotating the key. Rotate the key only when the
+reason names authentication. Any request that completes with content
 clears the gate immediately. The probe is off until
 `FACTORY_DROID_OPENAI_AUTH_PROBE_SECONDS` is set.
 

@@ -55,6 +55,7 @@ class AuthProbe:
         self._task: asyncio.Task[None] | None = None
         self._consecutive_failures = 0
         self._status: AuthProbeStatus = "unknown"
+        self._last_failure_reason: str | None = None
 
     @property
     def status(self) -> AuthProbeStatus:
@@ -64,6 +65,11 @@ class AuthProbe:
     @property
     def consecutive_failures(self) -> int:
         return self._consecutive_failures
+
+    @property
+    def last_failure_reason(self) -> str | None:
+        """Most recent probe failure, so the 503 gate can name the real cause."""
+        return self._last_failure_reason
 
     @property
     def failing(self) -> bool:
@@ -79,6 +85,7 @@ class AuthProbe:
         """A completion that carried content proves the key works."""
         self._consecutive_failures = 0
         self._status = "ok"
+        self._last_failure_reason = None
 
     def suspect(self) -> None:
         """Ask for an immediate probe after an auth-shaped or empty completion."""
@@ -112,12 +119,14 @@ class AuthProbe:
         if reason is None:
             self._consecutive_failures = 0
             self._status = "ok"
+            self._last_failure_reason = None
             if self._metrics is not None:
                 self._metrics.increment_auth_probe_successes()
             log_debug("auth.probe_ok", elapsed_ms=elapsed_ms)
             return
         self._consecutive_failures += 1
         self._status = "degraded"
+        self._last_failure_reason = reason
         if self._metrics is not None:
             self._metrics.increment_auth_probe_failures()
         log_warning(

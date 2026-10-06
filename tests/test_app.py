@@ -7857,6 +7857,36 @@ async def test_chat_requests_fail_fast_while_the_auth_gate_is_open(
     assert len(rejected) == 1
     assert rejected[0]["phase"] == "auth_probe"
     assert rejected[0]["consecutive"] == 3
+    assert "reason" not in rejected[0]
+
+
+@pytest.mark.asyncio
+async def test_the_auth_gate_names_the_probe_failure_reason(
+    tmp_path: Path,
+) -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
+    app, runner = _probe_app(tmp_path, auth_failure_threshold=3)
+    probe = app.state.auth_probe
+    assert probe is not None
+    probe._consecutive_failures = 3
+    probe._last_failure_reason = "Factory Droid SDK failed: Unknown tool identifier(s), code=-32603"
+    async with _client(app) as client:
+        response = await client.post("/v1/chat/completions", json=_payload())
+    assert response.status_code == 503
+    body = response.json()
+    assert body["error"]["type"] == "factory_auth_error"
+    assert "3 in a row" in body["error"]["message"]
+    assert "Unknown tool identifier(s)" in body["error"]["message"]
+    assert runner.requests == []
+    rejected = [
+        json.loads(line)
+        for line in log_stream.getvalue().splitlines()
+        if json.loads(line)["event"] == "chat.rejected"
+    ]
+    assert rejected[0]["reason"] == (
+        "Factory Droid SDK failed: Unknown tool identifier(s), code=-32603"
+    )
 
 
 @pytest.mark.asyncio

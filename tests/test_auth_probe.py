@@ -168,6 +168,7 @@ async def test_successful_probe_reports_ok() -> None:
     await probe._probe_once()
 
     assert probe.status == "ok"
+    assert probe.last_failure_reason is None
     assert len(runner.requests) == 1
     request = runner.requests[0]
     assert request.model == "factory-droid"
@@ -201,6 +202,7 @@ async def test_runner_error_counts_as_probe_failure() -> None:
     assert probe.status == "degraded"
     assert probe.consecutive_failures == 1
     assert probe.failing is False
+    assert probe.last_failure_reason == "Factory rejected the bridge's API key: revoked"
     assert "factory_droid_openai_auth_probe_failures_total 1" in metrics.render()
     failures = [entry for entry in _events(stream) if entry["event"] == "auth.probe_failed"]
     assert len(failures) == 1
@@ -274,6 +276,22 @@ async def test_gate_opens_at_the_failure_threshold() -> None:
     probe.record_success()
     assert probe.failing is False
     assert probe.status == "ok"
+    assert probe.last_failure_reason is None
+
+
+@pytest.mark.asyncio
+async def test_a_recovered_probe_clears_the_last_failure_reason() -> None:
+    runner = _RecordedRunner(error=RunnerError("unauthorized"))
+    probe = _probe(runner)
+
+    await probe._probe_once()
+    assert probe.last_failure_reason == "unauthorized"
+
+    runner.error = None
+    await probe._probe_once()
+
+    assert probe.status == "ok"
+    assert probe.last_failure_reason is None
 
 
 @pytest.mark.asyncio
