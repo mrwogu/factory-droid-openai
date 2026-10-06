@@ -2251,6 +2251,7 @@ def create_app(
                                 warm_age_ms=result.warm_age_ms,
                                 will_retry=retry_request is not None,
                                 has_tool_calls=bool(result.tool_calls),
+                                limit=output_token_limit,
                             )
                         if retry_request is None:
                             if retry_in_flight and retry_reason_in_flight is not None:
@@ -2801,6 +2802,7 @@ def _log_truncated_tool_call(
     warm_age_ms: float | None,
     will_retry: bool,
     has_tool_calls: bool,
+    limit: int | None,
 ) -> None:
     log_warning(
         "chat.attempt_truncated" if will_retry or has_tool_calls else "chat.truncated",
@@ -2814,6 +2816,7 @@ def _log_truncated_tool_call(
         warm=run_request.warm_session is not None,
         warm_age_ms=warm_age_ms,
         output_tokens=usage.output_tokens,
+        limit=limit,
         will_retry=will_retry,
         has_tool_calls=has_tool_calls,
     )
@@ -3402,6 +3405,7 @@ async def _stream_completion(
                     warm_age_ms=warm_age_ms,
                     will_retry=False,
                     has_tool_calls=saw_tool_call,
+                    limit=output_token_limit,
                 )
             yield _sse(
                 _chunk(
@@ -3436,6 +3440,7 @@ async def _stream_completion(
                 warm_age_ms=warm_age_ms,
                 will_retry=False,
                 has_tool_calls=saw_tool_call,
+                limit=output_token_limit,
             )
             held = stop_buffer.flush()
             if held:

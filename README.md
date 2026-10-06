@@ -374,6 +374,10 @@ client can retry or split the request itself.
   after a valid call, and `has_tool_calls` makes clear why that partial
   call cannot be retried regardless of its size.
 - `chat.truncated` is reserved for the final request outcome.
+- Both truncation events carry `limit`, the per-turn output-token ceiling
+  in force (`max_completion_tokens` or `max_tokens`). The field is absent
+  when no cap was armed, so a cap cut is distinguishable from a stream
+  death in one grep (issue #154).
 - `chat.retry` names the reason, retry number, model, warm state, and warm
   age of the attempt that will be retried. The retry number distinguishes
   the first correction from the escalated second retry.
