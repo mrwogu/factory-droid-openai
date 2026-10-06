@@ -116,6 +116,7 @@ class ToolCatalogCache:
         self._identity: _ToolCatalogIdentity | None = None
         self._tool_ids: frozenset[str] | None = None
         self._generation = 0
+        self._generation_floor = 0
 
     async def get(
         self,
@@ -136,11 +137,16 @@ class ToolCatalogCache:
             return _ToolCatalogRevision(identity, self._generation), tool_ids, False
 
     async def invalidate(self) -> None:
-        """Drop the snapshot so the next lookup re-runs discovery (#157)."""
+        """Drop the snapshot so the next lookup re-runs discovery (#157).
+
+        Revisions captured before this call are fenced: remember() discards
+        them instead of merging their ids back into the healed snapshot.
+        """
         async with self._lock:
             self._identity = None
             self._tool_ids = None
             self._generation += 1
+            self._generation_floor = self._generation
 
     async def remember(
         self,
@@ -151,6 +157,10 @@ class ToolCatalogCache:
     ) -> None:
         async with self._lock:
             if revision.identity != self._identity:
+                return
+            if revision.generation <= self._generation_floor:
+                # A rename recovery fences pre-invalidation revisions; merging
+                # one would resurrect ids the server renamed away (#157).
                 return
             remembered = tool_ids - _matching(tool_ids, dynamic_prefix)
             if revision.generation != self._generation:
@@ -347,6 +357,12 @@ class DroidRpcExtension:
                     if cache_hit:
                         tool_ids.update(expected_tool_ids)
                     self._verify_native_tool_ids(tool_ids, expected_tool_ids)
+                if attempt + 1 >= _TOOL_DISABLE_RETRIES:
+                    # Recovery consumed the last attempt, so the fresh catalog
+                    # cannot be applied in this call; re-raise the real cause
+                    # instead of a stale verification failure. The snapshot is
+                    # healed either way, so the next session succeeds.
+                    raise
                 continue
             verification = await self._list_tools(client)
             if not verification:
