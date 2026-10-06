@@ -3593,6 +3593,9 @@ async def test_repeated_truncated_tool_call_logs_final_outcome(tmp_path: Path) -
     assert final[0]["attempt"] == 1
     assert final[0]["warm"] is False
     assert final[0]["output_tokens"] == 0
+    # No output-token limit was in force, so the field stays absent instead
+    # of claiming a ceiling (issue #154). None fields are dropped log-wide.
+    assert "limit" not in final[0]
     assert final[0]["will_retry"] is False
     outcomes = [record for record in records if record["event"] == "chat.retry_outcome"]
     assert len(outcomes) == 1
@@ -4274,6 +4277,7 @@ async def test_output_limit_caps_a_runaway_tool_argument(tmp_path: Path) -> None
     records = _warning_records(log_stream)
     truncated = next(record for record in records if record["event"] == "chat.truncated")
     assert truncated["reason"] == "output token limit reached"
+    assert truncated["limit"] == 32
     assert truncated["will_retry"] is False
     assert truncated["has_tool_calls"] is False
     assert not any(record["event"] == "chat.empty_completion" for record in records)
@@ -4901,6 +4905,7 @@ async def test_streaming_output_limit_caps_a_runaway_tool_argument(
     assert not any(record["event"] == "chat.empty_completion" for record in records)
     truncated = next(record for record in records if record["event"] == "chat.truncated")
     assert truncated["reason"] == "output token limit reached"
+    assert truncated["limit"] == 32
 
 
 @pytest.mark.asyncio
@@ -4973,6 +4978,7 @@ async def test_streaming_output_limit_after_a_complete_call_keeps_the_call(
     records = _warning_records(log_stream)
     truncated = next(record for record in records if record["event"] == "chat.attempt_truncated")
     assert truncated["reason"] == "output token limit reached"
+    assert truncated["limit"] == 32
     assert truncated["has_tool_calls"] is True
 
 
@@ -5257,6 +5263,8 @@ async def test_stream_generator_drops_held_text_for_structured_output() -> None:
 
 @pytest.mark.asyncio
 async def test_streaming_truncated_tool_call_finishes_with_length(tmp_path: Path) -> None:
+    log_stream = io.StringIO()
+    logs.configure_logging(level="warning", log_format="json", stream=log_stream)
     runner = FakeRunner(
         [
             TextDelta("working on EN"),
@@ -5302,6 +5310,12 @@ async def test_streaming_truncated_tool_call_finishes_with_length(tmp_path: Path
     )
     assert content == "working on EN"
     assert 'outcome="truncated",status="200"} 1' in metrics.text
+    records = _warning_records(log_stream)
+    truncated = next(record for record in records if record["event"] == "chat.truncated")
+    assert truncated["stream"] is True
+    # A stream death, not a cap cut: no limit was armed, so the field stays
+    # absent (issue #154).
+    assert "limit" not in truncated
 
 
 @pytest.mark.asyncio
