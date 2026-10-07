@@ -32,6 +32,7 @@ from droid_sdk.schemas.cli import (
     SessionNotification,
     SessionTokenUsageChangedNotification,
 )
+from droid_sdk.schemas.client import AvailableModelConfig
 from droid_sdk.schemas.enums import (
     AutonomyLevel,
     DroidInteractionMode,
@@ -45,6 +46,7 @@ from droid_sdk.schemas.messages import (
     ThinkingBlock,
     ToolUseBlock,
 )
+from pydantic import ValidationError
 
 from factory_droid_openai.config import (
     DEFAULT_MODEL_ALIAS,
@@ -885,42 +887,20 @@ class DroidRunner:
                     raise
 
     async def list_models(self, *, timeout_seconds: float) -> tuple[DroidModel, ...]:
-        models: list[Any] = []
-
-        async def initialize(client: DroidClient) -> None:
-            result = await client.initialize_session(
-                machine_id="factory-droid-openai-models",
-                cwd=str(self._workdir),
-                mcp_servers=[],
-                interaction_mode=DroidInteractionMode.Auto,
-                autonomy_level=AutonomyLevel.Off,
-                skip_permissions_unsafe=False,
-                enabled_tool_ids=[],
-            )
-
-            models.extend(result.available_models or [])
-
         async def operation(client: DroidClient) -> tuple[DroidModel, ...]:
-            await self._rpc.close_session(client, reason="clear")
-            return tuple(
-                DroidModel(
-                    id=model.id,
-                    display_name=model.display_name,
-                    provider=_state_value(model.model_provider),
-                    supported_reasoning_efforts=tuple(
-                        _state_value(effort) for effort in model.supported_reasoning_efforts
-                    ),
-                    default_reasoning_effort=_state_value(model.default_reasoning_effort),
-                    supports_images=not bool(model.no_image_support),
-                    supports_pdfs=bool(model.supports_pdfs),
-                )
-                for model in models
-            )
+            entries = await self._rpc.list_models(client)
+            models: list[DroidModel] = []
+            for entry in entries:
+                # droid.list_models already applies organization policy, but an
+                # entry Droid still flags as disabled is not usable, so drop it.
+                if entry.get("disabled") is True:
+                    continue
+                models.append(_parse_model_entry(entry))
+            return tuple(models)
 
-        return await self._session_operation(
+        return await self._connection_operation(
             operation,
             timeout_seconds=timeout_seconds,
-            init_operation=initialize,
         )
 
     async def get_context(
@@ -1053,18 +1033,9 @@ class DroidRunner:
                 )
                 return await operation(client)
         except (TimeoutError, DroidTimeoutError) as exc:
-            raise RunnerError(
-                f"Factory Droid timed out after"
-                f" {asyncio.get_running_loop().time() - started:.1f} seconds.",
-                status_code=504,
-                error_type="factory_droid_timeout",
-            ) from exc
+            raise self._operation_timeout_error(started) from exc
         except FileNotFoundError as exc:
-            raise RunnerError(
-                f"Factory Droid executable was not found: {self._droid_path}",
-                status_code=503,
-                error_type="factory_droid_unavailable",
-            ) from exc
+            raise self._missing_executable_error() from exc
         except SessionNotFoundError as exc:
             raise RunnerError(
                 f"Factory Droid session '{session_id}' was not found.",
@@ -1072,10 +1043,7 @@ class DroidRunner:
                 error_type="session_not_found",
             ) from exc
         except DroidClientError as exc:
-            raise RunnerError(
-                f"Factory Droid SDK failed: {exc}",
-                error_type="factory_droid_sdk_error",
-            ) from exc
+            raise self._sdk_failure_error(exc) from exc
         finally:
             cleanup_task = asyncio.create_task(self._cleanup(client, transport, interrupt=False))
             try:
@@ -1083,6 +1051,60 @@ class DroidRunner:
             except asyncio.CancelledError:
                 await cleanup_task
                 raise
+
+    async def _connection_operation(
+        self,
+        operation: Callable[[DroidClient], Awaitable[OperationResult]],
+        *,
+        timeout_seconds: float,
+    ) -> OperationResult:
+        """Run one sessionless JSON-RPC call on a dedicated Droid process."""
+        client, transport = self._new_client()
+        client.set_permission_handler(lambda _params: "cancel")
+        client.set_ask_user_handler(
+            lambda _params: {"cancelled": True, "answers": []},
+        )
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deadline = started + timeout_seconds
+        try:
+            async with asyncio.timeout_at(deadline):
+                await client.connect()
+                return await operation(client)
+        except (TimeoutError, DroidTimeoutError) as exc:
+            raise self._operation_timeout_error(started) from exc
+        except FileNotFoundError as exc:
+            raise self._missing_executable_error() from exc
+        except DroidClientError as exc:
+            raise self._sdk_failure_error(exc) from exc
+        finally:
+            cleanup_task = asyncio.create_task(self._cleanup(client, transport, interrupt=False))
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                await cleanup_task
+                raise
+
+    def _operation_timeout_error(self, started: float) -> RunnerError:
+        elapsed = asyncio.get_running_loop().time() - started
+        return RunnerError(
+            f"Factory Droid timed out after {elapsed:.1f} seconds.",
+            status_code=504,
+            error_type="factory_droid_timeout",
+        )
+
+    def _missing_executable_error(self) -> RunnerError:
+        return RunnerError(
+            f"Factory Droid executable was not found: {self._droid_path}",
+            status_code=503,
+            error_type="factory_droid_unavailable",
+        )
+
+    def _sdk_failure_error(self, exc: DroidClientError) -> RunnerError:
+        return RunnerError(
+            f"Factory Droid SDK failed: {exc}",
+            error_type="factory_droid_sdk_error",
+        )
 
     def _new_client(self) -> tuple[DroidClient, _ManagedProcessTransport | None]:
         if self._client_factory is not None:
@@ -1173,9 +1195,10 @@ def _resolve_model_id(model: str, model_alias: str) -> str | None:
 def sdk_error(exc: DroidClientError, *, model: str | None = None) -> RunnerError:
     """Map a Droid SDK failure onto the closest OpenAI-compatible error.
 
-    Droid lists every model its CLI knows about and only refuses the ones an
-    organization policy blocks when a session is initialized, so that refusal
-    has to read as an unavailable model rather than a bridge failure.
+    Model discovery comes back org-filtered from ``droid.list_models``, but a
+    requested model an organization policy blocks is still refused only when a
+    session is initialized, so that refusal has to read as an unavailable
+    model rather than a bridge failure.
     """
     message = str(exc)
     denied = _model_denied_error(message, model=model)
@@ -1260,6 +1283,24 @@ def _resolve_reasoning_effort(value: str | None) -> ReasoningEffort | None:
 def normalize_reasoning_effort(value: str | None) -> str | None:
     resolved = _resolve_reasoning_effort(value)
     return resolved.value if resolved is not None else None
+
+
+def _parse_model_entry(entry: dict[str, Any]) -> DroidModel:
+    try:
+        model = AvailableModelConfig.model_validate(entry)
+    except ValidationError as exc:
+        raise DroidClientError(f"Droid returned a malformed model entry: {exc}") from exc
+    return DroidModel(
+        id=model.id,
+        display_name=model.display_name,
+        provider=_state_value(model.model_provider),
+        supported_reasoning_efforts=tuple(
+            _state_value(effort) for effort in model.supported_reasoning_efforts
+        ),
+        default_reasoning_effort=_state_value(model.default_reasoning_effort),
+        supports_images=not bool(model.no_image_support),
+        supports_pdfs=bool(model.supports_pdfs),
+    )
 
 
 def _state_value(state: object) -> str:

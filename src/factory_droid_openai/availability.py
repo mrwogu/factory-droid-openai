@@ -18,9 +18,9 @@ class QuarantinedModel:
 class ModelQuarantine:
     """Remembers models Droid refused, so the bridge stops offering them.
 
-    The Droid catalog lists every model the CLI knows about, including ones an
-    organization policy blocks, and the refusal only surfaces when a session is
-    initialized. Recording the refusal keeps blocked models out of
+    Discovery already applies organization policy, but clients can send raw
+    model IDs and cached entries can become unavailable. Recording a refusal
+    at session startup or mid-stream keeps the model out of
     ``GET /v1/models`` and turns later requests into an immediate error instead
     of another Droid startup.
     """

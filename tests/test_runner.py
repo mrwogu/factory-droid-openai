@@ -187,6 +187,8 @@ class FakeClient:
             self.files = params.get("files")
             self.output_format = params.get("outputFormat")
             return {"result": {}}
+        if method == "droid.list_models":
+            return {"result": {"models": []}}
         if method in {"droid.close_session", "droid.rename_session"}:
             return {"result": {"success": True}}
         raise AssertionError(f"unexpected RPC method: {method}")
@@ -1476,27 +1478,49 @@ async def test_cleanup_completes_when_the_caller_is_cancelled_again(
 
 
 @pytest.mark.asyncio
-async def test_runner_discovers_models_from_session_initialization(
-    tmp_path: Path,
-) -> None:
+async def test_runner_lists_models_without_a_session(tmp_path: Path) -> None:
     class ModelClient(FakeClient):
-        async def initialize_session(self, **kwargs: Any) -> Any:
-            await super().initialize_session(**kwargs)
-            return SimpleNamespace(
-                available_models=[
-                    SimpleNamespace(
-                        id="gpt-5.4",
-                        display_name="GPT-5.4",
-                        model_provider=SimpleNamespace(value="openai"),
-                        supported_reasoning_efforts=[
-                            ReasoningEffort.Low,
-                            ReasoningEffort.High,
-                        ],
-                        default_reasoning_effort=ReasoningEffort.High,
-                        no_image_support=False,
-                        supports_pdfs=True,
-                    )
-                ]
+        async def send_request(
+            self,
+            method: str,
+            params: dict[str, Any],
+            timeout: float | None = None,
+            request_id: str | None = None,
+        ) -> dict[str, Any]:
+            if method == "droid.list_models":
+                self.rpc_requests.append((method, params, timeout))
+                return {
+                    "result": {
+                        "models": [
+                            {
+                                "id": "gpt-5.4",
+                                "displayName": "GPT-5.4",
+                                "shortDisplayName": "GPT-5.4",
+                                "modelProvider": "openai",
+                                "supportedReasoningEfforts": ["low", "high"],
+                                "defaultReasoningEffort": "high",
+                                "noImageSupport": False,
+                                "supportsPDFs": True,
+                            },
+                            {
+                                "id": "blocked-model",
+                                "displayName": "Blocked",
+                                "shortDisplayName": "Blocked",
+                                "modelProvider": "openai",
+                                "supportedReasoningEfforts": ["low"],
+                                "defaultReasoningEffort": "low",
+                                "noImageSupport": False,
+                                "supportsPDFs": False,
+                                "disabled": True,
+                            },
+                        ]
+                    }
+                }
+            return await super().send_request(
+                method,
+                params,
+                timeout=timeout,
+                request_id=request_id,
             )
 
     client = ModelClient([])
@@ -1508,36 +1532,207 @@ async def test_runner_discovers_models_from_session_initialization(
 
     models = await runner.list_models(timeout_seconds=1)
 
-    assert models[0].id == "gpt-5.4"
+    assert [model.id for model in models] == ["gpt-5.4"]
+    assert models[0].display_name == "GPT-5.4"
     assert models[0].provider == "openai"
     assert models[0].supported_reasoning_efforts == ("low", "high")
+    assert models[0].default_reasoning_effort == "high"
     assert models[0].supports_images is True
     assert models[0].supports_pdfs is True
-    assert ("droid.close_session", {"reason": "clear"}, 30.0) in client.rpc_requests
+    # Discovery is sessionless: one RPC, no session setup or teardown.
+    assert client.init_kwargs == {}
+    assert [request[0] for request in client.rpc_requests] == ["droid.list_models"]
 
 
 @pytest.mark.asyncio
-async def test_model_discovery_uses_the_session_init_timeout(
-    tmp_path: Path,
-) -> None:
+async def test_model_discovery_keeps_entries_flagged_enabled(tmp_path: Path) -> None:
+    class EnabledFlagClient(FakeClient):
+        async def send_request(
+            self,
+            method: str,
+            params: dict[str, Any],
+            timeout: float | None = None,
+            request_id: str | None = None,
+        ) -> dict[str, Any]:
+            if method == "droid.list_models":
+                self.rpc_requests.append((method, params, timeout))
+                return {
+                    "result": {
+                        "models": [
+                            {
+                                "id": "gpt-5.4",
+                                "displayName": "GPT-5.4",
+                                "shortDisplayName": "GPT-5.4",
+                                "modelProvider": "openai",
+                                "supportedReasoningEfforts": ["low"],
+                                "defaultReasoningEffort": "low",
+                                # A disabled flag that is anything but true must
+                                # not hide the entry.
+                                "disabled": False,
+                            },
+                        ]
+                    }
+                }
+            return await super().send_request(
+                method,
+                params,
+                timeout=timeout,
+                request_id=request_id,
+            )
+
+    client = EnabledFlagClient([])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    models = await runner.list_models(timeout_seconds=1)
+
+    assert [model.id for model in models] == ["gpt-5.4"]
+    assert models[0].supports_images is True
+    assert models[0].supports_pdfs is False
+
+
+@pytest.mark.asyncio
+async def test_model_discovery_rejects_malformed_entries(tmp_path: Path) -> None:
+    class MalformedEntryClient(FakeClient):
+        async def send_request(
+            self,
+            method: str,
+            params: dict[str, Any],
+            timeout: float | None = None,
+            request_id: str | None = None,
+        ) -> dict[str, Any]:
+            if method == "droid.list_models":
+                self.rpc_requests.append((method, params, timeout))
+                return {"result": {"models": [{"id": "gpt-5.4"}]}}
+            return await super().send_request(
+                method,
+                params,
+                timeout=timeout,
+                request_id=request_id,
+            )
+
+    client = MalformedEntryClient([])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    with pytest.raises(RunnerError, match="malformed model entry") as error:
+        await runner.list_models(timeout_seconds=1)
+
+    assert error.value.error_type == "factory_droid_sdk_error"
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_model_discovery_times_out(tmp_path: Path) -> None:
     class HangingModelClient(FakeClient):
-        async def initialize_session(self, **kwargs: Any) -> Any:
-            del kwargs
-            await asyncio.Event().wait()
+        async def send_request(
+            self,
+            method: str,
+            params: dict[str, Any],
+            timeout: float | None = None,
+            request_id: str | None = None,
+        ) -> dict[str, Any]:
+            if method == "droid.list_models":
+                await asyncio.Event().wait()
+            return await super().send_request(
+                method,
+                params,
+                timeout=timeout,
+                request_id=request_id,
+            )
 
     client = HangingModelClient([])
     runner = DroidRunner(
         droid_path="droid",
         workdir=tmp_path,
         client_factory=cast("Any", lambda _path, _cwd: client),
-        session_init_timeout_seconds=0.01,
     )
 
-    with pytest.raises(RunnerError, match="session initialization timed out") as error:
-        await runner.list_models(timeout_seconds=1.0)
+    with pytest.raises(RunnerError, match="timed out") as error:
+        await runner.list_models(timeout_seconds=0.05)
 
     assert error.value.status_code == 504
     assert error.value.error_type == "factory_droid_timeout"
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("client_class", "status_code", "error_type"),
+    [
+        (MissingExecutableClient, 503, "factory_droid_unavailable"),
+        (FailingSdkClient, 502, "factory_droid_sdk_error"),
+    ],
+)
+async def test_model_discovery_maps_failures_like_sessions(
+    tmp_path: Path,
+    client_class: type[FakeClient],
+    status_code: int,
+    error_type: str,
+) -> None:
+    client = client_class([])
+    runner = DroidRunner(
+        droid_path="/missing/droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    with pytest.raises(RunnerError) as error:
+        await runner.list_models(timeout_seconds=1)
+
+    assert error.value.status_code == status_code
+    assert error.value.error_type == error_type
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_model_discovery_cleanup_survives_cancellation(tmp_path: Path) -> None:
+    closing = asyncio.Event()
+    release = asyncio.Event()
+
+    class SlowClosingModelClient(FakeClient):
+        async def send_request(
+            self,
+            method: str,
+            params: dict[str, Any],
+            timeout: float | None = None,
+            request_id: str | None = None,
+        ) -> dict[str, Any]:
+            if method == "droid.list_models":
+                self.rpc_requests.append((method, params, timeout))
+                return {"result": {"models": []}}
+            return await super().send_request(
+                method,
+                params,
+                timeout=timeout,
+                request_id=request_id,
+            )
+
+        async def close(self) -> None:
+            closing.set()
+            await release.wait()
+            self.closed = True
+
+    client = SlowClosingModelClient([])
+    runner = DroidRunner(
+        droid_path="droid",
+        workdir=tmp_path,
+        client_factory=cast("Any", lambda _path, _cwd: client),
+    )
+
+    task = asyncio.create_task(runner.list_models(timeout_seconds=5))
+    await closing.wait()
+    task.cancel()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
     assert client.closed is True
 
 

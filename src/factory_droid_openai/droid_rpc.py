@@ -531,6 +531,15 @@ class DroidRpcExtension:
     async def rename_session(self, client: DroidClient, *, title: str) -> None:
         await self._request(client, "droid.rename_session", {"title": title})
 
+    async def list_models(self, client: DroidClient) -> list[dict[str, Any]]:
+        """List models Droid can serve, already filtered by organization policy.
+
+        ``droid.list_models`` is sessionless, so discovery needs neither a
+        session initialization nor ``droid.close_session``.
+        """
+        result = await self._request(client, "droid.list_models", {})
+        return _required_list(result, "models")
+
     async def close_session(self, client: DroidClient, *, reason: str = "other") -> None:
         await self._request(client, "droid.close_session", {"reason": reason})
 

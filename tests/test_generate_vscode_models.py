@@ -289,6 +289,52 @@ def test_verify_models_reports_progress_and_refusals(
     assert "gpt-5.4: ok" in stderr
 
 
+def test_help_describes_filtered_discovery_and_optional_verification(
+    gen: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["generate_vscode_models.py", "--help"])
+
+    with pytest.raises(SystemExit) as error:
+        gen._parse_args()
+
+    assert error.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "policy-filtered GET /v1/models catalog" in help_text
+    assert "No local Droid sessions are started unless --verify is set." in help_text
+    assert "Optionally check session startup with the local Droid CLI" in help_text
+    assert "No model turns; the catalog is already policy-filtered." in help_text
+    assert "blocked by an organization policy" not in help_text
+
+
+def test_main_uses_filtered_catalog_without_session_probes(
+    gen: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "chatLanguageModels.json"
+    catalog = _catalog()[:2]
+    monkeypatch.setattr(gen, "_fetch_models", lambda *_args, **_kwargs: catalog)
+
+    def unexpected_verification(*_args: Any, **_kwargs: Any) -> dict[str, str]:
+        raise AssertionError("Generating from the bridge catalog must not probe local sessions")
+
+    monkeypatch.setattr(gen, "_verify_models", unexpected_verification)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["generate_vscode_models.py", "--all-models", "--output", str(output)],
+    )
+
+    gen.main()
+
+    config = json.loads(output.read_text(encoding="utf-8"))
+    assert [model["id"] for model in config[0]["models"]] == ["factory-droid", "gpt-5.4"]
+    assert config[0]["models"][1]["vision"] is False
+    assert config[0]["models"][1]["supportsReasoningEffort"] == ["off", "low", "high"]
+
+
 def test_main_generates_config_with_verified_models(
     gen: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
