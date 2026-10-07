@@ -115,12 +115,14 @@ if TYPE_CHECKING:
 RunnerFactory = Callable[[], DroidRunner]
 ModelOutputRetryReason = Literal[
     "malformed_tool_call",
+    "malformed_tool_call_escalated",
     "structured_output",
     "tool_without_catalog",
     "tool_without_catalog_escalated",
     "trailing_output",
     "trailing_output_escalated",
     "truncated_tool_call",
+    "truncated_tool_call_escalated",
 ]
 RetryOutcome = Literal["recovered", "refailed", "not_attempted"]
 BearerCredentials = Annotated[
@@ -149,6 +151,11 @@ _MODEL_OUTPUT_RETRY_PROMPTS: dict[ModelOutputRetryReason, str] = {
         "Your previous tool call was malformed. Return the required tool call again as one "
         "complete valid tool call. Output no explanation."
     ),
+    "malformed_tool_call_escalated": (
+        "Your previous two tool calls were malformed. Return the required tool call as one "
+        "complete valid tool call with complete arguments. Stop immediately. Output no "
+        "explanation."
+    ),
     "structured_output": (
         "Your previous response did not satisfy the required JSON output format. Return "
         "complete JSON again, matching the requested schema exactly. Output JSON only."
@@ -175,17 +182,28 @@ _MODEL_OUTPUT_RETRY_PROMPTS: dict[ModelOutputRetryReason, str] = {
         "A previous tool call attempt was incomplete. Return the required tool call as one "
         "complete valid tool call. Output no explanation."
     ),
+    "truncated_tool_call_escalated": (
+        "Your previous two tool call attempts were incomplete. Return the required tool call "
+        "as one complete valid tool call with complete arguments. Stop immediately. Output no "
+        "explanation."
+    ),
 }
 _TRAILING_OUTPUT_ERROR_PREFIX = "unexpected text after tool call"
-# Burst traffic can repeat a phantom tool call or trailing prose after the
-# correction, so those two shapes earn one escalated second retry before the
-# turn fails; every other retry reason stays single-shot (issue #150).
-_ESCALATABLE_RETRY_REASONS = frozenset(("tool_without_catalog", "trailing_output"))
+# Repeated phantom, malformed, truncated, and trailing-output shapes get one
+# escalated retry; every other retry reason stays single-shot (issue #150).
+_ESCALATABLE_RETRY_REASONS = frozenset(
+    ("tool_without_catalog", "trailing_output", "malformed_tool_call", "truncated_tool_call")
+)
 # Isolated requests retry these reasons in a fresh session with the full
 # original prompt; everything else reuses the attempt's session with the
 # correction note alone.
 _FRESH_SESSION_RETRY_REASONS = frozenset(
-    ("tool_without_catalog", "tool_without_catalog_escalated", "truncated_tool_call")
+    (
+        "tool_without_catalog",
+        "tool_without_catalog_escalated",
+        "truncated_tool_call",
+        "truncated_tool_call_escalated",
+    )
 )
 # The bridge ships no tokenizer, so the text-length fallback in OutputTokenCap
 # counts roughly 4 characters per output token; Droid's own usage snapshots
@@ -2730,7 +2748,11 @@ def _escalated_retry_reason(reason: ModelOutputRetryReason) -> ModelOutputRetryR
     """The second-correction variant of an escalatable retry reason."""
     if reason == "tool_without_catalog":
         return "tool_without_catalog_escalated"
-    return "trailing_output_escalated"
+    if reason == "trailing_output":
+        return "trailing_output_escalated"
+    if reason == "malformed_tool_call":
+        return "malformed_tool_call_escalated"
+    return "truncated_tool_call_escalated"
 
 
 def _log_retry_outcome(

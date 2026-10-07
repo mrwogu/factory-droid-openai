@@ -303,7 +303,7 @@ class DistinctSessionTruncationRunner(FakeRunner):
                 )
                 for event in events
             ]
-            for session_id in ("attempt-1", "attempt-2")
+            for session_id in ("attempt-1", "attempt-2", "attempt-3")
         ]
 
     async def run(self, request: RunRequest) -> AsyncIterator[RunEvent]:
@@ -3566,6 +3566,7 @@ async def test_repeated_truncated_tool_call_logs_final_outcome(tmp_path: Path) -
         [
             "retry/truncated-tool.jsonl",
             "retry/truncated-tool.jsonl",
+            "retry/truncated-tool.jsonl",
         ]
     )
     payload = _payload(
@@ -3579,18 +3580,22 @@ async def test_repeated_truncated_tool_call_logs_final_outcome(tmp_path: Path) -
     async with _client(_app(tmp_path, runner)) as client:
         response = await client.post("/v1/chat/completions", json=payload)
 
-    # A truncation the retry could not recover is a clean error envelope, not a
-    # 200 with a half-written body the client cannot classify (issue #139).
+    # A truncation the escalated retry could not recover is a clean error
+    # envelope, not a 200 with a half-written body the client cannot classify.
     assert response.status_code == 502
     assert response.json()["error"]["type"] == "truncated_tool_call"
     assert response.json()["error"]["message"]
+    assert len(runner.requests) == 3
+    assert [request.session_id for request in runner.requests] == [None, None, None]
+    assert "previous two tool call attempts" in runner.requests[2].prompt
+    assert runner.requests[0].prompt in runner.requests[2].prompt
     records = [json.loads(line) for line in log_stream.getvalue().splitlines() if line.strip()]
     attempts = [record for record in records if record["event"] == "chat.attempt_truncated"]
     final = [record for record in records if record["event"] == "chat.truncated"]
-    assert [record["attempt"] for record in attempts] == [0]
-    assert attempts[0]["will_retry"] is True
+    assert [record["attempt"] for record in attempts] == [0, 1]
+    assert all(record["will_retry"] is True for record in attempts)
     assert len(final) == 1
-    assert final[0]["attempt"] == 1
+    assert final[0]["attempt"] == 2
     assert final[0]["warm"] is False
     assert final[0]["output_tokens"] == 0
     # No output-token limit was in force, so the field stays absent instead
@@ -3599,9 +3604,9 @@ async def test_repeated_truncated_tool_call_logs_final_outcome(tmp_path: Path) -
     assert final[0]["will_retry"] is False
     outcomes = [record for record in records if record["event"] == "chat.retry_outcome"]
     assert len(outcomes) == 1
-    assert outcomes[0]["reason"] == "truncated_tool_call"
+    assert outcomes[0]["reason"] == "truncated_tool_call_escalated"
     assert outcomes[0]["outcome"] == "refailed"
-    assert outcomes[0]["attempt"] == 1
+    assert outcomes[0]["attempt"] == 2
 
 
 @pytest.mark.asyncio
@@ -3621,10 +3626,11 @@ async def test_failed_truncated_retry_keeps_visible_session_registered(tmp_path:
     response = await _post_completion(app, _weather_payload())
 
     assert response.status_code == 502
-    assert [request.session_id for request in runner.requests] == [None, None]
+    assert [request.session_id for request in runner.requests] == [None, None, None]
     assert app.state.sessions.key("visible-session") == key
     assert app.state.sessions.key("attempt-1") is None
     assert app.state.sessions.key("attempt-2") is None
+    assert app.state.sessions.key("attempt-3") is None
 
 
 @pytest.mark.asyncio
@@ -4090,6 +4096,60 @@ async def test_non_streaming_trailing_output_escalated_retry_recovers(
     assert outcome["attempt"] == 2
 
 
+@pytest.mark.parametrize(
+    ("fixture", "reason", "escalated_reason", "retry_session_id"),
+    [
+        (
+            "retry/malformed-tool.jsonl",
+            "malformed_tool_call",
+            "malformed_tool_call_escalated",
+            "replay-session",
+        ),
+        (
+            "retry/truncated-tool.jsonl",
+            "truncated_tool_call",
+            "truncated_tool_call_escalated",
+            None,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_non_streaming_tool_call_escalated_retry_recovers(
+    tmp_path: Path,
+    fixture: str,
+    reason: str,
+    escalated_reason: str,
+    retry_session_id: str | None,
+) -> None:
+    log_stream = _retry_log_stream()
+    runner = RetryRunner([fixture, fixture, "retry/valid-tool.jsonl"])
+
+    response = await _post_completion(_app(tmp_path, runner), _weather_payload())
+
+    assert response.status_code == 200
+    tool_calls = response.json()["choices"][0]["message"]["tool_calls"]
+    assert tool_calls[0]["function"]["name"] == "weather"
+    assert len(runner.requests) == 3
+    assert [request.session_id for request in runner.requests] == [
+        None,
+        retry_session_id,
+        retry_session_id,
+    ]
+    assert "complete valid tool call" in runner.requests[1].prompt
+    assert "previous two" in runner.requests[2].prompt
+    if retry_session_id is None:
+        assert runner.requests[0].prompt in runner.requests[2].prompt
+
+    records = _warning_records(log_stream)
+    retries = [record for record in records if record["event"] == "chat.retry"]
+    assert [record["attempt"] for record in retries] == [1, 2]
+    assert [record["reason"] for record in retries] == [reason, escalated_reason]
+    outcome = _single_retry_outcome(records)
+    assert outcome["reason"] == escalated_reason
+    assert outcome["outcome"] == "recovered"
+    assert outcome["attempt"] == 2
+
+
 @pytest.mark.asyncio
 async def test_continuation_tool_without_catalog_escalated_retry_keeps_session(
     tmp_path: Path,
@@ -4213,11 +4273,13 @@ async def test_non_streaming_trailing_output_without_session_logs_not_attempted(
 
 
 @pytest.mark.asyncio
-async def test_non_streaming_retry_stays_bounded_when_tool_call_is_still_malformed(
+async def test_non_streaming_malformed_tool_call_escalated_retry_is_bounded(
     tmp_path: Path,
 ) -> None:
+    log_stream = _retry_log_stream()
     runner = RetryRunner(
         [
+            "retry/malformed-tool.jsonl",
             "retry/malformed-tool.jsonl",
             "retry/malformed-tool.jsonl",
         ]
@@ -4230,14 +4292,22 @@ async def test_non_streaming_retry_stays_bounded_when_tool_call_is_still_malform
             }
         ]
     )
-    async with _client(_app(tmp_path, runner)) as client:
-        response = await client.post("/v1/chat/completions", json=payload)
+    response = await _post_completion(_app(tmp_path, runner), payload)
 
     assert response.status_code == 200
     choice = response.json()["choices"][0]
     assert choice["finish_reason"] == "stop"
     assert choice["message"]["content"].startswith("[bridge notice: dropped a malformed tool call")
-    assert len(runner.requests) == 2
+    assert len(runner.requests) == 3
+    assert [request.session_id for request in runner.requests] == [
+        None,
+        "replay-session",
+        "replay-session",
+    ]
+    assert "previous two tool calls" in runner.requests[2].prompt
+    retries = [record for record in _warning_records(log_stream) if record["event"] == "chat.retry"]
+    assert [record["attempt"] for record in retries] == [1, 2]
+    _assert_retry_refailed(log_stream, "malformed_tool_call_escalated", attempt=2)
 
 
 def _output_cap_runaway_argument() -> TextDelta:
