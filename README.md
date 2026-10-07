@@ -1234,7 +1234,10 @@ Call `GET /v1/models` to list the bridge alias and the models currently
 available to the authenticated Droid CLI. Factory-specific metadata includes
 the display name, reasoning efforts, and image and PDF support.
 
-Discovery starts a short-lived Droid session, so the catalog is cached for
+Discovery calls the sessionless `droid.list_models` JSON-RPC method, so no
+Droid session is started; the returned catalog already reflects organization
+model policy for the signed-in account, and entries Droid still flags as
+`disabled` are withheld. The catalog is cached for
 `FACTORY_DROID_OPENAI_MODEL_CACHE_SECONDS` and concurrent callers share a
 single discovery attempt. If discovery cannot start or authenticate Droid, the
 endpoint preserves compatibility by serving the last known catalog, or the
@@ -1242,9 +1245,9 @@ bridge alias alone, and marks the response with the
 `x-factory-droid-model-discovery: degraded` header while incrementing
 `factory_droid_openai_model_discovery_failures_total`.
 
-The Droid catalog also lists models an organization policy blocks for the
-signed-in account. Droid rejects those when a session starts, which the bridge
-maps to `404 model_not_found` and remembers for
+A client can still name a model an organization policy blocks by sending its
+raw ID. Droid rejects those when a session starts, which the bridge maps to
+`404 model_not_found` and remembers for
 `FACTORY_DROID_OPENAI_MODEL_QUARANTINE_SECONDS`. While a model is quarantined,
 `GET /v1/models` withholds it and reports how many entries were withheld in the
 `x-factory-droid-models-quarantined` header, chat requests for it are refused

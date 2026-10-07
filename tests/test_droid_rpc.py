@@ -1058,6 +1058,43 @@ async def test_rpc_extension_rejects_malformed_results(result: object) -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_models_returns_the_org_filtered_catalog() -> None:
+    entries: list[dict[str, Any]] = [
+        {
+            "id": "gpt-5.4",
+            "displayName": "GPT-5.4",
+            "shortDisplayName": "GPT-5.4",
+            "modelProvider": "openai",
+            "supportedReasoningEfforts": ["low", "high"],
+            "defaultReasoningEffort": "high",
+        }
+    ]
+    protocol = FakeProtocol(lambda _method, _params: {"result": {"models": entries}})
+
+    models = await DroidRpcExtension().list_models(_client(protocol))
+
+    assert models == entries
+    assert protocol.calls[0][:2] == ("droid.list_models", {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result",
+    [
+        None,
+        {},
+        {"models": "nope"},
+        {"models": [1]},
+    ],
+)
+async def test_list_models_rejects_malformed_results(result: object) -> None:
+    protocol = FakeProtocol(lambda _method, _params: {"result": result})
+
+    with pytest.raises(DroidClientError, match="malformed"):
+        await DroidRpcExtension().list_models(_client(protocol))
+
+
+@pytest.mark.asyncio
 async def test_rpc_extension_requires_an_sdk_protocol_engine() -> None:
     with pytest.raises(DroidClientError, match="protocol engine"):
         await DroidRpcExtension().fork_session(_client(None))
