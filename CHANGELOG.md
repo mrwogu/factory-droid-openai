@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.13.0](https://github.com/mrwogu/factory-droid-openai/compare/v1.12.1...v1.13.0) (2026-10-07)
+
+
+### Features
+
+* **models:** use sessionless discovery ([#163](https://github.com/mrwogu/factory-droid-openai/issues/163)) ([78d3919](https://github.com/mrwogu/factory-droid-openai/commit/78d3919e95dd1be8138d8a0d5cc9a07f6dfb1274))
+
+
+### Bug Fixes
+
+* **api:** escalate repeated malformed and truncated tool calls ([#164](https://github.com/mrwogu/factory-droid-openai/issues/164)) ([3004447](https://github.com/mrwogu/factory-droid-openai/commit/3004447faa1abae5f94bf166fb18c1144c21a709))
+* **logging:** carry the armed output-token limit on truncations ([#160](https://github.com/mrwogu/factory-droid-openai/issues/160)) ([2a65cd0](https://github.com/mrwogu/factory-droid-openai/commit/2a65cd01dd516321e0ecd7db4667dd23f0e25a8a))
+
 ## [1.12.1](https://github.com/mrwogu/factory-droid-openai/compare/v1.12.0...v1.12.1) (2026-10-06)
 
 
