@@ -1319,9 +1319,7 @@ def create_app(
             metrics.increment_model_discovery_failures()
             log_warning("models.discovery_degraded", cached=len(discovered))
             response.headers["x-factory-droid-model-discovery"] = "degraded"
-        # The Droid catalog also lists models an organization policy blocks, so
-        # anything already known to be refused is withheld from clients that
-        # build their model picker from this response.
+        # A cached catalog can still contain a model refused after discovery.
         available = tuple(model for model in discovered if quarantine.allows(model.id))
         withheld = len(discovered) - len(available)
         if not degraded:

@@ -1,3 +1,5 @@
+"""Generate VS Code models from the bridge's policy-filtered catalog."""
+
 from __future__ import annotations
 
 import argparse
@@ -72,6 +74,7 @@ def _is_loopback_host(host: str) -> bool:
 
 
 def _fetch_models(base_url: str, api_key: str | None) -> list[dict[str, Any]]:
+    """Read the bridge's cached, policy-filtered ``GET /v1/models`` catalog."""
     validated_url = _validated_base_url(base_url)
     parsed = urlsplit(validated_url)
     if api_key and parsed.scheme == "http" and not _is_loopback_host(parsed.hostname or ""):
@@ -94,11 +97,11 @@ async def _probe_model(
     timeout_seconds: float,
     gate: asyncio.Semaphore,
 ) -> str | None:
-    """Return why ``model_id`` is unusable, or ``None`` when it works.
+    """Return a session-start failure, or ``None`` when startup succeeds.
 
-    Only a session is initialized, which is where Droid refuses models an
-    organization policy blocks. No model turn runs, so probing the whole
-    catalog costs no tokens.
+    The bridge catalog already applies organization policy. This optional
+    check initializes and discards a session with the local Droid CLI; it does
+    not run a model turn or prove inference will succeed.
     """
     from factory_droid_openai.runner import DroidRunner, SessionKey
 
@@ -124,7 +127,7 @@ def _verify_models(
     timeout_seconds: float,
     concurrency: int,
 ) -> dict[str, str]:
-    """Probe every model and map the unusable ones to their refusal."""
+    """Check local session startup and map failed probes to their errors."""
 
     async def run() -> dict[str, str]:
         gate = asyncio.Semaphore(max(1, concurrency))
@@ -214,7 +217,9 @@ def _build_config(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate a VS Code chatLanguageModels.json from a running bridge.",
+        description="Generate a VS Code chatLanguageModels.json from the bridge's "
+        "policy-filtered GET /v1/models catalog. No local Droid sessions are "
+        "started unless --verify is set.",
     )
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--chat-url", default=None)
@@ -226,19 +231,32 @@ def _parse_args() -> argparse.Namespace:
         "--model",
         action="append",
         dest="models",
-        help="Model ID to include; repeatable. Defaults to a curated set.",
+        help="Model ID from the bridge catalog; repeatable. Defaults to a curated set.",
     )
-    parser.add_argument("--all-models", action="store_true", help="Include every discovered model.")
+    parser.add_argument(
+        "--all-models",
+        action="store_true",
+        help="Include every model in the bridge's policy-filtered catalog.",
+    )
     parser.add_argument(
         "--verify",
         action="store_true",
-        help="Drop models Droid refuses to start a session with, such as ones "
-        "blocked by an organization policy.",
+        help="Optionally check session startup with the local Droid CLI and drop failures. "
+        "No model turns; the catalog is already policy-filtered.",
+    )
+    parser.add_argument(
+        "--droid-path",
+        default=os.getenv("FACTORY_DROID_PATH", "droid"),
+        help="Local Droid executable used only by --verify.",
+    )
+    parser.add_argument(
+        "--workdir",
+        type=Path,
+        default=None,
+        help="Working directory for local --verify sessions.",
     )
     parser.add_argument("--verify-concurrency", type=int, default=4)
     parser.add_argument("--verify-timeout-seconds", type=float, default=60.0)
-    parser.add_argument("--droid-path", default=os.getenv("FACTORY_DROID_PATH", "droid"))
-    parser.add_argument("--workdir", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
     return parser.parse_args()
 

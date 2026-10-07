@@ -998,11 +998,12 @@ Setup walks through several prompts in order:
 4. VS Code asks for the API type. Pick **Chat Completions**.
 5. VS Code opens `chatLanguageModels.json`. Two options for filling it:
 
-   - **Copy the ready example.** A provider entry covering every model the
-     reference host exposed is committed at
+   - **Copy the ready example.** A static snapshot of the models a reference
+     host exposed is committed at
      [`examples/vscode/chatLanguageModels.json`](examples/vscode/chatLanguageModels.json).
      Paste its contents into the file, then adjust `apiKey` and the endpoint
-     URL.
+     URL. Some entries may be unavailable for your account; generate your own
+     configuration for the current catalog.
    - **Generate your own.** Your account may have different models enabled
      than the reference host, so run the generator against a running bridge;
      it reads image support and reasoning effort levels from `GET
@@ -1010,28 +1011,43 @@ Setup walks through several prompts in order:
 
 ```bash
 CONFIG=/absolute/path/to/chatLanguageModels.json
-uv run python scripts/generate_vscode_models.py --all-models --verify --output "$CONFIG"
+uv run python scripts/generate_vscode_models.py --all-models --output "$CONFIG"
 ```
 
 Set `CONFIG` to the file VS Code opened. Without `--output`, the generator
 updates the repository's ready example instead.
 
-`--all-models` includes every model the bridge exposes; `--verify` starts a
-Droid session for each one, drops the models Droid refuses (typically ones an
-organization policy blocks for the signed-in account), and reports progress
-per model to stderr. No model turn runs, so verification costs no tokens; it
-spawns Droid directly and takes roughly a minute for a full catalog. Narrower
-selections are possible:
+`--all-models` includes the bridge alias and every model in the bridge's
+cached, organization-policy-filtered catalog. Discovery uses the sessionless
+`droid.list_models` RPC and omits entries marked `disabled`, so session probes
+are not needed to remove policy-blocked models.
+
+Without `--all-models` or `--model`, the generator selects a curated set and
+exits if any of those IDs are absent from the bridge catalog. Use `--all-models`
+or choose only IDs returned by `GET /v1/models`:
 
 ```bash
-uv run python scripts/generate_vscode_models.py --output "$CONFIG"
-uv run python scripts/generate_vscode_models.py --all-models --output "$CONFIG"
 uv run python scripts/generate_vscode_models.py --model gpt-5.4 --model claude-opus-5 --output "$CONFIG"
 ```
 
-`id` is the explicit Droid model ID. Replace it with another ID from
-`GET /v1/models` or `droid exec --help`, such as `gemini-3.1-pro-preview` or
-the `factory-droid` alias. Each ID needs its own entry in `models`.
+`--verify` remains optional. It initializes and closes a session for each
+explicit model ID with the local Droid CLI, drops failed probes, and reports
+progress to stderr. The `factory-droid` alias is not probed. No model turn runs,
+so verification costs no model tokens, but successful startup does not
+guarantee that inference will succeed.
+
+```bash
+uv run python scripts/generate_vscode_models.py --all-models --verify --output "$CONFIG"
+```
+
+Verification uses local credentials and settings, not the bridge's HTTP
+endpoint. If the bridge runs in a container or on another host, its profile
+may differ from the local CLI. Use `--droid-path` and `--workdir` to choose the
+local executable and probe working directory.
+
+`id` is the explicit Droid model ID or the `factory-droid` alias. Use IDs from
+`GET /v1/models`; `droid exec --help` can also list models your organization
+policy blocks. Each ID needs its own entry in `models`.
 
 When bearer authentication is enabled, set the same token as `apiKey`. The
 placeholder `none` works only on a loopback bridge without a configured token.
@@ -2094,13 +2110,18 @@ entrypoint is overridden.
 
 ### Model not allowed by organization policy
 
-Droid lists the full catalog but refuses to start a session for models the
-account's organization policy blocks. The bridge answers `404 model_not_found`,
-logs `models.quarantined`, and withholds the model from `GET /v1/models` for
+`GET /v1/models` already excludes models the account's organization policy
+blocks. A client can still send a raw blocked ID, or reuse an ID whose policy
+changed after discovery. Droid refuses it at session startup; the bridge
+answers `404 model_not_found`, logs `models.quarantined`, and withholds the
+model from `GET /v1/models` for
 `FACTORY_DROID_OPENAI_MODEL_QUARANTINE_SECONDS`, so a client that rebuilds its
-model list recovers on its own. Regenerate client configuration with
-`uv run python scripts/generate_vscode_models.py --all-models --verify` to drop
-blocked models up front.
+model list can pick another available model.
+
+Regenerate VS Code's configuration from the filtered catalog with
+`uv run python scripts/generate_vscode_models.py --all-models --output "$CONFIG"`,
+where `CONFIG` points to the file VS Code opened. `--verify` is optional and
+only checks session startup with the local Droid CLI.
 
 ## Development
 
