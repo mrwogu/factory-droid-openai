@@ -1089,9 +1089,11 @@ async def test_list_models_returns_the_org_filtered_catalog() -> None:
 )
 async def test_list_models_rejects_malformed_results(result: object) -> None:
     protocol = FakeProtocol(lambda _method, _params: {"result": result})
+    rpc = DroidRpcExtension()
+    client = _client(protocol)
 
     with pytest.raises(DroidClientError, match="malformed"):
-        await DroidRpcExtension().list_models(_client(protocol))
+        await rpc.list_models(client)
 
 
 @pytest.mark.asyncio
